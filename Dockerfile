@@ -20,6 +20,18 @@ COPY frontend/app.jsx           /usr/share/nginx/html/app.jsx
 COPY frontend/components.jsx    /usr/share/nginx/html/components.jsx
 COPY frontend/tweaks-panel.jsx  /usr/share/nginx/html/tweaks-panel.jsx
 
+# Bundle vendor JS locally — no CDN dependency at runtime
+RUN wget -q -O /usr/share/nginx/html/vendor-react.js \
+        https://unpkg.com/react@18.3.1/umd/react.development.js \
+    && wget -q -O /usr/share/nginx/html/vendor-react-dom.js \
+        https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js \
+    && wget -q -O /usr/share/nginx/html/vendor-babel.js \
+        https://unpkg.com/@babel/standalone@7.29.0/babel.min.js \
+    && wget -q -O /usr/share/nginx/html/vendor-leaflet.js \
+        https://unpkg.com/leaflet@1.9.4/dist/leaflet.js \
+    && wget -q -O /usr/share/nginx/html/vendor-leaflet.css \
+        https://unpkg.com/leaflet@1.9.4/dist/leaflet.css
+
 # nginx config (replace the default Debian site)
 RUN rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
 COPY nginx.conf /etc/nginx/conf.d/obd.conf
