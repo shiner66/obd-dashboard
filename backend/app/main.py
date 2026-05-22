@@ -335,3 +335,51 @@ async def upload_myop(file: UploadFile):
 @app.get("/api/v1/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/v1/debug/data-error")
+def debug_data_error():
+    """Diagnose why data.js fails: find the first trip field that can't be serialized."""
+    import traceback
+    trips = db.get_all_trips()
+    results = []
+
+    # Try serializing VEHICLE
+    try:
+        vehicle = _build_vehicle(trips)
+        json.dumps(vehicle)
+        results.append({"section": "VEHICLE", "ok": True})
+    except Exception as e:
+        results.append({"section": "VEHICLE", "ok": False, "error": str(e),
+                        "trace": traceback.format_exc()})
+
+    # Try serializing TREND_INSIGHTS
+    try:
+        ti = getattr(app.state, "trend_insights", [])
+        json.dumps(ti)
+        results.append({"section": "TREND_INSIGHTS", "ok": True})
+    except Exception as e:
+        results.append({"section": "TREND_INSIGHTS", "ok": False, "error": str(e)})
+
+    # Try serializing each trip individually to pin down the bad one
+    bad_trips = []
+    for t in trips:
+        try:
+            json.dumps(t)
+        except Exception as e:
+            # Find the bad field
+            bad_fields = []
+            for k, v in t.items():
+                try:
+                    json.dumps(v)
+                except Exception as fe:
+                    bad_fields.append({"field": k, "type": type(v).__name__,
+                                       "value": repr(v)[:200], "error": str(fe)})
+            bad_trips.append({"trip_id": t.get("id"), "bad_fields": bad_fields})
+
+    if bad_trips:
+        results.append({"section": "TRIPS", "ok": False, "bad_trips": bad_trips})
+    else:
+        results.append({"section": "TRIPS", "ok": True, "count": len(trips)})
+
+    return results
