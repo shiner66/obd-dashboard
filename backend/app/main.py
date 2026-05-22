@@ -337,6 +337,28 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/api/v1/admin/fix-myop-timestamps")
+def fix_myop_timestamps():
+    """One-shot: add +2 h to start_local/end_local of all myop-source trips.
+
+    Needed because the original parser wrongly subtracted 2 h from the
+    Stellantis timestamp (which is already in local Italian time).
+    Safe to call multiple times — subsequent calls update 0 rows because
+    the fixed times are no longer in the 'wrong' window, but note that
+    idempotency is not enforced: call it exactly once after upgrading.
+    """
+    with db._conn() as con:
+        result = con.execute(
+            """UPDATE trips
+               SET start_local = datetime(start_local, '+2 hours'),
+                   end_local   = datetime(end_local,   '+2 hours')
+               WHERE source = 'myop'"""
+        )
+        updated = result.rowcount
+    log.info("fix-myop-timestamps: updated %d trips", updated)
+    return {"updated": updated}
+
+
 @app.get("/api/v1/debug/data-error")
 def debug_data_error():
     """Diagnose why data.js fails: find the first trip field that can't be serialized."""

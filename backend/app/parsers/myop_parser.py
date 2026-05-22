@@ -8,10 +8,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 
-_TZ_OFFSET_H = 2  # Italy CEST (summer); use 1 for CET (winter)
+def _to_local_iso(date_str: str) -> str:
+    """Return the Stellantis timestamp as local ISO, stripping the spurious Z suffix.
 
-# Alert code → {sev, label}  (briefing §4 + data.js ALERTS)
-ALERT_DICT: dict[int, dict] = {
+    Stellantis sends Italian local time but marks it as UTC (Z). The Z is wrong —
+    the value is already in local time — so we just strip it and use it as-is.
+    """
+    return date_str.rstrip("Z")
     0:  {"sev": "critical", "label": "Pressione olio motore anomala"},
     1:  {"sev": "critical", "label": "Temperatura motore troppo elevata"},
     8:  {"sev": "warning",  "label": "Livello olio motore insufficiente"},
@@ -32,17 +35,9 @@ ALERT_DICT: dict[int, dict] = {
 }
 
 
-def _to_local_iso(date_str: str) -> str:
-    """Convert Stellantis 'UTC' timestamp (actually local CET/CEST) to ISO."""
-    # Strip Z, parse as-is (server sends local time with Z suffix — §4 caveat)
-    raw = date_str.rstrip("Z")
-    try:
-        dt = datetime.fromisoformat(raw)
-        # Subtract tz offset to get true UTC, then format without tz for display
-        return (dt - timedelta(hours=_TZ_OFFSET_H)).isoformat()
-    except ValueError:
-        return raw
 
+# Alert code → {sev, label}  (briefing §4 + data.js ALERTS)
+ALERT_DICT: dict[int, dict] = {
 
 def parse_file(path: str | Path) -> list[dict]:
     """
