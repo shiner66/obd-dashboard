@@ -21,6 +21,16 @@
   <div id="root"></div>
 
   <script src="/api/v1/data.js"></script>
+  <script>
+    /* Fallback: se data.js non carica (502, timeout, ecc.) le variabili restano undefined */
+    if (typeof TRIPS === 'undefined') {
+      var TRIPS = [], ALERTS = {}, TREND_INSIGHTS = [], PID_CATALOG = [], PID_GROUPS = {}, POINTS = {};
+      var VEHICLE = {name:'OBD Trip Platform',ecu:'',adapter:'',vin:'',odometer:null,
+        fuelLevel:null,fuelAutonomy:null,adblueRange:null,
+        nextService:{days:null,km:null,passed:false},
+        dpfSoot:null,dpfAvgRegenKm:null,dpfSinceRegenKm:null,battery:null};
+    }
+  </script>
   <script type="text/babel" src="components.jsx"></script>
   <script type="text/babel" src="tweaks-panel.jsx"></script>
   <script type="text/babel" src="app.jsx"></script>
