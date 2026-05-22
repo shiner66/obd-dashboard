@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>obd-dashboard</Name>
+  <Repository>ghcr.io/shiner66/obd-dashboard:latest</Repository>
+  <Registry>https://ghcr.io/shiner66/obd-dashboard</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/shiner66/obd-dashboard/issues</Support>
+  <Project>https://github.com/shiner66/obd-dashboard</Project>
+  <Overview>Self-hosted dashboard for the Peugeot 308 SW 1.5 BlueHDi (ECU MD1CS003). Parses CarScanner CSV/BRC exports and MyOpel .myop files, applies RBS byte-swap corrections, runs the DPF state machine, generates AI insights in Italian, and shows everything in a React/Leaflet UI. Single container: nginx + uvicorn supervised together. Drop files in the mapped "OBD files" and "MyOpel files" directories — they're auto-processed within seconds.</Overview>
+  <Category>Tools: Status:Stable</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/shiner66/obd-dashboard/main/unraid-templates/obd-dashboard.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/shiner66/obd-dashboard/main/unraid-templates/icon.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Description>Self-hosted dashboard for OBD trip data. Parses CarScanner CSV/BRC and MyOpel .myop files, correlates trips across the two sources, runs a DPF state machine, and produces Italian-language AI insights. Single-container deployment.</Description>
+  <Config Name="WebUI" Target="80" Default="8080" Mode="tcp" Description="HTTP port for the dashboard. Open http://&lt;unraid-ip&gt;:&lt;port&gt;/" Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+  <Config Name="OBD files directory" Target="/data/obd" Default="/mnt/user/data/obd-files/" Mode="rw" Description="Drop CarScanner CSV/BRC exports here. Watchdog auto-processes new files." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/data/obd-files/</Config>
+  <Config Name="MyOpel files directory" Target="/data/myop" Default="/mnt/user/data/myop-files/" Mode="rw" Description="Drop .myop exports from MyOpel emails here. Watchdog auto-processes new files." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/data/myop-files/</Config>
+  <Config Name="Database directory" Target="/data/db" Default="/mnt/user/appdata/obd-dashboard/db/" Mode="rw" Description="SQLite database storage. The trips.db file is created here." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/obd-dashboard/db/</Config>
+</Container>

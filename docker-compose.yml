@@ -1,0 +1,53 @@
+version: "3.8"
+
+# ── OBD Trip Platform — Docker Compose for Unraid ────────────────────────────
+# Single-container image: nginx + uvicorn.
+# Edit the volume paths below to match your Unraid shares.
+
+services:
+
+  obd-dashboard:
+    image: ghcr.io/shiner66/obd-dashboard:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: obd-dashboard
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      OBD_FILES_DIR:  /data/obd
+      MYOP_FILES_DIR: /data/myop
+      DB_PATH:        /data/db/trips.db
+    volumes:
+      - obd_files:/data/obd
+      - myop_files:/data/myop
+      - db_data:/data/db
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  obd_files:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/user/data/obd-files
+
+  myop_files:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/user/data/myop-files
+
+  db_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /mnt/user/appdata/obd-dashboard/db
