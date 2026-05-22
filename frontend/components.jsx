@@ -287,7 +287,7 @@ const DpfPill = ({ state }) => {
 
 /* ============== Alert chip ============== */
 const AlertChip = ({ code }) => {
-  const a = window.ALERTS[code];
+  const a = (typeof ALERTS !== "undefined" ? ALERTS : {})[code];
   if (!a) return <span className="alert-chip info">#{code}</span>;
   return (
     <span className={`alert-chip ${a.sev}`} title={a.label}>
