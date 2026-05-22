@@ -220,45 +220,56 @@ def _r(v: float | None, d: int = 2) -> float | None:
 
 # ── Main parse function ───────────────────────────────────────────────────────
 
-def parse_file(path: str | Path) -> dict:
+def _read_csv_rows(path: Path) -> list[tuple]:
+    """Try semicolon delimiter first, then comma, returning parsed rows."""
+    raw_rows: list[tuple] = []
+    for delimiter in (";", ","):
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            next(reader, None)  # skip header
+            for row in reader:
+                if len(row) < 3:
+                    continue
+                try:
+                    sec = float(row[0])
+                    pid = row[1].strip()
+                    val = float(row[2])
+                except (ValueError, IndexError):
+                    continue
+                unit = row[3].strip() if len(row) > 3 else ""
+                try:
+                    lat = float(row[4]) if len(row) > 4 and row[4].strip() else 0.0
+                    lon = float(row[5]) if len(row) > 5 and row[5].strip() else 0.0
+                except ValueError:
+                    lat = lon = 0.0
+                raw_rows.append((sec, pid, val, unit, lat, lon))
+        if raw_rows:
+            break
+    return raw_rows
+
+
+def parse_file(path: str | Path) -> list[dict]:
     """
-    Parse a CarScanner CSV file and return a dict compatible with the
-    frontend's trip object format and the database schema.
+    Parse a CarScanner CSV file and return a list containing one trip dict
+    compatible with the frontend's trip object format and the database schema.
     """
     path = Path(path)
     filename = path.name
 
     # ── Timestamp from filename (local Italian time → strip timezone info) ──
-    stem = path.stem  # "2026-05-20 19-57-16"
-    try:
-        dt_local = datetime.strptime(stem, "%Y-%m-%d %H-%M-%S")
-        # Store as local ISO (display) and UTC (subtract CEST = +2h)
-        start_local = dt_local.isoformat()
-        start_utc   = (dt_local - timedelta(hours=2)).isoformat()
-    except ValueError:
-        start_local = start_utc = ""
+    stem = path.stem  # "2026-05-20_19-57-16" or "2026-05-20 19-57-16"
+    start_local = start_utc = ""
+    for fmt in ("%Y-%m-%d_%H-%M-%S", "%Y-%m-%d %H-%M-%S"):
+        try:
+            dt_local = datetime.strptime(stem, fmt)
+            start_local = dt_local.isoformat()
+            start_utc   = (dt_local - timedelta(hours=2)).isoformat()
+            break
+        except ValueError:
+            continue
 
-    # ── Read CSV ─────────────────────────────────────────────────────────────
-    raw_rows: list[tuple] = []   # (sec, pid, val, unit, lat, lon)
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.reader(f, delimiter=";")
-        next(reader, None)  # skip header
-        for row in reader:
-            if len(row) < 3:
-                continue
-            try:
-                sec = float(row[0])
-                pid = row[1].strip()
-                val = float(row[2])
-            except (ValueError, IndexError):
-                continue
-            unit = row[3].strip() if len(row) > 3 else ""
-            try:
-                lat = float(row[4]) if len(row) > 4 and row[4].strip() else 0.0
-                lon = float(row[5]) if len(row) > 5 and row[5].strip() else 0.0
-            except ValueError:
-                lat = lon = 0.0
-            raw_rows.append((sec, pid, val, unit, lat, lon))
+    # ── Read CSV (try semicolon, fallback to comma) ───────────────────────────
+    raw_rows = _read_csv_rows(path)
 
     if not raw_rows:
         raise ValueError(f"No valid rows in {filename}")
@@ -394,8 +405,8 @@ def parse_file(path: str | Path) -> dict:
             "group": _pid_group(pid_name),
         })
 
-    return {
-        "id":                    f"obd-{stem.replace(' ', '-')}",
+    return [{
+        "id":                    f"obd-{stem.replace(' ', '_')}",
         "sources":               ["obd"],
         "filename":              filename,
         "start":                 start_local,
@@ -435,7 +446,7 @@ def parse_file(path: str | Path) -> dict:
         "pidValues":             pid_values,
         "pidSeriesFull":         pid_series,
         "pidCatalog":            pid_catalog,
-    }
+    }]
 
 
 def _end_time(start_iso: str, duration_min: float) -> str:

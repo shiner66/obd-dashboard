@@ -136,10 +136,10 @@ async def lifespan(app: FastAPI):
     log.info("Database initialised at %s", DB_PATH)
 
     _scan_directory(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
-    _scan_directory(MYOP_FILES_DIR, _process_myop_file, (".myop",))
+    _scan_directory(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
 
     _watcher.watch(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
-    _watcher.watch(MYOP_FILES_DIR, _process_myop_file, (".myop",))
+    _watcher.watch(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
     _watcher.start()
 
     # Regenerate cross-trip insights and store on the most recent trip
