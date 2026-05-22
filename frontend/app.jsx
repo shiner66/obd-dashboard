@@ -98,11 +98,11 @@ const Sidebar = ({ active, setActive }) => {
       <div className="veh-card">
         <div className="veh-name">{VEHICLE.name}</div>
         <div className="muted mono" style={{ fontSize: 11, marginBottom: 8 }}>{VEHICLE.ecu}</div>
-        <div className="veh-row"><span>Odometro</span><span className="v">{VEHICLE.odometer.toLocaleString("it-IT")} km</span></div>
-        <div className="veh-row"><span>Carburante</span><span className="v">{VEHICLE.fuelLevel}% · {VEHICLE.fuelAutonomy} km</span></div>
-        <div className="veh-row"><span>AdBlue</span><span className="v">{VEHICLE.adblueRange.toLocaleString("it-IT")} km</span></div>
-        <div className="veh-row"><span>Batteria</span><span className="v">{VEHICLE.battery.toFixed(2)} V</span></div>
-        <div className="veh-row"><span>Service</span><span className="v">{VEHICLE.nextService.days} g · {VEHICLE.nextService.km.toLocaleString("it-IT")} km</span></div>
+        <div className="veh-row"><span>Odometro</span><span className="v">{VEHICLE.odometer?.toLocaleString("it-IT") ?? "—"} km</span></div>
+        <div className="veh-row"><span>Carburante</span><span className="v">{VEHICLE.fuelLevel ?? "—"}% · {VEHICLE.fuelAutonomy ?? "—"} km</span></div>
+        <div className="veh-row"><span>AdBlue</span><span className="v">{VEHICLE.adblueRange?.toLocaleString("it-IT") ?? "—"} km</span></div>
+        <div className="veh-row"><span>Batteria</span><span className="v">{VEHICLE.battery?.toFixed(2) ?? "—"} V</span></div>
+        <div className="veh-row"><span>Service</span><span className="v">{VEHICLE.nextService?.days ?? "—"} g · {VEHICLE.nextService?.km?.toLocaleString("it-IT") ?? "—"} km</span></div>
       </div>
     </aside>
   );
@@ -148,9 +148,9 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
             <div className="muted mono" style={{ fontSize: 11 }}>{VEHICLE.fuelAutonomy} km</div>
           </div>
           <div className="dpf-meta">
-            <div><div className="lbl">AdBlue range</div><div className="v">{VEHICLE.adblueRange.toLocaleString("it-IT")} km</div></div>
-            <div><div className="lbl">Batteria avvio</div><div className="v">{VEHICLE.battery.toFixed(2)} V</div></div>
-            <div><div className="lbl">Prox. tagliando</div><div className="v">{VEHICLE.nextService.days} g</div></div>
+            <div><div className="lbl">AdBlue range</div><div className="v">{VEHICLE.adblueRange?.toLocaleString("it-IT") ?? "—"} km</div></div>
+            <div><div className="lbl">Batteria avvio</div><div className="v">{VEHICLE.battery?.toFixed(2) ?? "—"} V</div></div>
+            <div><div className="lbl">Prox. tagliando</div><div className="v">{VEHICLE.nextService?.days ?? "—"} g</div></div>
             <div><div className="lbl">Olio dilution</div><div className="v">1.0 %</div></div>
           </div>
         </div>
@@ -540,7 +540,7 @@ const PidExplorerInner = ({ trip }) => {
           </div>
           <div className="filter-row">
             <button className={`chip ${group === "Tutti" ? "active" : ""}`} onClick={() => setGroup("Tutti")}>Tutti</button>
-            {PID_GROUPS.map(g => (
+            {Object.keys(PID_GROUPS).map(g => (
               <button key={g} className={`chip ${group === g ? "active" : ""}`} onClick={() => setGroup(g)}>{g}</button>
             ))}
           </div>
@@ -967,7 +967,7 @@ const TrendsView = () => {
 const App = () => {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [view, setView] = useState("dashboard");
-  const [selectedTripId, setSelectedTripId] = useState(TRIPS[0].id);
+  const [selectedTripId, setSelectedTripId] = useState(TRIPS[0]?.id);
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   // Apply tweaks to <html> as data-* attributes
