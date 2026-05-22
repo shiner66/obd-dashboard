@@ -86,6 +86,11 @@ def trip_exists(trip_id: str) -> bool:
         return row is not None
 
 
+def delete_trip(trip_id: str) -> None:
+    with _conn() as con:
+        con.execute("DELETE FROM trips WHERE id=?", (trip_id,))
+
+
 def save_trip(trip: dict) -> None:
     """Insert or replace a trip dict (as produced by the parsers)."""
     _j = lambda v: json.dumps(v) if v is not None else None

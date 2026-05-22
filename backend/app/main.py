@@ -69,11 +69,19 @@ def _correlate_new_obd(obd_trip: dict) -> None:
         if _trips_match(obd_trip, t):
             log.info("Correlating OBD %s → myop %s", obd_trip["id"], t["id"])
             db.enrich_with_myop(obd_trip["id"], t)
+            # Delete the now-absorbed standalone myop entry.
+            if t.get("id") and db.trip_exists(t["id"]):
+                db.delete_trip(t["id"])
+                log.info("Deleted absorbed myop entry %s", t["id"])
             break
 
 
-def _correlate_new_myop(myop_trip: dict) -> None:
-    """After saving a myop trip, check if any OBD trip matches it."""
+def _correlate_new_myop(myop_trip: dict) -> bool:
+    """After saving a myop trip, check if any OBD trip matches it.
+
+    Returns True if a match was found and the OBD trip was enriched.
+    Also deletes the standalone myop entry from DB when it is absorbed.
+    """
     all_trips = db.get_all_trips()
     for t in all_trips:
         if "obd" not in t.get("sources", []):
@@ -81,7 +89,13 @@ def _correlate_new_myop(myop_trip: dict) -> None:
         if _trips_match(t, myop_trip):
             log.info("Correlating myop %s → OBD %s", myop_trip["id"], t["id"])
             db.enrich_with_myop(t["id"], myop_trip)
-            break
+            # Remove the now-redundant standalone myop entry so it doesn't
+            # appear as a duplicate alongside the enriched OBD trip.
+            if db.trip_exists(myop_trip["id"]):
+                db.delete_trip(myop_trip["id"])
+                log.info("Deleted absorbed myop entry %s", myop_trip["id"])
+            return True
+    return False
 
 
 # ── File processing ───────────────────────────────────────────────────────────
@@ -108,12 +122,19 @@ def _process_myop_file(path: Path) -> list[str]:
     new_ids: list[str] = []
     for trip in trips:
         if db.trip_exists(trip["id"]):
+            # Already in DB: still try to correlate in case a matching OBD trip
+            # was uploaded after the myop import. _correlate_new_myop will also
+            # delete the standalone entry if a match is found.
             _correlate_new_myop(trip)
             continue
-        db.save_trip(trip)
-        _correlate_new_myop(trip)
-        new_ids.append(trip["id"])
-        log.info("Saved myop trip %s", trip["id"])
+        # Try correlation first; only persist as standalone if no OBD match.
+        matched = _correlate_new_myop(trip)
+        if not matched:
+            db.save_trip(trip)
+            new_ids.append(trip["id"])
+            log.info("Saved myop trip %s", trip["id"])
+        else:
+            log.info("myop trip %s absorbed into OBD trip, not saved standalone", trip["id"])
     return new_ids
 
 
@@ -339,24 +360,40 @@ def health():
 
 @app.post("/api/v1/admin/fix-myop-timestamps")
 def fix_myop_timestamps():
-    """One-shot: add +2 h to start_local/end_local of all myop-source trips.
+    """Fix myop timestamps and remove absorbed duplicate entries.
 
-    Needed because the original parser wrongly subtracted 2 h from the
-    Stellantis timestamp (which is already in local Italian time).
-    Safe to call multiple times — subsequent calls update 0 rows because
-    the fixed times are no longer in the 'wrong' window, but note that
-    idempotency is not enforced: call it exactly once after upgrading.
+    Step 1: add +2 h to start_local/end_local of all myop-source trips
+    (the original parser wrongly subtracted 2 h from the Stellantis timestamp
+    which is already in local Italian time).
+
+    Step 2: delete standalone myop entries whose myop_trip_id already appears
+    on an OBD trip — those are duplicates created before correlation worked.
+
+    Call once after upgrading. Not idempotent — do not call again.
     """
     with db._conn() as con:
-        result = con.execute(
+        fix_result = con.execute(
             """UPDATE trips
                SET start_local = datetime(start_local, '+2 hours'),
                    end_local   = datetime(end_local,   '+2 hours')
                WHERE source = 'myop'"""
         )
-        updated = result.rowcount
-    log.info("fix-myop-timestamps: updated %d trips", updated)
-    return {"updated": updated}
+        ts_fixed = fix_result.rowcount
+
+        del_result = con.execute(
+            """DELETE FROM trips
+               WHERE source = 'myop'
+                 AND CAST(SUBSTR(id, 6) AS INTEGER) IN (
+                     SELECT myop_trip_id FROM trips
+                     WHERE source IN ('obd_csv', 'obd_brc')
+                       AND myop_trip_id IS NOT NULL
+                 )"""
+        )
+        duplicates_removed = del_result.rowcount
+
+    log.info("fix-myop-timestamps: %d timestamps fixed, %d duplicates removed",
+             ts_fixed, duplicates_removed)
+    return {"timestamps_fixed": ts_fixed, "duplicates_removed": duplicates_removed}
 
 
 @app.get("/api/v1/debug/data-error")
