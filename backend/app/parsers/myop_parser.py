@@ -4,7 +4,6 @@ A .myop file is plain JSON with a list of {vin, trips[]} objects.
 """
 from __future__ import annotations
 import json
-from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -15,6 +14,10 @@ def _to_local_iso(date_str: str) -> str:
     the value is already in local time — so we just strip it and use it as-is.
     """
     return date_str.rstrip("Z")
+
+
+# Alert code → {sev, label}  (briefing §4 + data.js ALERTS)
+ALERT_DICT: dict[int, dict] = {
     0:  {"sev": "critical", "label": "Pressione olio motore anomala"},
     1:  {"sev": "critical", "label": "Temperatura motore troppo elevata"},
     8:  {"sev": "warning",  "label": "Livello olio motore insufficiente"},
@@ -34,10 +37,6 @@ def _to_local_iso(date_str: str) -> str:
     62: {"sev": "warning",  "label": "Pressione pneumatico RR insufficiente"},
 }
 
-
-
-# Alert code → {sev, label}  (briefing §4 + data.js ALERTS)
-ALERT_DICT: dict[int, dict] = {
 
 def parse_file(path: str | Path) -> list[dict]:
     """
