@@ -1062,4 +1062,23 @@ const App = () => {
   );
 };
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { err: null }; }
+  static getDerivedStateFromError(e) { return { err: e }; }
+  render() {
+    if (this.state.err) {
+      return (
+        <div style={{ padding: 32, fontFamily: "monospace", background: "#080c10", color: "#ff6b6b", minHeight: "100vh" }}>
+          <div style={{ fontSize: 18, marginBottom: 12 }}>Errore JavaScript — dashboard non caricata</div>
+          <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, color: "#f8f8f8" }}>{String(this.state.err)}</pre>
+          <pre style={{ whiteSpace: "pre-wrap", fontSize: 11, color: "#999", marginTop: 8 }}>{this.state.err?.stack}</pre>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(
+  <ErrorBoundary><App /></ErrorBoundary>
+);
