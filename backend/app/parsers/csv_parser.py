@@ -220,6 +220,25 @@ def _r(v: float | None, d: int = 2) -> float | None:
 
 # ── Main parse function ───────────────────────────────────────────────────────
 
+def _parse_seconds(s: str) -> float | None:
+    """Parse a time column that may be seconds (float) or HH:MM:SS[.mmm]."""
+    s = s.strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    # Try colon-separated time formats
+    parts = s.replace(",", ".").split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
 def _read_csv_rows(path: Path) -> list[tuple]:
     """Try semicolon delimiter first, then comma, returning parsed rows."""
     raw_rows: list[tuple] = []
@@ -231,7 +250,9 @@ def _read_csv_rows(path: Path) -> list[tuple]:
                 if len(row) < 3:
                     continue
                 try:
-                    sec = float(row[0])
+                    sec = _parse_seconds(row[0])
+                    if sec is None:
+                        continue
                     pid = row[1].strip()
                     val = float(row[2])
                 except (ValueError, IndexError):
@@ -396,10 +417,13 @@ def parse_file(path: str | Path) -> list[dict]:
         pid_series[slug] = _downsample(series, 60)
 
         # Build PID catalog entry
+        _name_clean = pid_name
+        for _pfx in ("[ECM] ", "[TCU] ", "[ECM]", "[TCU]"):
+            _name_clean = _name_clean.replace(_pfx, "")
         pid_catalog.append({
             "slug":  slug,
             "name":  pid_name,
-            "short": slug.upper().replace("_", " ")[:16],
+            "short": _name_clean.strip()[:32],
             "unit":  unit,
             "kind":  kind,
             "group": _pid_group(pid_name),

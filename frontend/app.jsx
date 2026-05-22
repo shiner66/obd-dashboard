@@ -585,7 +585,7 @@ const PidExplorerInner = ({ trip }) => {
                         cursor: "pointer",
                       }}>
                     <td style={{ padding: "6px 12px", color: isSel ? "var(--accent-strong)" : "var(--fg-0)" }}>
-                      <div style={{ fontWeight: 500 }}>{p.short}</div>
+                      <div style={{ fontWeight: 500 }}>{p.name.replace(/^\[(ECM|TCU)\]\s*/i, "")}</div>
                       <div className="muted mono" style={{ fontSize: 10 }}>{p.slug}</div>
                     </td>
                     <td style={{ padding: "6px 8px", color: "var(--fg-2)" }}>{p.group}</td>
@@ -604,7 +604,7 @@ const PidExplorerInner = ({ trip }) => {
               })}
               {filtered.length === 0 && (
                 <tr><td colSpan="5" style={{ padding: 20, textAlign: "center", color: "var(--fg-3)" }}>
-                  Nessun PID trovato.
+                  {trip && !trip.pidValues ? "Nessun dato PID — viaggio solo MyOpel o CSV non importato correttamente." : "Nessun PID trovato."}
                 </td></tr>
               )}
             </tbody>
@@ -618,7 +618,7 @@ const PidExplorerInner = ({ trip }) => {
             <div style={{ fontSize: 11, color: "var(--fg-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
               {selPid.group} · {selPid.kind}
             </div>
-            <div style={{ fontSize: 16, color: "var(--fg-0)", fontWeight: 600, marginTop: 4 }}>{selPid.short}</div>
+            <div style={{ fontSize: 16, color: "var(--fg-0)", fontWeight: 600, marginTop: 4 }}>{selPid.name.replace(/^\[(ECM|TCU)\]\s*/i, "")}</div>
             <div className="muted mono" style={{ fontSize: 11, marginTop: 2 }}>{selPid.name}</div>
             <div className="muted mono" style={{ fontSize: 11 }}>slug: <span style={{ color: "var(--fg-1)" }}>{selPid.slug}</span></div>
 
