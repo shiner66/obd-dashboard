@@ -26,17 +26,28 @@ def per_trip(trip: dict) -> list[dict]:
 
     # DPF state narrative
     state = trip.get("dpfRegenState") or "idle"
-    state_msg = {
-        "idle":      "Nessuna rigenerazione DPF in questo viaggio.",
-        "requested": "Rigenerazione DPF richiesta ma non completata — viaggio troppo breve.",
-        "active":    "Rigenerazione DPF in corso durante il viaggio.",
-        "completed": "Rigenerazione DPF completata con successo durante il viaggio.",
-        "post_regen":"Rigenerazione DPF appena completata prima di questo viaggio.",
-    }.get(state, "")
-    if state_msg:
-        out.append(_ins("dpf",
-            "warning" if state == "requested" else "info",
-            "Stato rigenerazione DPF", state_msg))
+    if state == "requested":
+        egt = trip.get("exhaustAfterCatC")
+        if egt and egt > 450:
+            regen_body = (
+                f"Rigenerazione DPF richiesta. EGT massima {egt:.0f}°C — "
+                "temperature FAP quasi raggiunte ma viaggio terminato prima del completamento."
+            )
+        else:
+            regen_body = (
+                "Rigenerazione DPF richiesta ma non completata — "
+                "viaggio troppo breve o temperature FAP insufficienti."
+            )
+        out.append(_ins("dpf", "warning", "Rigenerazione DPF richiesta", regen_body))
+    elif state == "active":
+        out.append(_ins("dpf", "info", "Rigenerazione DPF in corso",
+            "Rigenerazione attiva durante il viaggio."))
+    elif state == "completed":
+        out.append(_ins("dpf", "info", "Rigenerazione DPF completata",
+            "Rigenerazione completata con successo durante il viaggio."))
+    elif state == "post_regen":
+        out.append(_ins("dpf", "info", "Post-rigenerazione",
+            "Rigenerazione completata prima di questo viaggio."))
 
     # Soot level alert
     soot = trip.get("dpfSootPct")
@@ -72,11 +83,12 @@ def per_trip(trip: dict) -> list[dict]:
             out.append(_ins("engine", "warning", f"Diluizione olio {dil:.1f}%",
                 "Monitorare nel tempo."))
 
-    # Stop-and-Start fault
+    # Stop-and-Start state — only report actual faults (state 7).
+    # State 9 = inibito temporaneo (normale: termica, A/C, batteria); non è un guasto.
     ss = trip.get("ssState")
-    if ss == 9:
-        out.append(_ins("engine", "warning", "Stop&Start in stato di guasto",
-            "Codice 9 — controllare batteria e sistema Start&Stop."))
+    if ss == 7:
+        out.append(_ins("engine", "warning", "Stop&Start — guasto rilevato",
+            "Il sistema Stop&Start ha riportato un guasto. Diagnostica raccomandata."))
 
     # Fuel consumption context
     l100 = trip.get("consumptionL100km")

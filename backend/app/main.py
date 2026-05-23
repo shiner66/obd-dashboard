@@ -396,6 +396,25 @@ def fix_myop_timestamps():
     return {"timestamps_fixed": ts_fixed, "duplicates_removed": duplicates_removed}
 
 
+@app.post("/api/v1/admin/recompute-insights")
+def recompute_insights():
+    """Recompute per-trip insights for all OBD trips using current rules.
+
+    Safe to call multiple times. Use after updating insight/DPF logic to
+    refresh the stored insights without re-uploading CSV files.
+    """
+    trips = db.get_all_trips()
+    updated = 0
+    for trip in trips:
+        if "obd" not in trip.get("sources", []):
+            continue
+        new_insights = insight_svc.per_trip(trip)
+        db.update_insights(trip["id"], new_insights)
+        updated += 1
+    log.info("recompute-insights: updated %d OBD trips", updated)
+    return {"updated": updated}
+
+
 @app.get("/api/v1/debug/data-error")
 def debug_data_error():
     """Diagnose why data.js fails: find the first trip field that can't be serialized."""
