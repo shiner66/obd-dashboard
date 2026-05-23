@@ -266,8 +266,12 @@ def _row_to_trip(row: dict) -> dict:
         "oilMaxC":               row.get("oil_temp_max_c"),
         "odometerKm":            row.get("odometer_km"),
         "airTempC":              row.get("air_temp_c"),
-        "fuelConsumedL":         row.get("fuel_consumed_l"),
-        "consumptionL100km":     row.get("consumption_l100km"),
+        "fuelConsumedL":         row.get("fuel_consumed_l") or row.get("myop_fuel_consumed_l"),
+        "consumptionL100km":     row.get("consumption_l100km") or (
+            round(row["myop_fuel_consumed_l"] / row["distance_km"] * 100, 2)
+            if row.get("myop_fuel_consumed_l") and row.get("distance_km")
+            else None
+        ),
         "dpfSootPct":            row.get("dpf_soot_pct"),
         "dpfClosedSoot":         row.get("dpf_closed_soot"),
         "dpfRegenActive":        row.get("dpf_regen_active") or 0,
