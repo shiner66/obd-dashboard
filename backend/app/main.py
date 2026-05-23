@@ -164,12 +164,26 @@ async def lifespan(app: FastAPI):
     _watcher.watch(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
     _watcher.start()
 
-    # Regenerate cross-trip insights and store on the most recent trip
+    _recompute_all_insights()
     _refresh_cross_trip_insights()
 
     yield
 
     _watcher.stop()
+
+
+def _recompute_all_insights() -> None:
+    try:
+        trips = db.get_all_trips()
+        updated = 0
+        for trip in trips:
+            if "obd" not in trip.get("sources", []):
+                continue
+            db.update_insights(trip["id"], insight_svc.per_trip(trip))
+            updated += 1
+        log.info("Recomputed per-trip insights for %d OBD trips", updated)
+    except Exception:
+        log.exception("Per-trip insight recompute failed")
 
 
 def _refresh_cross_trip_insights() -> None:
