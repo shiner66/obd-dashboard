@@ -420,7 +420,7 @@ const TripDpf = ({ trip }) => {
           <span className="section-title">DPF state machine</span>
           <span className="section-sub">§8 — derivata da regen_status + EGT + Δkm</span>
         </div>
-        <div style={{ display: "flex", gap: 0, alignItems: "center", flexWrap: "wrap" }}>
+        <div className="dpf-state-row" style={{ display: "flex", gap: 0, alignItems: "center", flexWrap: "wrap" }}>
           {stages.map((s, i) => (
             <React.Fragment key={s}>
               <div style={{
@@ -564,7 +564,7 @@ const PidExplorerInner = ({ trip }) => {
           </div>
         </div>
 
-        <div style={{ maxHeight: "60vh", overflow: "auto" }}>
+        <div className="pid-scroll">
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead style={{ position: "sticky", top: 0, background: "var(--bg-2)", zIndex: 2 }}>
               <tr style={{ textAlign: "left", color: "var(--fg-3)" }}>
@@ -687,7 +687,7 @@ const MapView = () => {
         ))}
       </div>
       <div className="detail">
-        <div className="map-wrap" style={{ height: "calc(100vh - 80px - 48px)" }}>
+        <div className="map-wrap map-fullpage">
           <TripMap trip={trip} allTrips={obdTrips} height={"100%"} />
           <div className="map-overlay">
             <div className="lbl">Provincia di Salerno</div>
@@ -808,7 +808,7 @@ const MyOpelView = () => {
             <span className="section-title">Cronologia viaggi</span>
             <span className="section-sub">canale Stellantis · TCU</span>
           </div>
-          <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)", overflow: "hidden" }}>
+          <div className="table-wrap" style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
               <thead>
                 <tr style={{ textAlign: "left", color: "var(--fg-3)", background: "var(--bg-2)" }}>

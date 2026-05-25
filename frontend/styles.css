@@ -109,7 +109,14 @@ html, body, #root {
   font-size: var(--font-size);
   line-height: 1.4;
   -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior-y: none;
   transition: background var(--anim-med) var(--ease), color var(--anim-med) var(--ease);
+}
+/* Prevent iOS Safari from auto-zooming into input fields */
+input, select, textarea, button { font-size: inherit; }
+@media (max-width: 760px) {
+  input, select, textarea { font-size: 16px !important; }
 }
 
 /* ===== Keyframes ===== */
@@ -163,6 +170,7 @@ button { font-family: inherit; }
   display: grid;
   grid-template-columns: 240px 1fr;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
   transition: grid-template-columns var(--anim-med) var(--ease);
 }
@@ -281,11 +289,16 @@ button { font-family: inherit; }
 
 .topbar {
   display: flex; align-items: center; gap: 16px;
-  padding: 14px 24px;
+  padding:
+    max(14px, env(safe-area-inset-top))
+    max(24px, env(safe-area-inset-right))
+    14px
+    max(24px, env(safe-area-inset-left));
   border-bottom: 1px solid var(--line-soft);
   background: var(--bg-0);
   position: relative;
   z-index: 50;
+  flex: 0 0 auto;
 }
 .menu-btn {
   display: none;
@@ -334,8 +347,36 @@ button { font-family: inherit; }
 .icon-btn:hover { background: var(--bg-3); }
 
 /* ===== Content layouts ===== */
-.content { flex: 1; overflow: auto; }
+.content {
+  flex: 1;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  min-height: 0;
+  padding-bottom: env(safe-area-inset-bottom);
+}
 .page { padding: 24px; max-width: 100%; }
+
+/* Table-scroll wrapper — overflow:hidden on desktop preserves rounded corners,
+   overflow-x:auto on mobile lets wide tables scroll horizontally */
+.table-wrap { overflow: hidden; }
+
+/* Full-page map: uses dynamic viewport height so iOS Safari URL bar doesn't cut it */
+.map-fullpage {
+  height: calc(100vh - 130px);
+  height: calc(100dvh - 130px);
+  min-height: 280px;
+}
+
+/* PID Explorer scroll container — fallback to vh on browsers without dvh */
+.pid-scroll {
+  max-height: 60vh;
+  max-height: 60dvh;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+@media (max-width: 760px) {
+  .pid-scroll { max-height: 50dvh; }
+}
 .page-grid {
   display: grid;
   grid-template-columns: 420px 1fr;
@@ -837,15 +878,20 @@ button { font-family: inherit; }
     grid-template-columns: 1fr;
     position: relative;
   }
-  .menu-btn { display: inline-flex; align-items: center; justify-content: center; }
+  .menu-btn { display: inline-flex; align-items: center; justify-content: center; padding: 8px 10px; }
   .app .sidebar {
     position: fixed;
     top: 0; left: 0; bottom: 0;
-    width: 260px;
-    padding: 18px 12px;
+    width: min(260px, 80vw);
+    padding:
+      max(18px, env(safe-area-inset-top))
+      12px
+      max(18px, env(safe-area-inset-bottom));
     transform: translateX(-100%);
     box-shadow: 8px 0 30px oklch(0 0 0 / 0.4);
     border-right: 1px solid var(--line);
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
   .app .sidebar > * { display: flex; }
   .app .sidebar .nav-item span:not(.nav-badge):not(.src-tag),
@@ -853,7 +899,7 @@ button { font-family: inherit; }
   .app .sidebar .nav-section,
   .app .sidebar .veh-card,
   .app .sidebar .nav-item .nav-badge { display: revert; }
-  .app .sidebar .nav-item { justify-content: flex-start; padding: 8px 10px; }
+  .app .sidebar .nav-item { justify-content: flex-start; padding: 10px 12px; min-height: 40px; }
   .app.drawer-open .sidebar { transform: translateX(0); }
   .app.drawer-open::after {
     content: "";
@@ -862,31 +908,111 @@ button { font-family: inherit; }
     z-index: 90;
     animation: fadeIn var(--anim-fast) var(--ease);
   }
-  .topbar { padding: 10px 14px; }
-  .topbar h1 { font-size: 16px; }
+  .topbar {
+    padding:
+      max(10px, env(safe-area-inset-top))
+      max(14px, env(safe-area-inset-right))
+      10px
+      max(14px, env(safe-area-inset-left));
+    gap: 10px;
+  }
+  .topbar > div { min-width: 0; }
+  .topbar h1 {
+    font-size: 16px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .topbar .crumb { display: none; }
   .topbar .search { display: none; }
   .topbar .icon-btn span { display: none; }
-  .page { padding: 14px; }
+  .topbar .icon-btn { padding: 8px 10px; }
+
+  .page { padding: 14px; padding-bottom: max(14px, env(safe-area-inset-bottom)); }
   .page-grid {
     grid-template-columns: 1fr;
     grid-template-rows: auto 1fr;
+    height: auto;
   }
-  .page-grid > .trip-list { max-height: 38vh; }
+  .page-grid > .trip-list { max-height: 40vh; max-height: 40dvh; padding: 12px; }
   .stat-grid { grid-template-columns: 1fr 1fr !important; gap: 8px; }
   .hero-grid { grid-template-columns: 1fr !important; }
-  .dpf-block { grid-template-columns: 1fr !important; text-align: center; }
+  .dpf-block { grid-template-columns: 1fr !important; text-align: center; padding: 14px; gap: 14px; }
   .dpf-block .gauge-radial { margin: 0 auto; }
+  .dpf-meta { grid-template-columns: 1fr 1fr; gap: 10px 14px; text-align: left; }
   .detail { padding: 14px; gap: 14px; }
-  .detail-title { font-size: 16px; }
-  .detail-sub { flex-wrap: wrap; }
+  .detail-head { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .detail-title { font-size: 16px; line-height: 1.3; }
+  .detail-sub { flex-wrap: wrap; gap: 8px 12px; font-size: 11.5px; }
   .trend-grid { grid-template-columns: 1fr !important; }
-  .spark-grid { grid-template-columns: 1fr 1fr; }
-  .trip-card-stats { flex-wrap: wrap; gap: 10px; }
-  .map-wrap { height: 280px !important; }
+  .spark-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .trip-card-stats { flex-wrap: wrap; gap: 10px 14px; }
+  .trip-card-stats > .trip-stat { flex: 1 1 calc(50% - 14px); min-width: 0; }
+  .map-wrap { height: 280px; }
+  .map-fullpage { height: calc(100dvh - 110px); min-height: 240px; }
+
   /* PID Explorer: stack table + detail */
   .pid-explorer-grid { grid-template-columns: 1fr !important; }
   .pid-detail-card { position: static !important; }
+
+  /* Inline grid-template-columns inside .page collapses to a single column */
+  .page > div[style*="grid-template-columns"] {
+    grid-template-columns: 1fr !important;
+  }
+
+  /* Tabs scroll horizontally instead of wrapping awkwardly */
+  .tabs {
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { white-space: nowrap; flex-shrink: 0; padding: 10px 14px; min-height: 40px; }
+
+  /* Filter chips: bigger touch targets */
+  .chip { padding: 7px 12px; font-size: 12px; min-height: 30px; }
+  .filter-row { gap: 6px 8px; }
+
+  /* Table containers scroll horizontally */
+  .table-wrap {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+  }
+  .table-wrap table { min-width: 560px; }
+
+  /* DPF state machine row: smaller pills + tighter gaps */
+  .dpf-state-row { gap: 4px; }
+  .dpf-state-row > div { font-size: 11px !important; padding: 6px 10px !important; }
+
+  /* Sidebar drawer is taller than topbar — ensure it doesn't get hidden behind it */
+  .sidebar { z-index: 100; }
+
+  /* Tighter insight cards */
+  .insight { padding: 10px 12px; gap: 10px; }
+  .insight-cat { flex: 0 0 56px; font-size: 9px; }
+  .insight-text { font-size: 12.5px; }
+
+  /* Animated bar inside dashboard fuel block stays centered */
+  .dpf-block > div[style*="width: 120"] { width: 100% !important; }
+
+  /* Avoid sticky position-related glitches on iOS */
+  .pid-detail-card { top: auto !important; }
+}
+
+/* Very small phones (iPhone SE etc.) */
+@media (max-width: 380px) {
+  .stat-grid { grid-template-columns: 1fr !important; }
+  .spark-grid { grid-template-columns: 1fr; }
+  .topbar { gap: 8px; }
+  .topbar h1 { font-size: 15px; }
+  .page { padding: 12px; }
+}
+
+/* Landscape with limited height (e.g. iPhone landscape) */
+@media (max-height: 500px) and (orientation: landscape) {
+  .page-grid > .trip-list { max-height: 50dvh; }
+  .map-fullpage { height: calc(100dvh - 80px); }
 }
 
 /* Page transition wrapper */
