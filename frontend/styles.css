@@ -285,7 +285,7 @@ button { font-family: inherit; }
 .veh-row .v { font-family: var(--font-mono); color: var(--fg-1); }
 
 /* ===== Main column ===== */
-.main { display: flex; flex-direction: column; min-width: 0; }
+.main { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 
 .topbar {
   display: flex; align-items: center; gap: 16px;
@@ -349,8 +349,9 @@ button { font-family: inherit; }
 /* ===== Content layouts ===== */
 .content {
   flex: 1;
-  overflow: auto;
+  overflow-y: scroll;
   -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
   min-height: 0;
   padding-bottom: env(safe-area-inset-bottom);
 }

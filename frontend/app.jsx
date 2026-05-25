@@ -410,7 +410,7 @@ const TripDpf = ({ trip }) => {
           <div><div className="lbl">Capacità regen</div><div className="v">LT {trip.dpfRegenCapability}% · ST {trip.dpfRegenCapabilityST}%</div></div>
           <div><div className="lbl">EGT post-cat (peak)</div><div className="v">{trip.exhaustAfterCatC} <span className="muted">°C</span></div></div>
           <div><div className="lbl">NOx cat (peak)</div><div className="v">{trip.noxCatTempMaxC} <span className="muted">°C</span></div></div>
-          <div><div className="lbl">Vita residua DPF</div><div className="v">{(trip.dpfReplaceKm / 1000).toFixed(1)}k <span className="muted">km</span></div></div>
+          <div><div className="lbl">Vita residua DPF</div><div className="v">{trip.dpfReplaceKm != null ? (trip.dpfReplaceKm / 1000).toFixed(1) + "k" : "—"} <span className="muted">km</span></div></div>
           <div><div className="lbl">Olio dilution</div><div className="v">{trip.oilDilutionPct} <span className="muted">%</span></div></div>
         </div>
       </div>
@@ -831,8 +831,8 @@ const MyOpelView = () => {
                         {new Date(t.start).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
                       </span>
                     </td>
-                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.distanceKm.toFixed(1)} <span className="muted">km</span></td>
-                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.durationMin.toFixed(0)} <span className="muted">min</span></td>
+                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.distanceKm?.toFixed(1) ?? "—"} <span className="muted">km</span></td>
+                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.durationMin?.toFixed(0) ?? "—"} <span className="muted">min</span></td>
                     <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.consumptionL100km?.toFixed(2)} <span className="muted">L/100</span></td>
                     <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.costEur ? `€${t.costEur.toFixed(2)}` : "—"}</td>
                     <td style={{ padding: "10px 12px" }}>
