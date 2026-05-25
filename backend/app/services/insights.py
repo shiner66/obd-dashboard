@@ -59,10 +59,11 @@ def per_trip(trip: dict) -> list[dict]:
             out.append(_ins("dpf", "warning", f"DPF al {soot:.0f}%",
                 "Presto necessaria rigenerazione. Evita tragitti urbani brevi consecutivi."))
 
-    # Short-term regen capability drop
+    # Short-term regen capability drop — only fire when ST is notably lower than LT
+    # and the absolute value is below threshold (avoids spurious alerts on normal operation)
     st = trip.get("dpfRegenCapabilityST")
     lt = trip.get("dpfRegenCapability")
-    if st is not None and lt is not None and lt > 0 and st < lt * 0.5:
+    if st is not None and lt is not None and lt > 0 and st < lt * 0.7 and st < 80:
         out.append(_ins("dpf", "warning",
             "Capacità rigenerazione a breve termine ridotta",
             f"ST {st:.0f}% vs LT {lt:.0f}%. Possibile problema con la rigenerazione post-guida."))
@@ -138,13 +139,6 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         if last < 500:
             out.append(_ins("adblue", "critical", f"Autonomia AdBlue: {last:.0f} km",
                 "Rifornisci a breve per evitare blocco del motore."))
-
-    # Soot accumulation pattern (informational, only if we have data)
-    soot_vals = [t["dpfSootPct"] for t in obd if t.get("dpfSootPct") is not None]
-    if soot_vals:
-        out.append(_ins("dpf", "info", "Accumulo fuliggine medio",
-            "+0.42 %/km su tragitti urbani brevi; +0.18 %/km su extraurbano. "
-            "Pattern coerente con uso misto."))
 
     # MyOpel fuel cost summary — use costEur when already computed, or compute from fuelConsumedL
     costed = [t for t in trips if t.get("costEur") is not None]

@@ -275,7 +275,7 @@ def _row_to_trip(row: dict) -> dict:
         "dpfSootPct":            row.get("dpf_soot_pct"),
         "dpfClosedSoot":         row.get("dpf_closed_soot"),
         "dpfRegenActive":        row.get("dpf_regen_active") or 0,
-        "dpfRegenState":         row.get("dpf_regen_state") or "idle",
+        "dpfRegenState":         row.get("dpf_regen_state") or (None if row.get("source") == "myop" else "idle"),
         "dpfRegenCapability":    row.get("dpf_regen_capability"),
         "dpfRegenCapabilityST":  row.get("dpf_regen_capability_st"),
         "dpfSinceRegenKm":       row.get("dpf_since_regen_km"),

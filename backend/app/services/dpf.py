@@ -19,6 +19,16 @@ _DIST_REGEN      = "[ECM] Distance traveled since the last regeneration"
 _MIN_REGEN_SAMPLES = 3
 
 
+def _consecutive_below(recs: list, threshold: float, n: int) -> bool:
+    """Return True if there are at least n consecutive records with value < threshold."""
+    count = 0
+    for _, v in recs:
+        count = count + 1 if v < threshold else 0
+        if count >= n:
+            return True
+    return False
+
+
 def compute_state(pid_series: dict[str, list[tuple[float, float]]]) -> tuple[str, int]:
     """
     Returns (state_str, regen_active_int) from per-PID (ts, value) series.
@@ -50,9 +60,9 @@ def compute_state(pid_series: dict[str, list[tuple[float, float]]]) -> tuple[str
     soot_end = soot_cl_vals[-1] if soot_cl_vals else None
 
     dist_reset_in_trip = (
-        len(dist_regen_recs) >= 2
+        len(dist_regen_recs) >= _MIN_REGEN_SAMPLES + 1
         and dist_regen_recs[0][1] > 20
-        and any(v < dist_regen_recs[0][1] * 0.1 for _, v in dist_regen_recs[1:])
+        and _consecutive_below(dist_regen_recs[1:], dist_regen_recs[0][1] * 0.1, _MIN_REGEN_SAMPLES)
     )
 
     cooldown_started = (

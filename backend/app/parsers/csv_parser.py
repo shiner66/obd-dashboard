@@ -8,9 +8,13 @@ import csv
 import logging
 import re
 import statistics
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
+from zoneinfo import ZoneInfo
+
+_ROME_TZ = ZoneInfo("Europe/Rome")
+_UTC_TZ  = ZoneInfo("UTC")
 
 from ..services import rbs as rbs_svc
 from ..services.dpf import compute_state as dpf_state
@@ -293,7 +297,13 @@ def parse_file(path: str | Path) -> list[dict]:
         try:
             dt_local = datetime.strptime(stem, fmt)
             start_local = dt_local.isoformat()
-            start_utc   = (dt_local - timedelta(hours=2)).isoformat()
+            # Convert local Italian time → UTC using proper DST rules (CET/CEST)
+            start_utc = (
+                dt_local.replace(tzinfo=_ROME_TZ)
+                .astimezone(_UTC_TZ)
+                .replace(tzinfo=None)
+                .isoformat()
+            )
             break
         except ValueError:
             continue
@@ -460,7 +470,7 @@ def parse_file(path: str | Path) -> list[dict]:
         "maxRpm":                int(fields["max_rpm"]) if fields.get("max_rpm") else None,
         "coolantMaxC":           _r(fields.get("coolant_max_c"), 1),
         "oilMaxC":               _r(fields.get("oil_temp_max_c"), 1),
-        "odometerKm":            int(fields["odometer_km"]) if fields.get("odometer_km") else None,
+        "odometerKm":            round(fields["odometer_km"]) if fields.get("odometer_km") else None,
         "airTempC":              _r(fields.get("air_temp_c"), 1),
         "fuelConsumedL":         fuel_consumed_l,
         "consumptionL100km":     consumption_l100km,

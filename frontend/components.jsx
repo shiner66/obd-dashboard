@@ -210,7 +210,7 @@ const TripMap = ({ trip, allTrips = null, height = 340 }) => {
         preferCanvas: true,
       }).setView([40.572, 14.854], 11);
       window.L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        attribution: "© OSM",
+        attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>',
         maxZoom: 18,
       }).addTo(mapRef.current);
     }

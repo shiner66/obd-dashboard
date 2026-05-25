@@ -35,6 +35,12 @@ ALERT_DICT: dict[int, dict] = {
     60: {"sev": "warning",  "label": "Pressione pneumatico FR insufficiente"},
     61: {"sev": "warning",  "label": "Pressione pneumatico RL insufficiente"},
     62: {"sev": "warning",  "label": "Pressione pneumatico RR insufficiente"},
+    100: {"sev": "info",    "label": "Segnalazione veicolo (sistema)"},
+    102: {"sev": "info",    "label": "Notifica telematica TCU"},
+    108: {"sev": "warning", "label": "Avviso sistema — codice 108"},
+    109: {"sev": "warning", "label": "Avviso sistema — codice 109"},
+    110: {"sev": "warning", "label": "Avviso sistema — codice 110"},
+    141: {"sev": "info",    "label": "Aggiornamento stato veicolo"},
 }
 
 

@@ -118,15 +118,19 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
   const totalFuel = TRIPS.reduce((a, t) => a + (t.fuelConsumedL || 0), 0);
   const avgCons = totalFuel > 0 ? (totalFuel / totalKm * 100) : 0;
   const cost = TRIPS.reduce((a, t) => a + (t.costEur || 0), 0);
+  const fuelPriced = myop.filter(t => t.priceFuel);
+  const avgFuelPrice = fuelPriced.length > 0
+    ? fuelPriced.reduce((a, t) => a + t.priceFuel, 0) / fuelPriced.length
+    : null;
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 24 }}>
       <div className="stat-grid stagger" style={{ gridTemplateColumns: "repeat(5, 1fr)" }}>
         <StatCard label="Viaggi totali" value={TRIPS.length} sub={`${obd.length} OBD · ${myop.length} MyOpel`} />
-        <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" sub="ultimi 8 giorni" />
+        <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" sub="tutti i viaggi" />
         <StatCard label="Tempo guida" value={(totalMin / 60).toFixed(1)} unit="h" sub={`${Math.round(totalMin)} minuti`} />
         <StatCard label="Consumo medio" value={avgCons.toFixed(2)} unit="L/100km" sub="da PID L/h integrato" />
-        <StatCard label="Spesa MyOpel" value={`€${cost.toFixed(2)}`} sub={`${myop.length} viaggi · €1.78/L`} />
+        <StatCard label="Spesa MyOpel" value={`€${cost.toFixed(2)}`} sub={`${myop.length} viaggi · €${avgFuelPrice?.toFixed(3) ?? "—"}/L`} />
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
@@ -134,9 +138,9 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
           <RadialGauge value={VEHICLE.dpfSoot} max={100} label="Soot %" />
           <div className="dpf-meta">
             <div><div className="lbl">Km dall'ultima regen</div><div className="v">{VEHICLE.dpfSinceRegenKm} <span className="muted">/ {VEHICLE.dpfAvgRegenKm}</span></div></div>
-            <div><div className="lbl">Vita residua DPF</div><div className="v">89.3k km</div></div>
-            <div><div className="lbl">Capacità LT</div><div className="v">92%</div></div>
-            <div><div className="lbl">Stato</div><div className="v"><DpfPill state="idle" /></div></div>
+            <div><div className="lbl">Vita residua DPF</div><div className="v">{VEHICLE.dpfReplaceKm ? (VEHICLE.dpfReplaceKm / 1000).toFixed(1) + "k km" : "—"}</div></div>
+            <div><div className="lbl">Capacità LT</div><div className="v">{VEHICLE.dpfRegenCapability != null ? VEHICLE.dpfRegenCapability + "%" : "—"}</div></div>
+            <div><div className="lbl">Stato</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState || "idle"} /></div></div>
           </div>
         </div>
 
@@ -151,7 +155,7 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
             <div><div className="lbl">AdBlue range</div><div className="v">{VEHICLE.adblueRange?.toLocaleString("it-IT") ?? "—"} km</div></div>
             <div><div className="lbl">Batteria avvio</div><div className="v">{VEHICLE.battery?.toFixed(2) ?? "—"} V</div></div>
             <div><div className="lbl">Prox. tagliando</div><div className="v">{VEHICLE.nextService?.days ?? "—"} g</div></div>
-            <div><div className="lbl">Olio dilution</div><div className="v">1.0 %</div></div>
+            <div><div className="lbl">Olio dilution</div><div className="v">{VEHICLE.oilDilutionPct != null ? VEHICLE.oilDilutionPct + " %" : "—"}</div></div>
           </div>
         </div>
       </div>
@@ -716,8 +720,8 @@ const DpfView = () => {
         <div className="dpf-block">
           <RadialGauge value={VEHICLE.dpfSoot} max={100} label="Soot %" />
           <div className="dpf-meta">
-            <div><div className="lbl">Stato attuale</div><div className="v"><DpfPill state="idle" /></div></div>
-            <div><div className="lbl">Closed-loop</div><div className="v">18.4 <span className="muted">g/L</span></div></div>
+            <div><div className="lbl">Stato attuale</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState || "idle"} /></div></div>
+            <div><div className="lbl">Closed-loop</div><div className="v">{obdTrips[obdTrips.length - 1]?.dpfClosedSoot ?? "—"} <span className="muted">g/L</span></div></div>
             <div><div className="lbl">Km da regen</div><div className="v">{VEHICLE.dpfSinceRegenKm}</div></div>
             <div><div className="lbl">Avg interval</div><div className="v">{VEHICLE.dpfAvgRegenKm} km</div></div>
           </div>
@@ -752,8 +756,8 @@ const DpfView = () => {
                 <DpfPill state={t.dpfRegenState} />
               </div>
               <div className="trip-card-stats">
-                <div className="trip-stat"><span className="lbl">Soot inizio→fine</span>
-                  <span className="val mono">{(t.dpfSootPct + 3).toFixed(0)}→{t.dpfSootPct}<span className="unit"> %</span></span>
+                <div className="trip-stat"><span className="lbl">Soot DPF</span>
+                  <span className="val mono">{t.dpfSootPct}<span className="unit"> %</span></span>
                 </div>
                 <div className="trip-stat"><span className="lbl">EGT picco</span>
                   <span className="val mono">{t.exhaustAfterCatC}<span className="unit"> °C</span></span>
@@ -784,12 +788,16 @@ const MyOpelView = () => {
   const totalFuel = myop.reduce((a, t) => a + (t.fuelConsumedL || 0), 0);
   const totalKm = myop.reduce((a, t) => a + (t.distanceKm || 0), 0);
   const allAlerts = myop.flatMap(t => (t.alerts || []).map(c => ({ code: c, trip: t })));
+  const fuelPriced = myop.filter(t => t.priceFuel);
+  const avgPrice = fuelPriced.length > 0
+    ? fuelPriced.reduce((a, t) => a + t.priceFuel, 0) / fuelPriced.length
+    : null;
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div className="stat-grid" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
         <StatCard label="Viaggi MyOpel" value={myop.length} sub="ultima sincronizzazione email: oggi 11:02" />
-        <StatCard label="Spesa totale" value={`€${totalCost.toFixed(2)}`} sub={`${totalFuel.toFixed(2)} L · €1.78/L`} />
+        <StatCard label="Spesa totale" value={`€${totalCost.toFixed(2)}`} sub={`${totalFuel.toFixed(2)} L · €${avgPrice?.toFixed(3) ?? "—"}/L`} />
         <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" />
         <StatCard label="Alerts MyOpel" value={allAlerts.length} sub={`${new Set(allAlerts.map(a => a.code)).size} unici`} />
       </div>
@@ -843,29 +851,25 @@ const MyOpelView = () => {
 
         <div>
           <div className="section-head">
-            <span className="section-title">Pipeline ingestione</span>
-            <span className="section-sub">IMAP push (IDLE)</span>
+            <span className="section-title">Ingestione .myop</span>
+            <span className="section-sub">watchdog /data/myop</span>
           </div>
           <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)", padding: 14, fontSize: 12, display: "flex", flexDirection: "column", gap: 6 }}>
             <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: "var(--ok)" }}></span>
-              <span style={{ flex: 1 }}>Inbox connessa</span>
-              <span className="mono muted">2s fa</span>
+              <span style={{ flex: 1 }}>Sorgente</span>
+              <span className="mono muted">file .myop</span>
             </div>
             <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: "var(--ok)" }}></span>
-              <span style={{ flex: 1 }}>Ultimo .myop ricevuto</span>
-              <span className="mono muted">11:02</span>
+              <span style={{ flex: 1 }}>Viaggi caricati</span>
+              <span className="mono muted">{myop.length}</span>
             </div>
-            <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: "var(--ok)" }}></span>
+            <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: VEHICLE.vin ? "var(--ok)" : "var(--warn)" }}></span>
               <span style={{ flex: 1 }}>VIN identificato</span>
-              <span className="mono muted">{VEHICLE.vin.slice(-6)}</span>
-            </div>
-            <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: "var(--warn)" }}></span>
-              <span style={{ flex: 1 }}>Offset timezone CEST</span>
-              <span className="mono muted">-2h</span>
+              <span className="mono muted">{VEHICLE.vin?.slice(-6) ?? "—"}</span>
             </div>
             <div className="divider"></div>
             <div className="muted" style={{ fontSize: 11, lineHeight: 1.5 }}>
-              Ogni email Stellantis contiene <span className="mono">tutti</span> i viaggi cumulativamente.
+              Ogni file .myop contiene <span className="mono">tutti</span> i viaggi cumulativamente.
               I duplicati sono dedotti tramite trip ID.
             </div>
           </div>

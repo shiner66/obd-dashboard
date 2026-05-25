@@ -21,9 +21,12 @@ from .services.watcher import Watcher
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 
-OBD_FILES_DIR  = Path(os.getenv("OBD_FILES_DIR",  "/data/obd"))
-MYOP_FILES_DIR = Path(os.getenv("MYOP_FILES_DIR", "/data/myop"))
-DB_PATH        = Path(os.getenv("DB_PATH",        "/data/db/trips.db"))
+OBD_FILES_DIR   = Path(os.getenv("OBD_FILES_DIR",   "/data/obd"))
+MYOP_FILES_DIR  = Path(os.getenv("MYOP_FILES_DIR",  "/data/myop"))
+DB_PATH         = Path(os.getenv("DB_PATH",         "/data/db/trips.db"))
+VEHICLE_NAME    = os.getenv("VEHICLE_NAME",    "Peugeot 308 SW")
+VEHICLE_ECU     = os.getenv("VEHICLE_ECU",     "MD1CS003 — 1.5 BlueHDi")
+VEHICLE_ADAPTER = os.getenv("VEHICLE_ADAPTER", "BTLE IOS-Vlink")
 
 _watcher = Watcher()
 
@@ -59,21 +62,32 @@ def _trips_match(obd: dict, myop: dict) -> bool:
 
 
 def _correlate_new_obd(obd_trip: dict) -> None:
-    """After saving an OBD trip, check if any unmatched myop trip matches it."""
+    """After saving an OBD trip, check if any unmatched myop trip matches it.
+
+    Picks the closest match by start-time delta rather than the first result.
+    """
     all_trips = db.get_all_trips()
+    candidates: list[tuple[float, dict]] = []
     for t in all_trips:
         if "myopel" not in t.get("sources", []):
             continue
         if "obd" in t.get("sources", []):
-            continue                            # already merged
+            continue
         if _trips_match(obd_trip, t):
-            log.info("Correlating OBD %s → myop %s", obd_trip["id"], t["id"])
-            db.enrich_with_myop(obd_trip["id"], t)
-            # Delete the now-absorbed standalone myop entry.
-            if t.get("id") and db.trip_exists(t["id"]):
-                db.delete_trip(t["id"])
-                log.info("Deleted absorbed myop entry %s", t["id"])
-            break
+            t1 = _parse_dt(obd_trip.get("start"))
+            t2 = _parse_dt(t.get("start"))
+            delta = abs((t1 - t2).total_seconds()) if t1 and t2 else float("inf")
+            candidates.append((delta, t))
+
+    if not candidates:
+        return
+
+    _, best = min(candidates, key=lambda x: x[0])
+    log.info("Correlating OBD %s → myop %s", obd_trip["id"], best["id"])
+    db.enrich_with_myop(obd_trip["id"], best)
+    if best.get("id") and db.trip_exists(best["id"]):
+        db.delete_trip(best["id"])
+        log.info("Deleted absorbed myop entry %s", best["id"])
 
 
 def _correlate_new_myop(myop_trip: dict) -> bool:
@@ -160,6 +174,21 @@ async def lifespan(app: FastAPI):
     _scan_directory(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
     _scan_directory(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
 
+    # Idempotent: remove any standalone myop entries absorbed into an OBD trip
+    # (handles historical duplicates created before correlation was fixed)
+    with db._conn() as _con:
+        _res = _con.execute(
+            """DELETE FROM trips
+               WHERE source = 'myop'
+                 AND CAST(SUBSTR(id, 6) AS INTEGER) IN (
+                     SELECT myop_trip_id FROM trips
+                     WHERE source IN ('obd_csv', 'obd_brc')
+                       AND myop_trip_id IS NOT NULL
+                 )"""
+        )
+        if _res.rowcount:
+            log.info("Startup cleanup: removed %d absorbed standalone myop entries", _res.rowcount)
+
     _watcher.watch(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
     _watcher.watch(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
     _watcher.start()
@@ -234,9 +263,9 @@ def _build_vehicle(trips: list[dict]) -> dict:
     vin = next((t.get("vin", "") for t in myop_trips if t.get("vin")), "")
 
     return {
-        "name":          "Peugeot 308 SW",
-        "ecu":           "MD1CS003 — 1.5 BlueHDi",
-        "adapter":       "BTLE IOS-Vlink",
+        "name":          VEHICLE_NAME,
+        "ecu":           VEHICLE_ECU,
+        "adapter":       VEHICLE_ADAPTER,
         "vin":           vin,
         "odometer":      latest.get("odometerKm"),
         "fuelLevel":     fuel_level,
@@ -247,10 +276,14 @@ def _build_vehicle(trips: list[dict]) -> dict:
             "km":     km_svc,
             "passed": bool(maint_passed),
         },
-        "dpfSoot":         latest_obd.get("dpfSootPct"),
-        "dpfAvgRegenKm":   latest_obd.get("dpfAvgRegenKm"),
-        "dpfSinceRegenKm": latest_obd.get("dpfSinceRegenKm"),
-        "battery":         latest_obd.get("batteryStartupV"),
+        "dpfSoot":            latest_obd.get("dpfSootPct"),
+        "dpfAvgRegenKm":      latest_obd.get("dpfAvgRegenKm"),
+        "dpfSinceRegenKm":    latest_obd.get("dpfSinceRegenKm"),
+        "dpfReplaceKm":       latest_obd.get("dpfReplaceKm"),
+        "dpfRegenCapability": latest_obd.get("dpfRegenCapability"),
+        "dpfRegenState":      latest_obd.get("dpfRegenState"),
+        "oilDilutionPct":     latest_obd.get("oilDilutionPct"),
+        "battery":            latest_obd.get("batteryStartupV"),
     }
 
 
