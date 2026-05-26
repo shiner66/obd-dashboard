@@ -202,9 +202,6 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
 const TripsView = ({ selectedId, setSelectedId }) => {
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
-  const [mergeMode, setMergeMode] = useState(false);
-  const [mergeSelected, setMergeSelected] = useState([]);
-  const [merging, setMerging] = useState(false);
 
   const filtered = useMemo(() => {
     return TRIPS.filter(t => {
@@ -223,36 +220,6 @@ const TripsView = ({ selectedId, setSelectedId }) => {
   }, [filter, search]);
 
   const trip = TRIPS.find(t => t.id === selectedId) || filtered[0];
-
-  const toggleMergeSelect = (id) => {
-    setMergeSelected(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
-  };
-
-  const doMerge = async () => {
-    if (mergeSelected.length < 2) return;
-    setMerging(true);
-    const [primaryId, ...secondaryIds] = mergeSelected;
-    try {
-      const resp = await fetch("/api/v1/trips/merge", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ primary_id: primaryId, secondary_ids: secondaryIds }),
-      });
-      if (resp.ok) {
-        alert(`Viaggi uniti (${mergeSelected.length}) nel trip ${primaryId}. Ricarica la pagina per aggiornare.`);
-        setMergeMode(false);
-        setMergeSelected([]);
-        location.reload();
-      } else {
-        const err = await resp.json();
-        alert("Errore merge: " + (err.detail || resp.status));
-      }
-    } catch(e) {
-      alert("Errore di rete: " + e.message);
-    } finally {
-      setMerging(false);
-    }
-  };
 
   return (
     <div className="page-grid">
@@ -274,38 +241,11 @@ const TripsView = ({ selectedId, setSelectedId }) => {
                 {lbl} <span className="mono muted" style={{ fontSize: 10 }}>{n}</span>
               </button>
             ))}
-            <button
-              className={`chip ${mergeMode ? "active" : ""}`}
-              style={{ marginLeft: "auto", background: mergeMode ? "var(--warn-soft)" : undefined, color: mergeMode ? "var(--warn)" : undefined }}
-              onClick={() => { setMergeMode(m => !m); setMergeSelected([]); }}
-            >
-              Unisci
-            </button>
           </div>
-          {mergeMode && (
-            <div className="row" style={{ padding: "6px 0", gap: 8, flexWrap: "wrap" }}>
-              <span className="muted" style={{ fontSize: 12 }}>Seleziona ≥2 viaggi da unire (il primo sarà il principale):</span>
-              {mergeSelected.length >= 2 && (
-                <button className="icon-btn" style={{ background: "var(--warn-soft)", color: "var(--warn)" }}
-                        onClick={doMerge} disabled={merging}>
-                  {merging ? "…" : `Unisci ${mergeSelected.length} viaggi`}
-                </button>
-              )}
-            </div>
-          )}
         </div>
         <div className="stagger" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {filtered.map(t => (
-            <div key={t.id} className="row" style={{ gap: 6, alignItems: "stretch" }}>
-              {mergeMode && (
-                <input type="checkbox" checked={mergeSelected.includes(t.id)}
-                       onChange={() => toggleMergeSelect(t.id)}
-                       style={{ width: 16, flexShrink: 0, cursor: "pointer", accentColor: "var(--warn)" }} />
-              )}
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <TripCard trip={t} active={trip && t.id === trip.id} onClick={() => !mergeMode && setSelectedId(t.id)} />
-              </div>
-            </div>
+            <TripCard key={t.id} trip={t} active={trip && t.id === trip.id} onClick={() => setSelectedId(t.id)} />
           ))}
         </div>
         {filtered.length === 0 && (

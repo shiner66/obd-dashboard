@@ -401,6 +401,12 @@ def parse_file(path: str | Path) -> list[dict]:
     if fuel_consumed_l and distance_km:
         consumption_l100km = _r(fuel_consumed_l / distance_km * 100)
 
+    # Discard trips shorter than 1 km — parking-lot maneuvers, accidental triggers,
+    # and ECU restart noise have no diagnostic value and only pollute statistics.
+    if (distance_km or 0) < 1.0:
+        log.info("Skipping %s: trip too short (%.2f km)", filename, distance_km or 0)
+        return []
+
     # ── DPF state machine ─────────────────────────────────────────────────────
     dpf_regen_state, dpf_regen_active = dpf_state(pid_window)
 

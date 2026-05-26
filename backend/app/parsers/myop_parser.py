@@ -4,7 +4,13 @@ A .myop file is plain JSON with a list of {vin, trips[]} objects.
 """
 from __future__ import annotations
 import json
+import logging
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+# Trips below this distance are noise (parking maneuvers, accidental triggers).
+_MIN_DISTANCE_KM = 1.0
 
 
 def _to_local_iso(date_str: str) -> str:
@@ -157,12 +163,18 @@ def parse_file(path: str | Path) -> list[dict]:
         data = [data]
 
     trips: list[dict] = []
+    skipped = 0
     for vehicle_block in data:
         vin = vehicle_block.get("vin", "")
         for raw in vehicle_block.get("trips", []):
             trip = _parse_trip(raw, vin)
+            if (trip.get("distanceKm") or 0) < _MIN_DISTANCE_KM:
+                skipped += 1
+                continue
             trips.append(trip)
 
+    if skipped:
+        log.info("myop %s: skipped %d sub-%.0fkm trips", path.name, skipped, _MIN_DISTANCE_KM)
     return trips
 
 

@@ -5,7 +5,6 @@ import logging
 import math
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
 
 import aiofiles
@@ -15,6 +14,7 @@ from fastapi.responses import Response
 
 from . import database as db
 from .parsers import csv_parser, myop_parser
+from .services import correlator as corr_svc
 from .services import insights as insight_svc
 from .services.watcher import Watcher
 
@@ -31,91 +31,13 @@ VEHICLE_ADAPTER = os.getenv("VEHICLE_ADAPTER", "BTLE IOS-Vlink")
 _watcher = Watcher()
 
 
-# ── Trip correlation ──────────────────────────────────────────────────────────
-
-def _parse_dt(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(s[:19], fmt[:len(fmt)])
-        except ValueError:
-            continue
-    return None
-
-
-def _trips_match(obd: dict, myop: dict) -> bool:
-    """Return True if an OBD trip and a myop trip are the same real-world trip."""
-    t1 = _parse_dt(obd.get("start"))
-    t2 = _parse_dt(myop.get("start"))
-    if t1 is None or t2 is None:
-        return False
-    if abs((t1 - t2).total_seconds()) > 600:   # ±10 min
-        return False
-    d1 = obd.get("distanceKm") or 0
-    d2 = myop.get("distanceKm") or 0
-    if d1 > 0 and d2 > 0:
-        ratio = abs(d1 - d2) / max(d1, d2)
-        if ratio > 0.25:                        # ±25 % tolerance
-            return False
-    return True
-
-
-def _correlate_new_obd(obd_trip: dict) -> None:
-    """After saving an OBD trip, check if any unmatched myop trip matches it.
-
-    Picks the closest match by start-time delta rather than the first result.
-    """
-    all_trips = db.get_all_trips()
-    candidates: list[tuple[float, dict]] = []
-    for t in all_trips:
-        if "myopel" not in t.get("sources", []):
-            continue
-        if "obd" in t.get("sources", []):
-            continue
-        if _trips_match(obd_trip, t):
-            t1 = _parse_dt(obd_trip.get("start"))
-            t2 = _parse_dt(t.get("start"))
-            delta = abs((t1 - t2).total_seconds()) if t1 and t2 else float("inf")
-            candidates.append((delta, t))
-
-    if not candidates:
-        return
-
-    _, best = min(candidates, key=lambda x: x[0])
-    log.info("Correlating OBD %s → myop %s", obd_trip["id"], best["id"])
-    db.enrich_with_myop(obd_trip["id"], best)
-    if best.get("id") and db.trip_exists(best["id"]):
-        db.delete_trip(best["id"])
-        log.info("Deleted absorbed myop entry %s", best["id"])
-
-
-def _correlate_new_myop(myop_trip: dict) -> bool:
-    """After saving a myop trip, check if any OBD trip matches it.
-
-    Returns True if a match was found and the OBD trip was enriched.
-    Also deletes the standalone myop entry from DB when it is absorbed.
-    """
-    all_trips = db.get_all_trips()
-    for t in all_trips:
-        if "obd" not in t.get("sources", []):
-            continue
-        if _trips_match(t, myop_trip):
-            log.info("Correlating myop %s → OBD %s", myop_trip["id"], t["id"])
-            db.enrich_with_myop(t["id"], myop_trip)
-            # Remove the now-redundant standalone myop entry so it doesn't
-            # appear as a duplicate alongside the enriched OBD trip.
-            if db.trip_exists(myop_trip["id"]):
-                db.delete_trip(myop_trip["id"])
-                log.info("Deleted absorbed myop entry %s", myop_trip["id"])
-            return True
-    return False
-
-
 # ── File processing ───────────────────────────────────────────────────────────
+# Files are persisted as-is. Cross-trip reconciliation (OBD chain merge,
+# OBD↔MyOpel correlation, MyOpel dedupe) is delegated to corr_svc and runs
+# after every batch — see _post_process().
 
 def _process_obd_file(path: Path) -> list[str]:
-    """Parse an OBD CSV/BRC file, save trips, run insights, correlate. Returns new trip IDs."""
+    """Parse an OBD CSV/BRC file, save new trips, run per-trip insights. Returns new trip IDs."""
     trips = csv_parser.parse_file(path)
     new_ids: list[str] = []
     for trip in trips:
@@ -124,32 +46,40 @@ def _process_obd_file(path: Path) -> list[str]:
             continue
         trip["insights"] = insight_svc.per_trip(trip)
         db.save_trip(trip)
-        _correlate_new_obd(trip)
         new_ids.append(trip["id"])
         log.info("Saved OBD trip %s (%.1f km)", trip["id"], trip.get("distanceKm") or 0)
+    if new_ids:
+        _post_process()
     return new_ids
 
 
 def _process_myop_file(path: Path) -> list[str]:
-    """Parse a .myop file, save trips, correlate. Returns new trip IDs."""
+    """Parse a .myop file, save new trips. Returns new trip IDs."""
     trips = myop_parser.parse_file(path)
     new_ids: list[str] = []
     for trip in trips:
         if db.trip_exists(trip["id"]):
-            # Already in DB: still try to correlate in case a matching OBD trip
-            # was uploaded after the myop import. _correlate_new_myop will also
-            # delete the standalone entry if a match is found.
-            _correlate_new_myop(trip)
             continue
-        # Try correlation first; only persist as standalone if no OBD match.
-        matched = _correlate_new_myop(trip)
-        if not matched:
-            db.save_trip(trip)
-            new_ids.append(trip["id"])
-            log.info("Saved myop trip %s", trip["id"])
-        else:
-            log.info("myop trip %s absorbed into OBD trip, not saved standalone", trip["id"])
+        db.save_trip(trip)
+        new_ids.append(trip["id"])
+        log.info("Saved myop trip %s", trip["id"])
+    if new_ids:
+        _post_process()
     return new_ids
+
+
+def _post_process() -> None:
+    """Run autonomous correlation + refresh insights. Safe to call repeatedly."""
+    try:
+        counts = corr_svc.auto_correlate_all()
+    except Exception:
+        log.exception("auto_correlate_all failed")
+        counts = {}
+    # Recompute per-trip insights when correlation actually changed something
+    # (merges can absorb fields that affect rules like soot threshold or EGT).
+    if any(counts.values()):
+        _recompute_all_insights()
+    _refresh_cross_trip_insights()
 
 
 def _scan_directory(directory: Path, process_fn, extensions: tuple[str, ...]) -> None:
@@ -174,20 +104,12 @@ async def lifespan(app: FastAPI):
     _scan_directory(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
     _scan_directory(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
 
-    # Idempotent: remove any standalone myop entries absorbed into an OBD trip
-    # (handles historical duplicates created before correlation was fixed)
-    with db._conn() as _con:
-        _res = _con.execute(
-            """DELETE FROM trips
-               WHERE source = 'myop'
-                 AND CAST(SUBSTR(id, 6) AS INTEGER) IN (
-                     SELECT myop_trip_id FROM trips
-                     WHERE source IN ('obd_csv', 'obd_brc')
-                       AND myop_trip_id IS NOT NULL
-                 )"""
-        )
-        if _res.rowcount:
-            log.info("Startup cleanup: removed %d absorbed standalone myop entries", _res.rowcount)
+    # Final reconciliation pass after the initial scan — handles any leftover
+    # duplicates or chains from previous runs.
+    try:
+        corr_svc.auto_correlate_all()
+    except Exception:
+        log.exception("Startup auto_correlate_all failed")
 
     _watcher.watch(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
     _watcher.watch(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
@@ -379,7 +301,6 @@ async def upload_obd(file: UploadFile):
         await f.write(await file.read())
     try:
         new_ids = _process_obd_file(dest)
-        _refresh_cross_trip_insights()
         return {"status": "ok", "new_trips": new_ids}
     except Exception as e:
         log.exception("Error processing uploaded OBD file")
@@ -394,7 +315,6 @@ async def upload_myop(file: UploadFile):
         await f.write(await file.read())
     try:
         new_ids = _process_myop_file(dest)
-        _refresh_cross_trip_insights()
         return {"status": "ok", "new_trips": new_ids}
     except Exception as e:
         log.exception("Error processing uploaded myop file")
@@ -420,42 +340,16 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/api/v1/admin/fix-myop-timestamps")
-def fix_myop_timestamps():
-    """Fix myop timestamps and remove absorbed duplicate entries.
+@app.post("/api/v1/admin/correlate")
+def admin_correlate():
+    """Force an autonomous correlation pass (merge chains, correlate, dedupe).
 
-    Step 1: add +2 h to start_local/end_local of all myop-source trips
-    (the original parser wrongly subtracted 2 h from the Stellantis timestamp
-    which is already in local Italian time).
-
-    Step 2: delete standalone myop entries whose myop_trip_id already appears
-    on an OBD trip — those are duplicates created before correlation worked.
-
-    Call once after upgrading. Not idempotent — do not call again.
+    Normally runs automatically on every upload and at startup. Use this
+    endpoint after manual DB edits or to verify reconciliation is up-to-date.
     """
-    with db._conn() as con:
-        fix_result = con.execute(
-            """UPDATE trips
-               SET start_local = datetime(start_local, '+2 hours'),
-                   end_local   = datetime(end_local,   '+2 hours')
-               WHERE source = 'myop'"""
-        )
-        ts_fixed = fix_result.rowcount
-
-        del_result = con.execute(
-            """DELETE FROM trips
-               WHERE source = 'myop'
-                 AND CAST(SUBSTR(id, 6) AS INTEGER) IN (
-                     SELECT myop_trip_id FROM trips
-                     WHERE source IN ('obd_csv', 'obd_brc')
-                       AND myop_trip_id IS NOT NULL
-                 )"""
-        )
-        duplicates_removed = del_result.rowcount
-
-    log.info("fix-myop-timestamps: %d timestamps fixed, %d duplicates removed",
-             ts_fixed, duplicates_removed)
-    return {"timestamps_fixed": ts_fixed, "duplicates_removed": duplicates_removed}
+    counts = corr_svc.auto_correlate_all()
+    _refresh_cross_trip_insights()
+    return counts
 
 
 @app.post("/api/v1/admin/recompute-insights")
