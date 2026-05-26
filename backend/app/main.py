@@ -276,7 +276,8 @@ def _build_vehicle(trips: list[dict]) -> dict:
             "km":     km_svc,
             "passed": bool(maint_passed),
         },
-        "dpfSoot":            latest_obd.get("dpfSootPct"),
+        "dpfSoot":            latest_obd.get("dpfClosedSoot"),
+        "dpfClosedSoot":      latest_obd.get("dpfClosedSoot"),
         "dpfAvgRegenKm":      latest_obd.get("dpfAvgRegenKm"),
         "dpfSinceRegenKm":    latest_obd.get("dpfSinceRegenKm"),
         "dpfReplaceKm":       latest_obd.get("dpfReplaceKm"),
@@ -398,6 +399,20 @@ async def upload_myop(file: UploadFile):
     except Exception as e:
         log.exception("Error processing uploaded myop file")
         raise HTTPException(status_code=422, detail=str(e))
+
+
+@app.post("/api/v1/trips/merge")
+async def merge_trips(payload: dict):
+    """Merge trips: { primary_id: str, secondary_ids: [str] }"""
+    primary_id = payload.get("primary_id")
+    secondary_ids = payload.get("secondary_ids", [])
+    if not primary_id or not secondary_ids:
+        raise HTTPException(status_code=400, detail="primary_id and secondary_ids required")
+    try:
+        result = db.merge_trips(primary_id, secondary_ids)
+        return {"ok": True, "merged": result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/api/v1/health")

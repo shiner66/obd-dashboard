@@ -96,6 +96,17 @@ const Sidebar = ({ active, setActive }) => {
       </div>
 
       <div className="veh-card">
+        {VEHICLE.vin && (
+          <img
+            src={`https://visual3d-secure.opel-vauxhall.com/V3DImage.ashx?client=MyMarque&vin=${encodeURIComponent(VEHICLE.vin)}&format=png&width=320&view=001`}
+            alt={VEHICLE.name}
+            className="veh-img"
+            onError={e => {
+              e.target.src = `https://cdn.imagin.studio/getImage?customer=img&make=peugeot&modelFamily=308&modelYear=2022&zoomType=fullscreen&angle=29`;
+              e.target.onerror = () => { e.target.style.display = "none"; };
+            }}
+          />
+        )}
         <div className="veh-name">{VEHICLE.name}</div>
         <div className="muted mono" style={{ fontSize: 11, marginBottom: 8 }}>{VEHICLE.ecu}</div>
         <div className="veh-row"><span>Odometro</span><span className="v">{VEHICLE.odometer?.toLocaleString("it-IT") ?? "—"} km</span></div>
@@ -135,11 +146,11 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
         <div className="dpf-block">
-          <RadialGauge value={VEHICLE.dpfSoot} max={100} label="Soot %" />
+          <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" />
           <div className="dpf-meta">
+            <div><div className="lbl">Closed soot</div><div className="v">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</div></div>
             <div><div className="lbl">Km dall'ultima regen</div><div className="v">{VEHICLE.dpfSinceRegenKm} <span className="muted">/ {VEHICLE.dpfAvgRegenKm}</span></div></div>
             <div><div className="lbl">Vita residua DPF</div><div className="v">{VEHICLE.dpfReplaceKm ? (VEHICLE.dpfReplaceKm / 1000).toFixed(1) + "k km" : "—"}</div></div>
-            <div><div className="lbl">Capacità LT</div><div className="v">{VEHICLE.dpfRegenCapability != null ? VEHICLE.dpfRegenCapability + "%" : "—"}</div></div>
             <div><div className="lbl">Stato</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState || "idle"} /></div></div>
           </div>
         </div>
@@ -189,8 +200,11 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
 
 /* ============== Trips view (list + detail) ============== */
 const TripsView = ({ selectedId, setSelectedId }) => {
-  const [filter, setFilter] = useState("all"); // all / obd / myopel / alerts / regen
+  const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
+  const [mergeMode, setMergeMode] = useState(false);
+  const [mergeSelected, setMergeSelected] = useState([]);
+  const [merging, setMerging] = useState(false);
 
   const filtered = useMemo(() => {
     return TRIPS.filter(t => {
@@ -209,6 +223,36 @@ const TripsView = ({ selectedId, setSelectedId }) => {
   }, [filter, search]);
 
   const trip = TRIPS.find(t => t.id === selectedId) || filtered[0];
+
+  const toggleMergeSelect = (id) => {
+    setMergeSelected(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  };
+
+  const doMerge = async () => {
+    if (mergeSelected.length < 2) return;
+    setMerging(true);
+    const [primaryId, ...secondaryIds] = mergeSelected;
+    try {
+      const resp = await fetch("/api/v1/trips/merge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ primary_id: primaryId, secondary_ids: secondaryIds }),
+      });
+      if (resp.ok) {
+        alert(`Viaggi uniti (${mergeSelected.length}) nel trip ${primaryId}. Ricarica la pagina per aggiornare.`);
+        setMergeMode(false);
+        setMergeSelected([]);
+        location.reload();
+      } else {
+        const err = await resp.json();
+        alert("Errore merge: " + (err.detail || resp.status));
+      }
+    } catch(e) {
+      alert("Errore di rete: " + e.message);
+    } finally {
+      setMerging(false);
+    }
+  };
 
   return (
     <div className="page-grid">
@@ -230,18 +274,44 @@ const TripsView = ({ selectedId, setSelectedId }) => {
                 {lbl} <span className="mono muted" style={{ fontSize: 10 }}>{n}</span>
               </button>
             ))}
+            <button
+              className={`chip ${mergeMode ? "active" : ""}`}
+              style={{ marginLeft: "auto", background: mergeMode ? "var(--warn-soft)" : undefined, color: mergeMode ? "var(--warn)" : undefined }}
+              onClick={() => { setMergeMode(m => !m); setMergeSelected([]); }}
+            >
+              Unisci
+            </button>
           </div>
+          {mergeMode && (
+            <div className="row" style={{ padding: "6px 0", gap: 8, flexWrap: "wrap" }}>
+              <span className="muted" style={{ fontSize: 12 }}>Seleziona ≥2 viaggi da unire (il primo sarà il principale):</span>
+              {mergeSelected.length >= 2 && (
+                <button className="icon-btn" style={{ background: "var(--warn-soft)", color: "var(--warn)" }}
+                        onClick={doMerge} disabled={merging}>
+                  {merging ? "…" : `Unisci ${mergeSelected.length} viaggi`}
+                </button>
+              )}
+            </div>
+          )}
         </div>
         <div className="stagger" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {filtered.map(t => (
-            <TripCard key={t.id} trip={t} active={trip && t.id === trip.id} onClick={() => setSelectedId(t.id)} />
+            <div key={t.id} className="row" style={{ gap: 6, alignItems: "stretch" }}>
+              {mergeMode && (
+                <input type="checkbox" checked={mergeSelected.includes(t.id)}
+                       onChange={() => toggleMergeSelect(t.id)}
+                       style={{ width: 16, flexShrink: 0, cursor: "pointer", accentColor: "var(--warn)" }} />
+              )}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <TripCard trip={t} active={trip && t.id === trip.id} onClick={() => !mergeMode && setSelectedId(t.id)} />
+              </div>
+            </div>
           ))}
         </div>
         {filtered.length === 0 && (
           <div className="muted" style={{ padding: 20, textAlign: "center" }}>Nessun viaggio corrisponde ai filtri.</div>
         )}
       </div>
-      {/* extra div above closes correctly */}
 
       {trip ? <TripDetail trip={trip} /> : <div className="empty-state">Seleziona un viaggio</div>}
     </div>
@@ -347,7 +417,7 @@ const TripOverview = ({ trip }) => {
               { slug: "speed",   name: "Velocità",  unit: "km/h", color: "var(--accent)" },
               { slug: "coolant", name: "Liquido",   unit: "°C",   color: "var(--warn)" },
               { slug: "egt_a",   name: "EGT post",  unit: "°C",   color: "var(--crit)" },
-              { slug: "soot",    name: "Soot DPF",  unit: "%",    color: "var(--warn)" },
+              { slug: "closed_soot", name: "Closed soot", unit: "g/L", color: "var(--warn)" },
             ].map(p => {
               const stats = trip.pidValues?.[p.slug];
               const series = trip.pidSeriesFull?.[p.slug];
@@ -402,16 +472,15 @@ const TripDpf = ({ trip }) => {
   return (
     <>
       <div className="dpf-block">
-        <RadialGauge value={trip.dpfSootPct} max={100} label="Soot %" />
+        <RadialGauge value={trip.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" />
         <div className="dpf-meta">
           <div><div className="lbl">Stato</div><div className="v"><DpfPill state={trip.dpfRegenState} /></div></div>
-          <div><div className="lbl">Closed-loop soot</div><div className="v">{trip.dpfClosedSoot} <span className="muted">g/L</span></div></div>
+          <div><div className="lbl">Closed soot</div><div className="v">{trip.dpfClosedSoot != null ? trip.dpfClosedSoot + " g/L" : "—"}</div></div>
           <div><div className="lbl">Km dall'ultima regen</div><div className="v">{trip.dpfSinceRegenKm} <span className="muted">/ {trip.dpfAvgRegenKm} avg</span></div></div>
-          <div><div className="lbl">Capacità regen</div><div className="v">LT {trip.dpfRegenCapability}% · ST {trip.dpfRegenCapabilityST}%</div></div>
           <div><div className="lbl">EGT post-cat (peak)</div><div className="v">{trip.exhaustAfterCatC} <span className="muted">°C</span></div></div>
           <div><div className="lbl">NOx cat (peak)</div><div className="v">{trip.noxCatTempMaxC} <span className="muted">°C</span></div></div>
           <div><div className="lbl">Vita residua DPF</div><div className="v">{trip.dpfReplaceKm != null ? (trip.dpfReplaceKm / 1000).toFixed(1) + "k" : "—"} <span className="muted">km</span></div></div>
-          <div><div className="lbl">Olio dilution</div><div className="v">{trip.oilDilutionPct} <span className="muted">%</span></div></div>
+          <div><div className="lbl">Olio dilution</div><div className="v">{trip.oilDilutionPct != null ? trip.oilDilutionPct + " %" : "—"}</div></div>
         </div>
       </div>
 
@@ -455,11 +524,11 @@ const TripDpf = ({ trip }) => {
 
       <div>
         <div className="section-head">
-          <span className="section-title">Andamento soot</span>
-          <span className="section-sub">% intasamento DPF</span>
+          <span className="section-title">Andamento closed soot</span>
+          <span className="section-sub">g/L — campioni DPF durante il viaggio</span>
         </div>
         <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)", padding: 12 }}>
-          <LineChart data={trip.pidSeriesFull?.soot || []} color="var(--warn)" yLabel="%" />
+          <LineChart data={trip.pidSeriesFull?.closed_soot || trip.pidSeriesFull?.soot || []} color="var(--warn)" yLabel="g/L" />
         </div>
       </div>
     </>
@@ -707,7 +776,7 @@ const MapView = () => {
 /* ============== DPF / FAP view ============== */
 const DpfView = () => {
   const obdTrips = TRIPS.filter(t => t.sources.includes("obd")).sort((a, b) => a.start.localeCompare(b.start));
-  const sootSeries = obdTrips.map(t => t.dpfSootPct);
+  const sootSeries = obdTrips.map(t => t.dpfClosedSoot);
   const regenDistSeries = obdTrips.map(t => t.dpfSinceRegenKm);
   const egtSeries = obdTrips.map(t => t.exhaustAfterCatC);
 
@@ -718,20 +787,20 @@ const DpfView = () => {
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16 }}>
         <div className="dpf-block">
-          <RadialGauge value={VEHICLE.dpfSoot} max={100} label="Soot %" />
+          <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" />
           <div className="dpf-meta">
             <div><div className="lbl">Stato attuale</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState || "idle"} /></div></div>
-            <div><div className="lbl">Closed-loop</div><div className="v">{obdTrips[obdTrips.length - 1]?.dpfClosedSoot ?? "—"} <span className="muted">g/L</span></div></div>
+            <div><div className="lbl">Closed soot</div><div className="v">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</div></div>
             <div><div className="lbl">Km da regen</div><div className="v">{VEHICLE.dpfSinceRegenKm}</div></div>
             <div><div className="lbl">Avg interval</div><div className="v">{VEHICLE.dpfAvgRegenKm} km</div></div>
           </div>
         </div>
 
         <div className="trend-card">
-          <div className="section-head"><span className="section-title">Soot trend</span><span className="section-sub">ultimi {obdTrips.length} viaggi OBD</span></div>
-          <div className="big-num">{sootSeries[sootSeries.length - 1]}<span className="unit">%</span></div>
+          <div className="section-head"><span className="section-title">Closed soot trend</span><span className="section-sub">g/L · ultimi {obdTrips.length} viaggi OBD</span></div>
+          <div className="big-num">{sootSeries.filter(v => v != null).slice(-1)[0] ?? "—"}<span className="unit"> g/L</span></div>
           <Sparkline data={sootSeries} color="var(--warn)" height={70} />
-          <div className="muted mono" style={{ fontSize: 11 }}>min {Math.min(...sootSeries)}% · max {Math.max(...sootSeries)}%</div>
+          <div className="muted mono" style={{ fontSize: 11 }}>soglia rigenerazione: ~5 g/L</div>
         </div>
 
         <div className="trend-card">
@@ -756,8 +825,8 @@ const DpfView = () => {
                 <DpfPill state={t.dpfRegenState} />
               </div>
               <div className="trip-card-stats">
-                <div className="trip-stat"><span className="lbl">Soot DPF</span>
-                  <span className="val mono">{t.dpfSootPct}<span className="unit"> %</span></span>
+                <div className="trip-stat"><span className="lbl">Closed soot</span>
+                  <span className="val mono">{t.dpfClosedSoot ?? "—"}<span className="unit"> g/L</span></span>
                 </div>
                 <div className="trip-stat"><span className="lbl">EGT picco</span>
                   <span className="val mono">{t.exhaustAfterCatC}<span className="unit"> °C</span></span>
@@ -906,6 +975,8 @@ const TrendsView = () => {
   const consTrend = TRIPS.filter(t => t.consumptionL100km).map(t => t.consumptionL100km);
   const distTrend = TRIPS.map(t => t.distanceKm);
   const adblueTrend = obd.map(t => t.adblueRangeKm);
+  const sootTrend = obd.map(t => t.dpfClosedSoot);
+  const dilTrend = obd.filter(t => t.oilDilutionPct != null).map(t => ({ start: t.start, v: t.oilDilutionPct }));
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -930,6 +1001,18 @@ const TrendsView = () => {
           <div className="big-num">{adblueTrend[adblueTrend.length - 1]}<span className="unit">km</span></div>
           <LineChart data={adblueTrend} color="var(--warn)" height={90} yLabel="km" />
         </div>
+        <div className="trend-card">
+          <div className="section-head"><span className="section-title">Closed soot DPF</span><span className="section-sub">g/L — ciclo vita FAP</span></div>
+          <div className="big-num">{sootTrend.filter(v => v != null).slice(-1)[0] ?? "—"}<span className="unit"> g/L</span></div>
+          <LineChart data={sootTrend} color="var(--warn)" height={90} yLabel="g/L" />
+        </div>
+        {dilTrend.length >= 2 && (
+          <div className="trend-card">
+            <div className="section-head"><span className="section-title">Diluizione olio</span><span className="section-sub">% nel tempo — attenzione ai trend crescenti</span></div>
+            <div className="big-num">{dilTrend[dilTrend.length - 1]?.v?.toFixed(1)}<span className="unit">%</span></div>
+            <LineChart data={dilTrend.map(d => d.v)} color="var(--crit)" height={90} yLabel="%" />
+          </div>
+        )}
       </div>
 
       <div>

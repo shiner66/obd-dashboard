@@ -280,6 +280,11 @@ button { font-family: inherit; }
   padding: 12px;
   font-size: 12px;
 }
+.veh-img {
+  width: 100%; border-radius: var(--r-sm); margin-bottom: 8px; display: block;
+  object-fit: cover; max-height: 100px;
+  background: var(--bg-1);
+}
 .veh-name { color: var(--fg-0); font-weight: 600; font-size: 13px; margin-bottom: 2px; }
 .veh-row { display: flex; justify-content: space-between; padding: 4px 0; color: var(--fg-2); }
 .veh-row .v { font-family: var(--font-mono); color: var(--fg-1); }

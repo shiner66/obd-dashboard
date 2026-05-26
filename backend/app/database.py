@@ -13,6 +13,10 @@ def init(db_path: str | Path) -> None:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _conn() as con:
         con.executescript(_SCHEMA)
+        # Idempotent migration: add merged_ids column if it doesn't exist yet
+        existing = {row[1] for row in con.execute("PRAGMA table_info(trips)").fetchall()}
+        if "merged_ids" not in existing:
+            con.execute("ALTER TABLE trips ADD COLUMN merged_ids TEXT DEFAULT NULL")
 
 
 def _conn() -> sqlite3.Connection:
@@ -75,6 +79,7 @@ CREATE TABLE IF NOT EXISTS trips (
     pid_series_json      TEXT,        -- JSON {slug: [60 values]}
     pid_catalog_json     TEXT,        -- JSON [{slug,name,unit,kind,group}]
     insights_json        TEXT,        -- JSON [{category,level,title,body}]
+    merged_ids           TEXT DEFAULT NULL,
     created_at           TEXT DEFAULT (datetime('now'))
 );
 """
@@ -237,6 +242,90 @@ def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
         ))
 
 
+def merge_trips(primary_id: str, secondary_ids: list[str]) -> dict:
+    """Merge secondary trips into primary. Returns updated primary trip dict."""
+    import json as _json
+    with _conn() as con:
+        primary = con.execute("SELECT * FROM trips WHERE id=?", (primary_id,)).fetchone()
+        if not primary:
+            raise ValueError(f"Primary trip {primary_id} not found")
+        primary = dict(primary)
+
+        secondaries = []
+        for sid in secondary_ids:
+            row = con.execute("SELECT * FROM trips WHERE id=?", (sid,)).fetchone()
+            if row:
+                secondaries.append(dict(row))
+
+        if not secondaries:
+            return _row_to_trip(primary)
+
+        # Compute merged end time (latest)
+        all_ends = [primary.get("end_local", ""), *[s.get("end_local", "") for s in secondaries]]
+        merged_end = max(e for e in all_ends if e)
+
+        # Sum numeric fields
+        def _sum(*vals):
+            return sum(v for v in vals if v is not None) or None
+
+        # Duration = sum of all durations
+        merged_dur = _sum(primary.get("duration_min"), *[s.get("duration_min") for s in secondaries])
+
+        # Distance = sum
+        merged_dist = _sum(primary.get("distance_km"), *[s.get("distance_km") for s in secondaries])
+
+        # Fuel = sum
+        merged_fuel = _sum(primary.get("fuel_consumed_l"), *[s.get("fuel_consumed_l") for s in secondaries])
+
+        # Recalculate L/100km
+        merged_l100 = (merged_fuel / merged_dist * 100) if (merged_dist and merged_fuel and merged_dist > 0) else primary.get("consumption_l100km")
+
+        # Sources: union (stored as source column — keep primary's)
+        # alerts: merge from alerts_json
+        def _alerts(row):
+            try:
+                return _json.loads(row.get("alerts_json") or "[]")
+            except Exception:
+                return []
+        all_alerts = list(set(a for r in [primary, *secondaries] for a in _alerts(r)))
+
+        # Merge myop_trip_id (take first non-null)
+        merged_myop_id = primary.get("myop_trip_id")
+        for s in secondaries:
+            if not merged_myop_id and s.get("myop_trip_id"):
+                merged_myop_id = s.get("myop_trip_id")
+
+        con.execute("""
+            UPDATE trips SET
+                end_local           = ?,
+                duration_min        = ?,
+                distance_km         = ?,
+                fuel_consumed_l     = ?,
+                consumption_l100km  = ?,
+                alerts_json         = ?,
+                myop_trip_id        = ?,
+                merged_ids          = ?
+            WHERE id = ?
+        """, (
+            merged_end,
+            merged_dur,
+            merged_dist,
+            merged_fuel,
+            merged_l100,
+            _json.dumps(all_alerts),
+            merged_myop_id,
+            _json.dumps([primary_id, *secondary_ids]),
+            primary_id,
+        ))
+
+        # Delete secondary trips
+        for sid in secondary_ids:
+            con.execute("DELETE FROM trips WHERE id=?", (sid,))
+
+        row = con.execute("SELECT * FROM trips WHERE id=?", (primary_id,)).fetchone()
+        return _row_to_trip(dict(row))
+
+
 def _row_to_trip(row: dict) -> dict:
     _j = lambda k: json.loads(row[k]) if row.get(k) else None
 
@@ -301,4 +390,5 @@ def _row_to_trip(row: dict) -> dict:
         "pidSeriesFull":         _j("pid_series_json"),
         "pidCatalog":            _j("pid_catalog_json") or [],
         "insights":              _j("insights_json") or [],
+        "mergedIds":             _j("merged_ids"),
     }

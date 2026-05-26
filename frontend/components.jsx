@@ -26,22 +26,46 @@ const Icon = ({ name, size = 16, className = "" }) => {
   );
 };
 
+/* Filter obvious outliers using 3×IQR rule; null values are kept as gaps */
+const filterOutliers = (data) => {
+  if (!data || data.length < 6) return data;
+  const clean = data.filter(v => v != null && isFinite(v));
+  if (clean.length < 4) return data;
+  const sorted = [...clean].sort((a, b) => a - b);
+  const q1 = sorted[Math.floor(sorted.length * 0.25)];
+  const q3 = sorted[Math.floor(sorted.length * 0.75)];
+  const iqr = q3 - q1;
+  if (iqr === 0) return data;
+  const lo = q1 - 3 * iqr;
+  const hi = q3 + 3 * iqr;
+  return data.map(v => (v != null && isFinite(v) && v >= lo && v <= hi) ? v : null);
+};
+
 /* ============== Sparkline (tiny SVG line chart) ============== */
 const Sparkline = ({ data, height = 50, color = "var(--accent)", showFill = true, showMinMax = true, animate = true }) => {
   if (!data || data.length < 2) return null;
-  const min = Math.min(...data);
-  const max = Math.max(...data);
+  const filtered = filterOutliers(data) || data;
+  const cleanVals = filtered.filter(v => v != null && isFinite(v));
+  if (cleanVals.length < 2) return null;
+  const min = Math.min(...cleanVals);
+  const max = Math.max(...cleanVals);
   const range = max - min || 1;
   const w = 100;
-  const path = data.map((v, i) => {
-    const x = (i / (data.length - 1)) * w;
-    const y = 100 - ((v - min) / range) * 100;
-    return `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`;
-  }).join(" ");
-  const fillPath = path + ` L${w},100 L0,100 Z`;
-  // Live pulse marker on the last point
-  const lastX = w;
-  const lastY = 100 - ((data[data.length - 1] - min) / range) * 100;
+  const pts = filtered.map((v, i) => v != null ? { x: (i / (filtered.length - 1)) * w, y: 100 - ((v - min) / range) * 100 } : null);
+  const path = pts.reduce((acc, pt, i) => {
+    if (pt == null) return acc + ` M${pts.find((p, j) => j > i && p != null)?.x ?? 0},${pts.find((p, j) => j > i && p != null)?.y ?? 0}`;
+    const prev = i === 0 || pts[i-1] == null;
+    return acc + ` ${prev ? 'M' : 'L'}${pt.x.toFixed(2)},${pt.y.toFixed(2)}`;
+  }, "").trim();
+  // Fill path: connect only non-null segments to baseline
+  const firstNonNull = pts.find(p => p != null);
+  const lastNonNull = [...pts].reverse().find(p => p != null);
+  const fillPath = firstNonNull && lastNonNull
+    ? path + ` L${lastNonNull.x.toFixed(2)},100 L${firstNonNull.x.toFixed(2)},100 Z`
+    : path;
+  // Live pulse marker on the last non-null point
+  const lastX = lastNonNull ? lastNonNull.x : w;
+  const lastY = lastNonNull ? lastNonNull.y : 100;
   return (
     <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ height, width: "100%", display: "block", overflow: "visible" }}>
       <defs>
@@ -66,24 +90,57 @@ const Sparkline = ({ data, height = 50, color = "var(--accent)", showFill = true
 /* ============== Bigger chart (axis-less line) ============== */
 const LineChart = ({ data, height = 200, color = "var(--accent)", yLabel, accent = "accent", animate = true }) => {
   if (!data || data.length < 2) return null;
-  const min = Math.min(...data);
-  const max = Math.max(...data);
+  const svgRef = useRef(null);
+  const [hover, setHover] = useState(null);
+
+  const filteredData = filterOutliers(data) || data;
+  const cleanVals = filteredData.filter(v => v != null && isFinite(v));
+  if (cleanVals.length < 2) return null;
+  const min = Math.min(...cleanVals);
+  const max = Math.max(...cleanVals);
   const range = (max - min) || 1;
   const w = 600;
   const h = height;
   const padX = 16, padY = 12;
   const innerW = w - padX * 2;
   const innerH = h - padY * 2;
-  const path = data.map((v, i) => {
-    const x = padX + (i / (data.length - 1)) * innerW;
-    const y = padY + innerH - ((v - min) / range) * innerH;
-    return `${i === 0 ? "M" : "L"}${x.toFixed(2)},${y.toFixed(2)}`;
-  }).join(" ");
-  const fillPath = path + ` L${w - padX},${h - padY} L${padX},${h - padY} Z`;
+
+  const pts = filteredData.map((v, i) =>
+    v != null ? { x: padX + (i / (filteredData.length - 1)) * innerW, y: padY + innerH - ((v - min) / range) * innerH } : null
+  );
+  const path = pts.reduce((acc, pt, i) => {
+    if (pt == null) return acc + ` M${pts.find((p, j) => j > i && p != null)?.x ?? padX},${pts.find((p, j) => j > i && p != null)?.y ?? (padY + innerH)}`;
+    const prev = i === 0 || pts[i-1] == null;
+    return acc + ` ${prev ? 'M' : 'L'}${pt.x.toFixed(2)},${pt.y.toFixed(2)}`;
+  }, "").trim();
+
+  const firstNonNull = pts.find(p => p != null);
+  const lastNonNull = [...pts].reverse().find(p => p != null);
+  const fillPath = firstNonNull && lastNonNull
+    ? path + ` L${lastNonNull.x.toFixed(2)},${h - padY} L${firstNonNull.x.toFixed(2)},${h - padY} Z`
+    : path;
+
   const gridY = [0, 0.25, 0.5, 0.75, 1].map(t => padY + t * innerH);
   const gradId = `lc-${color.replace(/[^\w]/g, "")}`;
+
+  const handleMouseMove = (e) => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const mouseX = ((e.clientX - rect.left) / rect.width) * w;
+    const step = innerW / Math.max(filteredData.length - 1, 1);
+    const idx = Math.max(0, Math.min(filteredData.length - 1, Math.round((mouseX - padX) / step)));
+    const val = filteredData[idx];
+    if (val == null) { setHover(null); return; }
+    const cx = padX + (idx / (filteredData.length - 1)) * innerW;
+    const cy = padY + innerH - ((val - min) / range) * innerH;
+    setHover({ idx, val, cx, cy });
+  };
+
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" style={{ width: "100%", height, display: "block" }}>
+    <svg ref={svgRef} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none"
+         style={{ width: "100%", height, display: "block" }}
+         onMouseMove={handleMouseMove} onMouseLeave={() => setHover(null)}>
       <defs>
         <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity="0.25" />
@@ -100,6 +157,15 @@ const LineChart = ({ data, height = 200, color = "var(--accent)", yLabel, accent
       <text x={padX + 4} y={padY + 4} fill="var(--fg-3)" fontSize="10" fontFamily="var(--font-mono)">{max.toFixed(1)}</text>
       <text x={padX + 4} y={h - padY - 2} fill="var(--fg-3)" fontSize="10" fontFamily="var(--font-mono)">{min.toFixed(1)}</text>
       {yLabel && <text x={w - padX} y={padY + 4} fill="var(--fg-3)" fontSize="10" fontFamily="var(--font-mono)" textAnchor="end">{yLabel}</text>}
+      {hover && (
+        <g>
+          <circle cx={hover.cx} cy={hover.cy} r={3} fill={color} />
+          <rect x={hover.cx + 6} y={hover.cy - 16} width={52} height={18} rx={4} fill="var(--bg-3)" opacity={0.95} />
+          <text x={hover.cx + 10} y={hover.cy - 4} fill="var(--fg-0)" fontSize="10" fontFamily="var(--font-mono)">
+            {hover.val.toFixed(2)}
+          </text>
+        </g>
+      )}
     </svg>
   );
 };
