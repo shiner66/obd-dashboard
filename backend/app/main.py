@@ -24,8 +24,8 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(messa
 OBD_FILES_DIR   = Path(os.getenv("OBD_FILES_DIR",   "/data/obd"))
 MYOP_FILES_DIR  = Path(os.getenv("MYOP_FILES_DIR",  "/data/myop"))
 DB_PATH         = Path(os.getenv("DB_PATH",         "/data/db/trips.db"))
-VEHICLE_NAME    = os.getenv("VEHICLE_NAME",    "Peugeot 308 SW")
-VEHICLE_ECU     = os.getenv("VEHICLE_ECU",     "MD1CS003 — 1.5 BlueHDi")
+VEHICLE_NAME    = os.getenv("VEHICLE_NAME",    "Opel Corsa F Elegance")
+VEHICLE_ECU     = os.getenv("VEHICLE_ECU",     "MD1CS003 — 1.5d BlueHDi")
 VEHICLE_ADAPTER = os.getenv("VEHICLE_ADAPTER", "BTLE IOS-Vlink")
 
 _watcher = Watcher()

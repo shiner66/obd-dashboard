@@ -32,7 +32,7 @@ const TopBar = ({ view, onSearch, onMenu }) => (
       <Icon name="list" size={18} />
     </button>
     <div>
-      <div className="crumb">OBD Trip Platform · Peugeot · MD1CS003</div>
+      <div className="crumb">OBD Trip Platform · Opel Corsa F · MD1CS003</div>
       <h1>{view}</h1>
     </div>
     <div className="topbar-spacer" />
@@ -102,7 +102,7 @@ const Sidebar = ({ active, setActive }) => {
             alt={VEHICLE.name}
             className="veh-img"
             onError={e => {
-              e.target.src = `https://cdn.imagin.studio/getImage?customer=img&make=peugeot&modelFamily=308&modelYear=2022&zoomType=fullscreen&angle=29`;
+              e.target.src = `https://cdn.imagin.studio/getImage?customer=img&make=opel&modelFamily=corsa&modelYear=2022&zoomType=fullscreen&angle=29`;
               e.target.onerror = () => { e.target.style.display = "none"; };
             }}
           />
