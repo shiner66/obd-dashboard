@@ -156,7 +156,30 @@ def auto_correlate_all() -> dict:
                   and "obd" not in t.get("sources", [])]
 
     counts = {"obd_chains_merged": 0, "obd_trips_absorbed": 0,
-              "myop_correlated": 0, "myop_duplicates_removed": 0}
+              "myop_correlated": 0, "myop_duplicates_removed": 0,
+              "myop_recorrelated": 0}
+
+    # ── Step 0: cleanup ───────────────────────────────────────────────────────
+    # Delete standalone myop entries that were already absorbed into an OBD trip
+    # (happens when the .myop file is re-imported after the first correlation).
+    with db._conn() as con:
+        res = con.execute("""
+            DELETE FROM trips
+            WHERE source = 'myop'
+              AND CAST(SUBSTR(id, 6) AS INTEGER) IN (
+                  SELECT myop_trip_id FROM trips
+                  WHERE myop_trip_id IS NOT NULL
+              )
+        """)
+        if res.rowcount:
+            log.info("Removed %d re-imported standalone myop duplicates", res.rowcount)
+            counts["myop_duplicates_removed"] += res.rowcount
+
+    # Refresh after cleanup
+    trips = db.get_all_trips()
+    obd_trips  = [t for t in trips if "obd"    in t.get("sources", [])]
+    myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
+                  and "obd" not in t.get("sources", [])]
 
     # 1. OBD-to-OBD chain merge
     chains = _detect_obd_chains(obd_trips)
@@ -167,24 +190,46 @@ def auto_correlate_all() -> dict:
         counts["obd_chains_merged"] += 1
         counts["obd_trips_absorbed"] += len(rest)
 
-    # Refresh after merges — IDs of absorbed trips are gone
+    # Refresh after merges
     if chains:
         trips = db.get_all_trips()
         obd_trips  = [t for t in trips if "obd"    in t.get("sources", [])]
         myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
                       and "obd" not in t.get("sources", [])]
 
-    # 2. OBD-to-MyOpel correlation (orphan myop → matching OBD)
-    available_obd = [t for t in obd_trips if "myopel" not in t.get("sources", [])]
+    # 2. OBD-to-MyOpel correlation
+    # First pass: match standalone MyOpel against uncorrelated OBD trips.
+    unmatched_obd = [t for t in obd_trips if "myopel" not in t.get("sources", [])]
+    matched_myop_ids: set[str] = set()
+
     for myop in myop_trips:
-        match, score = _best_match(myop, available_obd)
+        match, score = _best_match(myop, unmatched_obd)
         if match:
-            log.info("Auto-correlating myop %s → OBD %s (score=%.2f)",
-                     myop["id"], match["id"], score)
+            log.info("Correlating myop %s → OBD %s (score=%.2f)", myop["id"], match["id"], score)
             db.enrich_with_myop(match["id"], myop)
             db.delete_trip(myop["id"])
-            available_obd = [t for t in available_obd if t["id"] != match["id"]]
+            unmatched_obd = [t for t in unmatched_obd if t["id"] != match["id"]]
+            matched_myop_ids.add(myop["id"])
             counts["myop_correlated"] += 1
+
+    # Second pass: standalone MyOpel trips still unmatched may have a better
+    # match with an already-correlated OBD trip (wrong previous correlation,
+    # e.g. established before a DST fix).  Use a higher score threshold (0.75)
+    # to avoid breaking good existing correlations.
+    remaining_myop = [m for m in myop_trips if m["id"] not in matched_myop_ids]
+    already_correlated_obd = [t for t in obd_trips if "myopel" in t.get("sources", [])]
+
+    for myop in remaining_myop:
+        match, score = _best_match(myop, already_correlated_obd)
+        if match and score >= 0.75:
+            log.info(
+                "Re-correlating: myop %s → OBD %s (score=%.2f, replacing existing myop)",
+                myop["id"], match["id"], score,
+            )
+            db.enrich_with_myop(match["id"], myop)
+            db.delete_trip(myop["id"])
+            already_correlated_obd = [t for t in already_correlated_obd if t["id"] != match["id"]]
+            counts["myop_recorrelated"] += 1
 
     # 3. MyOpel-to-MyOpel dedupe (same trip resent with new ID)
     trips = db.get_all_trips()
