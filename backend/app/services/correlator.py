@@ -4,8 +4,8 @@ Autonomous trip correlation & merging.
 Handles four reconciliation problems automatically:
 
 1. OBD-to-OBD overlap dedup — CarScanner reconnects mid-journey and creates a
-   new CSV that starts inside an already-running trip.  The shorter sub-recording
-   is discarded; the primary (earliest start) is kept.
+   new CSV that starts inside an already-running trip.  The recording with fewer
+   PIDs is discarded; the richer one (more PIDs, or longer if tied) is kept.
 
 2. OBD-to-OBD chain merge — CarScanner sometimes splits a single real-world
    journey into multiple CSV files (adapter dropout, brief engine restart at
@@ -199,8 +199,8 @@ def auto_correlate_all() -> dict:
 
     # ── Step 0.5: remove overlapping OBD sub-recordings ──────────────────────
     # CarScanner creates a new CSV when the OBD adapter reconnects mid-journey.
-    # The new file starts inside an already-running trip (negative gap).
-    # We keep the primary recording (earliest start, most data) and delete the rest.
+    # The new file starts inside an already-running trip (overlap).
+    # We keep whichever recording is richer (more PIDs; tie-break: longer duration).
     sorted_obd = sorted(obd_trips, key=lambda t: t.get("start") or "")
     to_remove_ids: set[str] = set()
     for i, trip_a in enumerate(sorted_obd):
@@ -217,10 +217,21 @@ def auto_correlate_all() -> dict:
                 continue
             if start_b >= end_a:
                 break  # sorted by start — no more overlaps possible
-            # trip_b starts before trip_a ends: it's a sub-recording of the same journey
-            to_remove_ids.add(trip_b["id"])
-            log.info("Removing overlapping OBD sub-recording %s (superseded by %s)",
-                     trip_b["id"], trip_a["id"])
+            # trip_b starts before trip_a ends — overlapping recording.
+            # Keep whichever has more PIDs (richer data); if tied, keep the longer one.
+            pids_a = len(trip_a.get("pidCatalog") or [])
+            pids_b = len(trip_b.get("pidCatalog") or [])
+            dur_a  = trip_a.get("durationMin") or 0
+            dur_b  = trip_b.get("durationMin") or 0
+            if pids_b > pids_a or (pids_b == pids_a and dur_b > dur_a):
+                to_remove_ids.add(trip_a["id"])
+                log.info("Removing overlapping OBD sub-recording %s (%d PIDs) in favour of %s (%d PIDs)",
+                         trip_a["id"], pids_a, trip_b["id"], pids_b)
+                break  # trip_a is gone; outer loop will process trip_b as primary
+            else:
+                to_remove_ids.add(trip_b["id"])
+                log.info("Removing overlapping OBD sub-recording %s (%d PIDs) in favour of %s (%d PIDs)",
+                         trip_b["id"], pids_b, trip_a["id"], pids_a)
 
     for tid in to_remove_ids:
         db.delete_trip(tid)
