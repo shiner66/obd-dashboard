@@ -31,9 +31,9 @@ log = logging.getLogger(__name__)
 
 # Tunables — chosen from real-world data, not arbitrary.
 MERGE_GAP_S        = 300       # OBD-OBD chain: 5 min between end of A and start of B
-MATCH_TIME_WINDOW_S = 1200     # OBD-MyOpel: ±20 min start time
+MATCH_TIME_WINDOW_S = 3600     # OBD-MyOpel: ±60 min (OBD starts at engine-on, MyOpel at first movement)
 MATCH_DISTANCE_TOL  = 0.30     # OBD-MyOpel: ±30% distance
-MIN_MATCH_SCORE     = 0.55     # Below this, refuse to correlate
+MIN_MATCH_SCORE     = 0.50     # Below this, refuse to correlate
 DEDUPE_TIME_S       = 600      # MyOpel-MyOpel dedupe: ±10 min start
 DEDUPE_DISTANCE_TOL = 0.10     # MyOpel-MyOpel dedupe: ±10% distance
 
@@ -87,8 +87,11 @@ def _score(a: dict, b: dict) -> float:
     else:
         dur_score = 0.5
 
-    # Time is the strongest signal; distance is a strong tiebreaker.
-    return 0.5 * time_score + 0.35 * dist_score + 0.15 * dur_score
+    # Distance is the primary signal (OBD and MyOpel measure the same km).
+    # Time is secondary — OBD starts at engine-on, MyOpel at first movement,
+    # so up to an hour of gap is possible.  Duration is a weak signal
+    # (OBD = engine-on time, MyOpel = travel time) so weight it lightly.
+    return 0.40 * time_score + 0.50 * dist_score + 0.10 * dur_score
 
 
 def _best_match(target: dict, candidates: Iterable[dict]) -> tuple[dict | None, float]:

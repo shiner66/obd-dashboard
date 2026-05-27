@@ -340,6 +340,58 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/api/v1/admin/fix-myop-dst")
+def fix_myop_dst():
+    """Subtract the DST offset from stored myop timestamps in the CEST period.
+
+    Stellantis applies the DST offset twice in summer (CEST), producing
+    timestamps 1 hour ahead of true Italian local time.  This endpoint
+    corrects start_local and end_local for every myop trip whose stored time
+    falls in the European Summer Time window (late March → late October).
+    In winter (CET, DST=0) the correction is a no-op so those trips are safe.
+
+    Run once after deploying the parser fix to correct historical data.
+    Calling it a second time will subtract another hour — do not repeat.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    _ROME = ZoneInfo("Europe/Rome")
+
+    trips = db.get_all_trips()
+    fixed = 0
+    for trip in trips:
+        if "myopel" not in trip.get("sources", []):
+            continue
+        start = trip.get("start")
+        if not start:
+            continue
+        try:
+            dt_s = datetime.fromisoformat(start)
+            dst = dt_s.replace(tzinfo=_ROME).dst()
+            if not dst or dst.total_seconds() == 0:
+                continue  # winter trip — no correction needed
+            new_start = (dt_s - dst).isoformat()
+            end = trip.get("end")
+            new_end = None
+            if end:
+                try:
+                    dt_e = datetime.fromisoformat(end)
+                    new_end = (dt_e - dst).isoformat()
+                except ValueError:
+                    new_end = end
+            with db._conn() as con:
+                con.execute(
+                    "UPDATE trips SET start_local=?, end_local=? WHERE id=?",
+                    (new_start, new_end or end, trip["id"]),
+                )
+            fixed += 1
+        except Exception:
+            log.exception("fix-myop-dst: error on trip %s", trip.get("id"))
+
+    log.info("fix-myop-dst: corrected %d trips", fixed)
+    return {"fixed": fixed}
+
+
 @app.post("/api/v1/admin/correlate")
 def admin_correlate():
     """Force an autonomous correlation pass (merge chains, correlate, dedupe).

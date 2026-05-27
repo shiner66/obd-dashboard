@@ -5,21 +5,39 @@ A .myop file is plain JSON with a list of {vin, trips[]} objects.
 from __future__ import annotations
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
+
+_ROME = ZoneInfo("Europe/Rome")
 
 # Trips below this distance are noise (parking maneuvers, accidental triggers).
 _MIN_DISTANCE_KM = 1.0
 
 
 def _to_local_iso(date_str: str) -> str:
-    """Return the Stellantis timestamp as local ISO, stripping the spurious Z suffix.
+    """Return the Stellantis timestamp as correct Italian local time.
 
-    Stellantis sends Italian local time but marks it as UTC (Z). The Z is wrong —
-    the value is already in local time — so we just strip it and use it as-is.
+    Stellantis sends Italian local time with a spurious Z suffix, but applies
+    the DST offset twice in summer (CEST): the stored value is 1 hour ahead of
+    true local time from late March to late October.  In winter (CET, DST=0)
+    no correction is needed.  We subtract the Europe/Rome DST offset derived
+    from the timestamp itself to obtain the true local time.
     """
-    return date_str.rstrip("Z")
+    has_z = date_str.endswith("Z")
+    s = date_str.rstrip("Z")
+    if not has_z:
+        return s  # already clean local time — no conversion
+    try:
+        dt = datetime.fromisoformat(s)
+        dst = dt.replace(tzinfo=_ROME).dst()
+        if dst:
+            dt = dt - dst
+        return dt.isoformat()
+    except (ValueError, TypeError):
+        return s
 
 
 # Alert code → {sev, label}  (briefing §4 + data.js ALERTS — full 167-entry mapping)
