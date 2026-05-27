@@ -5,14 +5,21 @@ per-PID stats, GPS track, RBS correction, DPF state machine.
 """
 from __future__ import annotations
 import csv
+import logging
 import re
 import statistics
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
+from zoneinfo import ZoneInfo
+
+_ROME_TZ = ZoneInfo("Europe/Rome")
+_UTC_TZ  = ZoneInfo("UTC")
 
 from ..services import rbs as rbs_svc
 from ..services.dpf import compute_state as dpf_state
+
+log = logging.getLogger(__name__)
 
 
 # ── Slug generation (§6) ──────────────────────────────────────────────────────
@@ -220,18 +227,44 @@ def _r(v: float | None, d: int = 2) -> float | None:
 
 # ── Main parse function ───────────────────────────────────────────────────────
 
+def _parse_seconds(s: str) -> float | None:
+    """Parse a time column that may be seconds (float) or HH:MM:SS[.mmm]."""
+    s = s.strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    # Try colon-separated time formats
+    parts = s.replace(",", ".").split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
 def _read_csv_rows(path: Path) -> list[tuple]:
     """Try semicolon delimiter first, then comma, returning parsed rows."""
     raw_rows: list[tuple] = []
-    for delimiter in (";", ","):
+    for delimiter in (";", ",", "\t"):
         with open(path, newline="", encoding="utf-8-sig") as f:
             reader = csv.reader(f, delimiter=delimiter)
-            next(reader, None)  # skip header
+            header = next(reader, None)
+            rows_seen = 0
             for row in reader:
+                rows_seen += 1
+                if rows_seen == 1:
+                    log.debug("CSV %s delim=%r header=%r first_row=%r",
+                              path.name, delimiter, header, row)
                 if len(row) < 3:
                     continue
                 try:
-                    sec = float(row[0])
+                    sec = _parse_seconds(row[0])
+                    if sec is None:
+                        continue
                     pid = row[1].strip()
                     val = float(row[2])
                 except (ValueError, IndexError):
@@ -244,6 +277,7 @@ def _read_csv_rows(path: Path) -> list[tuple]:
                     lat = lon = 0.0
                 raw_rows.append((sec, pid, val, unit, lat, lon))
         if raw_rows:
+            log.debug("CSV %s: parsed %d rows with delim=%r", path.name, len(raw_rows), delimiter)
             break
     return raw_rows
 
@@ -263,15 +297,28 @@ def parse_file(path: str | Path) -> list[dict]:
         try:
             dt_local = datetime.strptime(stem, fmt)
             start_local = dt_local.isoformat()
-            start_utc   = (dt_local - timedelta(hours=2)).isoformat()
+            # Convert local Italian time → UTC using proper DST rules (CET/CEST)
+            start_utc = (
+                dt_local.replace(tzinfo=_ROME_TZ)
+                .astimezone(_UTC_TZ)
+                .replace(tzinfo=None)
+                .isoformat()
+            )
             break
         except ValueError:
             continue
 
-    # ── Read CSV (try semicolon, fallback to comma) ───────────────────────────
+    # ── Read CSV (try semicolon, fallback to comma/tab) ──────────────────────
     raw_rows = _read_csv_rows(path)
 
     if not raw_rows:
+        # Log the raw first 5 lines to help diagnose unknown formats.
+        try:
+            with open(path, encoding="utf-8-sig", errors="replace") as _f:
+                preview = [next(_f, "") for _ in range(5)]
+            log.error("No valid rows in %s — first 5 lines: %r", filename, preview)
+        except Exception:
+            pass
         raise ValueError(f"No valid rows in {filename}")
 
     # ── Build per-PID series and GPS points ──────────────────────────────────
@@ -354,6 +401,12 @@ def parse_file(path: str | Path) -> list[dict]:
     if fuel_consumed_l and distance_km:
         consumption_l100km = _r(fuel_consumed_l / distance_km * 100)
 
+    # Discard trips shorter than 1 km — parking-lot maneuvers, accidental triggers,
+    # and ECU restart noise have no diagnostic value and only pollute statistics.
+    if (distance_km or 0) < 1.0:
+        log.info("Skipping %s: trip too short (%.2f km)", filename, distance_km or 0)
+        return []
+
     # ── DPF state machine ─────────────────────────────────────────────────────
     dpf_regen_state, dpf_regen_active = dpf_state(pid_window)
 
@@ -396,10 +449,13 @@ def parse_file(path: str | Path) -> list[dict]:
         pid_series[slug] = _downsample(series, 60)
 
         # Build PID catalog entry
+        _name_clean = pid_name
+        for _pfx in ("[ECM] ", "[TCU] ", "[ECM]", "[TCU]"):
+            _name_clean = _name_clean.replace(_pfx, "")
         pid_catalog.append({
             "slug":  slug,
             "name":  pid_name,
-            "short": slug.upper().replace("_", " ")[:16],
+            "short": _name_clean.strip()[:32],
             "unit":  unit,
             "kind":  kind,
             "group": _pid_group(pid_name),
@@ -420,7 +476,7 @@ def parse_file(path: str | Path) -> list[dict]:
         "maxRpm":                int(fields["max_rpm"]) if fields.get("max_rpm") else None,
         "coolantMaxC":           _r(fields.get("coolant_max_c"), 1),
         "oilMaxC":               _r(fields.get("oil_temp_max_c"), 1),
-        "odometerKm":            int(fields["odometer_km"]) if fields.get("odometer_km") else None,
+        "odometerKm":            round(fields["odometer_km"]) if fields.get("odometer_km") else None,
         "airTempC":              _r(fields.get("air_temp_c"), 1),
         "fuelConsumedL":         fuel_consumed_l,
         "consumptionL100km":     consumption_l100km,

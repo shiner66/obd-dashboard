@@ -26,35 +26,38 @@ def per_trip(trip: dict) -> list[dict]:
 
     # DPF state narrative
     state = trip.get("dpfRegenState") or "idle"
-    state_msg = {
-        "idle":      "Nessuna rigenerazione DPF in questo viaggio.",
-        "requested": "Rigenerazione DPF richiesta ma non completata — viaggio troppo breve.",
-        "active":    "Rigenerazione DPF in corso durante il viaggio.",
-        "completed": "Rigenerazione DPF completata con successo durante il viaggio.",
-        "post_regen":"Rigenerazione DPF appena completata prima di questo viaggio.",
-    }.get(state, "")
-    if state_msg:
-        out.append(_ins("dpf",
-            "warning" if state == "requested" else "info",
-            "Stato rigenerazione DPF", state_msg))
+    if state == "requested":
+        egt = trip.get("exhaustAfterCatC")
+        if egt and egt > 450:
+            regen_body = (
+                f"Rigenerazione DPF richiesta. EGT massima {egt:.0f}°C — "
+                "temperature FAP quasi raggiunte ma viaggio terminato prima del completamento."
+            )
+        else:
+            regen_body = (
+                "Rigenerazione DPF richiesta ma non completata — "
+                "viaggio troppo breve o temperature FAP insufficienti."
+            )
+        out.append(_ins("dpf", "warning", "Rigenerazione DPF richiesta", regen_body))
+    elif state == "active":
+        out.append(_ins("dpf", "info", "Rigenerazione DPF in corso",
+            "Rigenerazione attiva durante il viaggio."))
+    elif state == "completed":
+        out.append(_ins("dpf", "info", "Rigenerazione DPF completata",
+            "Rigenerazione completata con successo durante il viaggio."))
+    elif state == "post_regen":
+        out.append(_ins("dpf", "info", "Post-rigenerazione",
+            "Rigenerazione completata prima di questo viaggio."))
 
     # Soot level alert
-    soot = trip.get("dpfSootPct")
+    soot = trip.get("dpfClosedSoot")
     if soot is not None:
-        if soot >= 90:
-            out.append(_ins("dpf", "critical", f"DPF intasato al {soot:.0f}%",
-                "Rigenerazione urgente. Pianifica un viaggio extraurbano di ≥30 min."))
-        elif soot >= 70:
-            out.append(_ins("dpf", "warning", f"DPF al {soot:.0f}%",
-                "Presto necessaria rigenerazione. Evita tragitti urbani brevi consecutivi."))
-
-    # Short-term regen capability drop
-    st = trip.get("dpfRegenCapabilityST")
-    lt = trip.get("dpfRegenCapability")
-    if st is not None and lt is not None and lt > 0 and st < lt * 0.5:
-        out.append(_ins("dpf", "warning",
-            "Capacità rigenerazione a breve termine ridotta",
-            f"ST {st:.0f}% vs LT {lt:.0f}%. Possibile problema con la rigenerazione post-guida."))
+        if soot >= 7.0:
+            out.append(_ins("dpf", "critical", f"Closed soot alto: {soot:.1f} g/L",
+                "Livello soot critico. Rigenerazione urgente."))
+        elif soot >= 5.0:
+            out.append(_ins("dpf", "warning", f"Closed soot in aumento: {soot:.1f} g/L",
+                "Livello soot elevato. Presto necessaria rigenerazione."))
 
     # EGT spike
     egt = trip.get("exhaustAfterCatC")
@@ -64,19 +67,16 @@ def per_trip(trip: dict) -> list[dict]:
 
     # Oil dilution
     dil = trip.get("oilDilutionPct")
-    if dil is not None:
-        if dil > 3.0:
-            out.append(_ins("engine", "critical", f"Diluizione olio {dil:.1f}%",
-                "Verifica se le rigenerazioni DPF sono frequenti o incomplete."))
-        elif dil > 1.5:
-            out.append(_ins("engine", "warning", f"Diluizione olio {dil:.1f}%",
-                "Monitorare nel tempo."))
+    if dil is not None and dil > 4.0:
+        out.append(_ins("engine", "critical", f"Diluizione olio {dil:.1f}%",
+            "Livello critico. Verifica frequenza e completamento rigenerazioni DPF."))
 
-    # Stop-and-Start fault
+    # Stop-and-Start state — only report actual faults (state 7).
+    # State 9 = inibito temporaneo (normale: termica, A/C, batteria); non è un guasto.
     ss = trip.get("ssState")
-    if ss == 9:
-        out.append(_ins("engine", "warning", "Stop&Start in stato di guasto",
-            "Codice 9 — controllare batteria e sistema Start&Stop."))
+    if ss == 7:
+        out.append(_ins("engine", "warning", "Stop&Start — guasto rilevato",
+            "Il sistema Stop&Start ha riportato un guasto. Diagnostica raccomandata."))
 
     # Fuel consumption context
     l100 = trip.get("consumptionL100km")
@@ -112,12 +112,14 @@ def cross_trip(trips: list[dict]) -> list[dict]:
                 f"Ultime {len(volts)} partenze: {volts[0]:.2f}V → {volts[-1]:.2f}V. "
                 "Considera diagnosi batteria."))
 
-    # Regen interval stability
-    intervals = [t["dpfAvgRegenKm"] for t in obd if t.get("dpfAvgRegenKm") is not None]
-    if len(intervals) >= 3:
-        out.append(_ins("dpf", "info", "Intervallo medio rigenerazioni",
-            f"Stabile a {intervals[-1]:.0f} km. "
-            f"Range ultimi {len(intervals)}: {min(intervals):.0f}–{max(intervals):.0f} km."))
+    # Oil dilution trend — alert only when increasing
+    dil_series = [(t.get("start",""), t.get("oilDilutionPct")) for t in obd if t.get("oilDilutionPct") is not None]
+    if len(dil_series) >= 3:
+        vals = [v for _, v in dil_series]
+        if vals[-1] > vals[0] + 0.5 and vals[-1] > 1.5:
+            out.append(_ins("engine", "warning", "Diluizione olio in aumento",
+                f"Trend: {vals[0]:.1f}% → {vals[-1]:.1f}% sugli ultimi {len(vals)} viaggi OBD. "
+                "Verificare completamento rigenerazioni DPF."))
 
     # AdBlue low
     adblue = [t["adblueRangeKm"] for t in trips if t.get("adblueRangeKm") is not None]
@@ -127,13 +129,6 @@ def cross_trip(trips: list[dict]) -> list[dict]:
             out.append(_ins("adblue", "critical", f"Autonomia AdBlue: {last:.0f} km",
                 "Rifornisci a breve per evitare blocco del motore."))
 
-    # Soot accumulation pattern (informational, only if we have data)
-    soot_vals = [t["dpfSootPct"] for t in obd if t.get("dpfSootPct") is not None]
-    if soot_vals:
-        out.append(_ins("dpf", "info", "Accumulo fuliggine medio",
-            "+0.42 %/km su tragitti urbani brevi; +0.18 %/km su extraurbano. "
-            "Pattern coerente con uso misto."))
-
     # MyOpel fuel cost summary — use costEur when already computed, or compute from fuelConsumedL
     costed = [t for t in trips if t.get("costEur") is not None]
     if len(costed) >= 3:
@@ -141,5 +136,24 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         out.append(_ins("fuel", "info", "Spesa carburante (MyOpel)",
             f"Ultimi {len(costed)} viaggi: €{total:.2f} totali, "
             f"media €{total/len(costed):.2f}/viaggio."))
+
+    # Service countdown
+    km_svc_vals = [t.get("kmToService") for t in trips if t.get("kmToService") is not None]
+    if km_svc_vals:
+        km_svc = km_svc_vals[-1]
+        if km_svc is not None and km_svc < 500:
+            level = "critical" if km_svc <= 0 else "warning"
+            out.append(_ins("service", level, f"Tagliando tra {km_svc:.0f} km",
+                "Programma il prossimo intervento presso l'officina."))
+
+    # Consumo medio trend (ultimi 10 vs precedenti)
+    l100_all = [t["consumptionL100km"] for t in trips if t.get("consumptionL100km") and t["consumptionL100km"] < 20]
+    if len(l100_all) >= 10:
+        recent_avg = sum(l100_all[-5:]) / 5
+        older_avg  = sum(l100_all[:-5]) / (len(l100_all) - 5)
+        if recent_avg > older_avg * 1.15:
+            out.append(_ins("fuel", "warning", "Consumo in aumento",
+                f"Media recente {recent_avg:.1f} L/100 vs storico {older_avg:.1f} L/100. "
+                "Possibile usura, gonfiaggio pneumatici o guida diversa."))
 
     return out

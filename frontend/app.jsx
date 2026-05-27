@@ -32,7 +32,7 @@ const TopBar = ({ view, onSearch, onMenu }) => (
       <Icon name="list" size={18} />
     </button>
     <div>
-      <div className="crumb">OBD Trip Platform · Peugeot · MD1CS003</div>
+      <div className="crumb">OBD Trip Platform · Opel Corsa F · MD1CS003</div>
       <h1>{view}</h1>
     </div>
     <div className="topbar-spacer" />
@@ -56,6 +56,7 @@ const Sidebar = ({ active, setActive }) => {
     { id: "dpf",       icon: "chart",    label: "DPF / FAP" },
     { id: "myopel",    icon: "fuel",     label: "MyOpel" },
     { id: "trends",    icon: "trend",    label: "Trend & AI" },
+    { id: "admin",     icon: "gauge",    label: "Admin" },
   ];
 
   // Trip counts
@@ -96,6 +97,17 @@ const Sidebar = ({ active, setActive }) => {
       </div>
 
       <div className="veh-card">
+        {VEHICLE.vin && (
+          <img
+            src={`https://visual3d-secure.opel-vauxhall.com/V3DImage.ashx?client=MyMarque&vin=${encodeURIComponent(VEHICLE.vin)}&format=png&width=320&view=001`}
+            alt={VEHICLE.name}
+            className="veh-img"
+            onError={e => {
+              e.target.src = `https://cdn.imagin.studio/getImage?customer=img&make=opel&modelFamily=corsa&modelYear=2022&zoomType=fullscreen&angle=29`;
+              e.target.onerror = () => { e.target.style.display = "none"; };
+            }}
+          />
+        )}
         <div className="veh-name">{VEHICLE.name}</div>
         <div className="muted mono" style={{ fontSize: 11, marginBottom: 8 }}>{VEHICLE.ecu}</div>
         <div className="veh-row"><span>Odometro</span><span className="v">{VEHICLE.odometer?.toLocaleString("it-IT") ?? "—"} km</span></div>
@@ -118,25 +130,29 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
   const totalFuel = TRIPS.reduce((a, t) => a + (t.fuelConsumedL || 0), 0);
   const avgCons = totalFuel > 0 ? (totalFuel / totalKm * 100) : 0;
   const cost = TRIPS.reduce((a, t) => a + (t.costEur || 0), 0);
+  const fuelPriced = myop.filter(t => t.priceFuel);
+  const avgFuelPrice = fuelPriced.length > 0
+    ? fuelPriced.reduce((a, t) => a + t.priceFuel, 0) / fuelPriced.length
+    : null;
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 24 }}>
       <div className="stat-grid stagger" style={{ gridTemplateColumns: "repeat(5, 1fr)" }}>
         <StatCard label="Viaggi totali" value={TRIPS.length} sub={`${obd.length} OBD · ${myop.length} MyOpel`} />
-        <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" sub="ultimi 8 giorni" />
+        <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" sub="tutti i viaggi" />
         <StatCard label="Tempo guida" value={(totalMin / 60).toFixed(1)} unit="h" sub={`${Math.round(totalMin)} minuti`} />
         <StatCard label="Consumo medio" value={avgCons.toFixed(2)} unit="L/100km" sub="da PID L/h integrato" />
-        <StatCard label="Spesa MyOpel" value={`€${cost.toFixed(2)}`} sub={`${myop.length} viaggi · €1.78/L`} />
+        <StatCard label="Spesa MyOpel" value={`€${cost.toFixed(2)}`} sub={`${myop.length} viaggi · €${avgFuelPrice?.toFixed(3) ?? "—"}/L`} />
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
         <div className="dpf-block">
-          <RadialGauge value={VEHICLE.dpfSoot} max={100} label="Soot %" />
+          <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" />
           <div className="dpf-meta">
+            <div><div className="lbl">Closed soot</div><div className="v">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</div></div>
             <div><div className="lbl">Km dall'ultima regen</div><div className="v">{VEHICLE.dpfSinceRegenKm} <span className="muted">/ {VEHICLE.dpfAvgRegenKm}</span></div></div>
-            <div><div className="lbl">Vita residua DPF</div><div className="v">89.3k km</div></div>
-            <div><div className="lbl">Capacità LT</div><div className="v">92%</div></div>
-            <div><div className="lbl">Stato</div><div className="v"><DpfPill state="idle" /></div></div>
+            <div><div className="lbl">Vita residua DPF</div><div className="v">{VEHICLE.dpfReplaceKm ? (VEHICLE.dpfReplaceKm / 1000).toFixed(1) + "k km" : "—"}</div></div>
+            <div><div className="lbl">Stato</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState || "idle"} /></div></div>
           </div>
         </div>
 
@@ -151,7 +167,7 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
             <div><div className="lbl">AdBlue range</div><div className="v">{VEHICLE.adblueRange?.toLocaleString("it-IT") ?? "—"} km</div></div>
             <div><div className="lbl">Batteria avvio</div><div className="v">{VEHICLE.battery?.toFixed(2) ?? "—"} V</div></div>
             <div><div className="lbl">Prox. tagliando</div><div className="v">{VEHICLE.nextService?.days ?? "—"} g</div></div>
-            <div><div className="lbl">Olio dilution</div><div className="v">1.0 %</div></div>
+            <div><div className="lbl">Olio dilution</div><div className="v">{VEHICLE.oilDilutionPct != null ? VEHICLE.oilDilutionPct + " %" : "—"}</div></div>
           </div>
         </div>
       </div>
@@ -185,7 +201,7 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
 
 /* ============== Trips view (list + detail) ============== */
 const TripsView = ({ selectedId, setSelectedId }) => {
-  const [filter, setFilter] = useState("all"); // all / obd / myopel / alerts / regen
+  const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
 
   const filtered = useMemo(() => {
@@ -237,7 +253,6 @@ const TripsView = ({ selectedId, setSelectedId }) => {
           <div className="muted" style={{ padding: 20, textAlign: "center" }}>Nessun viaggio corrisponde ai filtri.</div>
         )}
       </div>
-      {/* extra div above closes correctly */}
 
       {trip ? <TripDetail trip={trip} /> : <div className="empty-state">Seleziona un viaggio</div>}
     </div>
@@ -343,7 +358,7 @@ const TripOverview = ({ trip }) => {
               { slug: "speed",   name: "Velocità",  unit: "km/h", color: "var(--accent)" },
               { slug: "coolant", name: "Liquido",   unit: "°C",   color: "var(--warn)" },
               { slug: "egt_a",   name: "EGT post",  unit: "°C",   color: "var(--crit)" },
-              { slug: "soot",    name: "Soot DPF",  unit: "%",    color: "var(--warn)" },
+              { slug: "closed_soot", name: "Closed soot", unit: "g/L", color: "var(--warn)" },
             ].map(p => {
               const stats = trip.pidValues?.[p.slug];
               const series = trip.pidSeriesFull?.[p.slug];
@@ -398,16 +413,15 @@ const TripDpf = ({ trip }) => {
   return (
     <>
       <div className="dpf-block">
-        <RadialGauge value={trip.dpfSootPct} max={100} label="Soot %" />
+        <RadialGauge value={trip.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" />
         <div className="dpf-meta">
           <div><div className="lbl">Stato</div><div className="v"><DpfPill state={trip.dpfRegenState} /></div></div>
-          <div><div className="lbl">Closed-loop soot</div><div className="v">{trip.dpfClosedSoot} <span className="muted">g/L</span></div></div>
+          <div><div className="lbl">Closed soot</div><div className="v">{trip.dpfClosedSoot != null ? trip.dpfClosedSoot + " g/L" : "—"}</div></div>
           <div><div className="lbl">Km dall'ultima regen</div><div className="v">{trip.dpfSinceRegenKm} <span className="muted">/ {trip.dpfAvgRegenKm} avg</span></div></div>
-          <div><div className="lbl">Capacità regen</div><div className="v">LT {trip.dpfRegenCapability}% · ST {trip.dpfRegenCapabilityST}%</div></div>
           <div><div className="lbl">EGT post-cat (peak)</div><div className="v">{trip.exhaustAfterCatC} <span className="muted">°C</span></div></div>
           <div><div className="lbl">NOx cat (peak)</div><div className="v">{trip.noxCatTempMaxC} <span className="muted">°C</span></div></div>
-          <div><div className="lbl">Vita residua DPF</div><div className="v">{(trip.dpfReplaceKm / 1000).toFixed(1)}k <span className="muted">km</span></div></div>
-          <div><div className="lbl">Olio dilution</div><div className="v">{trip.oilDilutionPct} <span className="muted">%</span></div></div>
+          <div><div className="lbl">Vita residua DPF</div><div className="v">{trip.dpfReplaceKm != null ? (trip.dpfReplaceKm / 1000).toFixed(1) + "k" : "—"} <span className="muted">km</span></div></div>
+          <div><div className="lbl">Olio dilution</div><div className="v">{trip.oilDilutionPct != null ? trip.oilDilutionPct + " %" : "—"}</div></div>
         </div>
       </div>
 
@@ -416,7 +430,7 @@ const TripDpf = ({ trip }) => {
           <span className="section-title">DPF state machine</span>
           <span className="section-sub">§8 — derivata da regen_status + EGT + Δkm</span>
         </div>
-        <div style={{ display: "flex", gap: 0, alignItems: "center", flexWrap: "wrap" }}>
+        <div className="dpf-state-row" style={{ display: "flex", gap: 0, alignItems: "center", flexWrap: "wrap" }}>
           {stages.map((s, i) => (
             <React.Fragment key={s}>
               <div style={{
@@ -451,11 +465,11 @@ const TripDpf = ({ trip }) => {
 
       <div>
         <div className="section-head">
-          <span className="section-title">Andamento soot</span>
-          <span className="section-sub">% intasamento DPF</span>
+          <span className="section-title">Andamento closed soot</span>
+          <span className="section-sub">g/L — campioni DPF durante il viaggio</span>
         </div>
         <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)", padding: 12 }}>
-          <LineChart data={trip.pidSeriesFull?.soot || []} color="var(--warn)" yLabel="%" />
+          <LineChart data={trip.pidSeriesFull?.closed_soot || trip.pidSeriesFull?.soot || []} color="var(--warn)" yLabel="g/L" />
         </div>
       </div>
     </>
@@ -560,7 +574,7 @@ const PidExplorerInner = ({ trip }) => {
           </div>
         </div>
 
-        <div style={{ maxHeight: "60vh", overflow: "auto" }}>
+        <div className="pid-scroll">
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
             <thead style={{ position: "sticky", top: 0, background: "var(--bg-2)", zIndex: 2 }}>
               <tr style={{ textAlign: "left", color: "var(--fg-3)" }}>
@@ -585,7 +599,7 @@ const PidExplorerInner = ({ trip }) => {
                         cursor: "pointer",
                       }}>
                     <td style={{ padding: "6px 12px", color: isSel ? "var(--accent-strong)" : "var(--fg-0)" }}>
-                      <div style={{ fontWeight: 500 }}>{p.short}</div>
+                      <div style={{ fontWeight: 500 }}>{p.name.replace(/^\[(ECM|TCU)\]\s*/i, "")}</div>
                       <div className="muted mono" style={{ fontSize: 10 }}>{p.slug}</div>
                     </td>
                     <td style={{ padding: "6px 8px", color: "var(--fg-2)" }}>{p.group}</td>
@@ -604,7 +618,7 @@ const PidExplorerInner = ({ trip }) => {
               })}
               {filtered.length === 0 && (
                 <tr><td colSpan="5" style={{ padding: 20, textAlign: "center", color: "var(--fg-3)" }}>
-                  Nessun PID trovato.
+                  {trip && !trip.pidValues ? "Nessun dato PID — viaggio solo MyOpel o CSV non importato correttamente." : "Nessun PID trovato."}
                 </td></tr>
               )}
             </tbody>
@@ -618,7 +632,7 @@ const PidExplorerInner = ({ trip }) => {
             <div style={{ fontSize: 11, color: "var(--fg-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>
               {selPid.group} · {selPid.kind}
             </div>
-            <div style={{ fontSize: 16, color: "var(--fg-0)", fontWeight: 600, marginTop: 4 }}>{selPid.short}</div>
+            <div style={{ fontSize: 16, color: "var(--fg-0)", fontWeight: 600, marginTop: 4 }}>{selPid.name.replace(/^\[(ECM|TCU)\]\s*/i, "")}</div>
             <div className="muted mono" style={{ fontSize: 11, marginTop: 2 }}>{selPid.name}</div>
             <div className="muted mono" style={{ fontSize: 11 }}>slug: <span style={{ color: "var(--fg-1)" }}>{selPid.slug}</span></div>
 
@@ -683,7 +697,7 @@ const MapView = () => {
         ))}
       </div>
       <div className="detail">
-        <div className="map-wrap" style={{ height: "calc(100vh - 80px - 48px)" }}>
+        <div className="map-wrap map-fullpage">
           <TripMap trip={trip} allTrips={obdTrips} height={"100%"} />
           <div className="map-overlay">
             <div className="lbl">Provincia di Salerno</div>
@@ -703,7 +717,7 @@ const MapView = () => {
 /* ============== DPF / FAP view ============== */
 const DpfView = () => {
   const obdTrips = TRIPS.filter(t => t.sources.includes("obd")).sort((a, b) => a.start.localeCompare(b.start));
-  const sootSeries = obdTrips.map(t => t.dpfSootPct);
+  const sootSeries = obdTrips.map(t => t.dpfClosedSoot);
   const regenDistSeries = obdTrips.map(t => t.dpfSinceRegenKm);
   const egtSeries = obdTrips.map(t => t.exhaustAfterCatC);
 
@@ -714,20 +728,20 @@ const DpfView = () => {
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16 }}>
         <div className="dpf-block">
-          <RadialGauge value={VEHICLE.dpfSoot} max={100} label="Soot %" />
+          <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" />
           <div className="dpf-meta">
-            <div><div className="lbl">Stato attuale</div><div className="v"><DpfPill state="idle" /></div></div>
-            <div><div className="lbl">Closed-loop</div><div className="v">18.4 <span className="muted">g/L</span></div></div>
+            <div><div className="lbl">Stato attuale</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState || "idle"} /></div></div>
+            <div><div className="lbl">Closed soot</div><div className="v">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</div></div>
             <div><div className="lbl">Km da regen</div><div className="v">{VEHICLE.dpfSinceRegenKm}</div></div>
             <div><div className="lbl">Avg interval</div><div className="v">{VEHICLE.dpfAvgRegenKm} km</div></div>
           </div>
         </div>
 
         <div className="trend-card">
-          <div className="section-head"><span className="section-title">Soot trend</span><span className="section-sub">ultimi {obdTrips.length} viaggi OBD</span></div>
-          <div className="big-num">{sootSeries[sootSeries.length - 1]}<span className="unit">%</span></div>
+          <div className="section-head"><span className="section-title">Closed soot trend</span><span className="section-sub">g/L · ultimi {obdTrips.length} viaggi OBD</span></div>
+          <div className="big-num">{sootSeries.filter(v => v != null).slice(-1)[0] ?? "—"}<span className="unit"> g/L</span></div>
           <Sparkline data={sootSeries} color="var(--warn)" height={70} />
-          <div className="muted mono" style={{ fontSize: 11 }}>min {Math.min(...sootSeries)}% · max {Math.max(...sootSeries)}%</div>
+          <div className="muted mono" style={{ fontSize: 11 }}>soglia rigenerazione: ~5 g/L</div>
         </div>
 
         <div className="trend-card">
@@ -752,8 +766,8 @@ const DpfView = () => {
                 <DpfPill state={t.dpfRegenState} />
               </div>
               <div className="trip-card-stats">
-                <div className="trip-stat"><span className="lbl">Soot inizio→fine</span>
-                  <span className="val mono">{(t.dpfSootPct + 3).toFixed(0)}→{t.dpfSootPct}<span className="unit"> %</span></span>
+                <div className="trip-stat"><span className="lbl">Closed soot</span>
+                  <span className="val mono">{t.dpfClosedSoot ?? "—"}<span className="unit"> g/L</span></span>
                 </div>
                 <div className="trip-stat"><span className="lbl">EGT picco</span>
                   <span className="val mono">{t.exhaustAfterCatC}<span className="unit"> °C</span></span>
@@ -784,12 +798,16 @@ const MyOpelView = () => {
   const totalFuel = myop.reduce((a, t) => a + (t.fuelConsumedL || 0), 0);
   const totalKm = myop.reduce((a, t) => a + (t.distanceKm || 0), 0);
   const allAlerts = myop.flatMap(t => (t.alerts || []).map(c => ({ code: c, trip: t })));
+  const fuelPriced = myop.filter(t => t.priceFuel);
+  const avgPrice = fuelPriced.length > 0
+    ? fuelPriced.reduce((a, t) => a + t.priceFuel, 0) / fuelPriced.length
+    : null;
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div className="stat-grid" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
         <StatCard label="Viaggi MyOpel" value={myop.length} sub="ultima sincronizzazione email: oggi 11:02" />
-        <StatCard label="Spesa totale" value={`€${totalCost.toFixed(2)}`} sub={`${totalFuel.toFixed(2)} L · €1.78/L`} />
+        <StatCard label="Spesa totale" value={`€${totalCost.toFixed(2)}`} sub={`${totalFuel.toFixed(2)} L · €${avgPrice?.toFixed(3) ?? "—"}/L`} />
         <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" />
         <StatCard label="Alerts MyOpel" value={allAlerts.length} sub={`${new Set(allAlerts.map(a => a.code)).size} unici`} />
       </div>
@@ -800,7 +818,7 @@ const MyOpelView = () => {
             <span className="section-title">Cronologia viaggi</span>
             <span className="section-sub">canale Stellantis · TCU</span>
           </div>
-          <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)", overflow: "hidden" }}>
+          <div className="table-wrap" style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
               <thead>
                 <tr style={{ textAlign: "left", color: "var(--fg-3)", background: "var(--bg-2)" }}>
@@ -823,8 +841,8 @@ const MyOpelView = () => {
                         {new Date(t.start).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
                       </span>
                     </td>
-                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.distanceKm.toFixed(1)} <span className="muted">km</span></td>
-                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.durationMin.toFixed(0)} <span className="muted">min</span></td>
+                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.distanceKm?.toFixed(1) ?? "—"} <span className="muted">km</span></td>
+                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.durationMin?.toFixed(0) ?? "—"} <span className="muted">min</span></td>
                     <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.consumptionL100km?.toFixed(2)} <span className="muted">L/100</span></td>
                     <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.costEur ? `€${t.costEur.toFixed(2)}` : "—"}</td>
                     <td style={{ padding: "10px 12px" }}>
@@ -843,29 +861,25 @@ const MyOpelView = () => {
 
         <div>
           <div className="section-head">
-            <span className="section-title">Pipeline ingestione</span>
-            <span className="section-sub">IMAP push (IDLE)</span>
+            <span className="section-title">Ingestione .myop</span>
+            <span className="section-sub">watchdog /data/myop</span>
           </div>
           <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)", padding: 14, fontSize: 12, display: "flex", flexDirection: "column", gap: 6 }}>
             <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: "var(--ok)" }}></span>
-              <span style={{ flex: 1 }}>Inbox connessa</span>
-              <span className="mono muted">2s fa</span>
+              <span style={{ flex: 1 }}>Sorgente</span>
+              <span className="mono muted">file .myop</span>
             </div>
             <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: "var(--ok)" }}></span>
-              <span style={{ flex: 1 }}>Ultimo .myop ricevuto</span>
-              <span className="mono muted">11:02</span>
+              <span style={{ flex: 1 }}>Viaggi caricati</span>
+              <span className="mono muted">{myop.length}</span>
             </div>
-            <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: "var(--ok)" }}></span>
+            <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: VEHICLE.vin ? "var(--ok)" : "var(--warn)" }}></span>
               <span style={{ flex: 1 }}>VIN identificato</span>
-              <span className="mono muted">{VEHICLE.vin.slice(-6)}</span>
-            </div>
-            <div className="row"><span className="dot" style={{ width: 6, height: 6, borderRadius: 3, background: "var(--warn)" }}></span>
-              <span style={{ flex: 1 }}>Offset timezone CEST</span>
-              <span className="mono muted">-2h</span>
+              <span className="mono muted">{VEHICLE.vin?.slice(-6) ?? "—"}</span>
             </div>
             <div className="divider"></div>
             <div className="muted" style={{ fontSize: 11, lineHeight: 1.5 }}>
-              Ogni email Stellantis contiene <span className="mono">tutti</span> i viaggi cumulativamente.
+              Ogni file .myop contiene <span className="mono">tutti</span> i viaggi cumulativamente.
               I duplicati sono dedotti tramite trip ID.
             </div>
           </div>
@@ -902,6 +916,8 @@ const TrendsView = () => {
   const consTrend = TRIPS.filter(t => t.consumptionL100km).map(t => t.consumptionL100km);
   const distTrend = TRIPS.map(t => t.distanceKm);
   const adblueTrend = obd.map(t => t.adblueRangeKm);
+  const sootTrend = obd.map(t => t.dpfClosedSoot);
+  const dilTrend = obd.filter(t => t.oilDilutionPct != null).map(t => ({ start: t.start, v: t.oilDilutionPct }));
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -926,6 +942,18 @@ const TrendsView = () => {
           <div className="big-num">{adblueTrend[adblueTrend.length - 1]}<span className="unit">km</span></div>
           <LineChart data={adblueTrend} color="var(--warn)" height={90} yLabel="km" />
         </div>
+        <div className="trend-card">
+          <div className="section-head"><span className="section-title">Closed soot DPF</span><span className="section-sub">g/L — ciclo vita FAP</span></div>
+          <div className="big-num">{sootTrend.filter(v => v != null).slice(-1)[0] ?? "—"}<span className="unit"> g/L</span></div>
+          <LineChart data={sootTrend} color="var(--warn)" height={90} yLabel="g/L" />
+        </div>
+        {dilTrend.length >= 2 && (
+          <div className="trend-card">
+            <div className="section-head"><span className="section-title">Diluizione olio</span><span className="section-sub">% nel tempo — attenzione ai trend crescenti</span></div>
+            <div className="big-num">{dilTrend[dilTrend.length - 1]?.v?.toFixed(1)}<span className="unit">%</span></div>
+            <LineChart data={dilTrend.map(d => d.v)} color="var(--crit)" height={90} yLabel="%" />
+          </div>
+        )}
       </div>
 
       <div>
@@ -963,6 +991,103 @@ const TrendsView = () => {
   );
 };
 
+/* ============== Admin view ============== */
+const AdminView = () => {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [correlating, setCorrelating] = useState(false);
+
+  const check = async () => {
+    setLoading(true);
+    try {
+      const r = await fetch("/api/v1/admin/uncorrelated");
+      setData(await r.json());
+    } catch(e) {
+      setData({ error: e.message });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const correlate = async () => {
+    setCorrelating(true);
+    try {
+      const r = await fetch("/api/v1/admin/correlate", { method: "POST" });
+      const res = await r.json();
+      await check();
+      alert("Correlazione completata: " + JSON.stringify(res));
+    } catch(e) {
+      alert("Errore: " + e.message);
+    } finally {
+      setCorrelating(false);
+    }
+  };
+
+  const fmt = (s) => s ? s.slice(0,16).replace("T"," ") : "—";
+
+  return (
+    <div className="page-single" style={{ maxWidth: 900 }}>
+      <div className="section-head">
+        <span className="section-title">Diagnostica correlazione</span>
+      </div>
+
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
+          <button className="icon-btn" onClick={check} disabled={loading}>
+            {loading ? "…" : "Verifica trip non correlati"}
+          </button>
+          <button className="icon-btn" onClick={correlate} disabled={correlating} style={{ background: "var(--warn-soft)", color: "var(--warn)" }}>
+            {correlating ? "…" : "Forza correlazione"}
+          </button>
+          {data && !data.error && (
+            <span className="muted" style={{ fontSize: 12, alignSelf: "center" }}>
+              OBD soli: <b>{data.standalone_obd}</b> · MyOpel soli: <b>{data.standalone_myop}</b> · Candidati: <b>{data.candidates?.length ?? 0}</b>
+            </span>
+          )}
+        </div>
+      </div>
+
+      {data?.error && (
+        <div className="insight-card critical"><b>Errore:</b> {data.error}</div>
+      )}
+
+      {data?.candidates?.length === 0 && (
+        <div className="card" style={{ color: "var(--ok)", padding: 16 }}>
+          Nessun trip sovrapposto non correlato trovato.
+        </div>
+      )}
+
+      {data?.candidates?.map((c, i) => (
+        <div key={i} className="card" style={{ marginBottom: 10, borderLeft: `3px solid ${c.would_correlate ? "var(--ok)" : "var(--warn)"}` }}>
+          <div className="row" style={{ gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <div className="lbl" style={{ marginBottom: 4 }}>OBD</div>
+              <div className="mono" style={{ fontSize: 12 }}>{c.obd.id}</div>
+              <div style={{ fontSize: 13 }}>{fmt(c.obd.start)} → {fmt(c.obd.end)}</div>
+              <div className="muted" style={{ fontSize: 12 }}>{c.obd.km?.toFixed(1) ?? "—"} km · {c.obd.min?.toFixed(0) ?? "—"} min</div>
+            </div>
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <div className="lbl" style={{ marginBottom: 4 }}>MyOpel</div>
+              <div className="mono" style={{ fontSize: 12 }}>{c.myop.id}</div>
+              <div style={{ fontSize: 13 }}>{fmt(c.myop.start)} → {fmt(c.myop.end)}</div>
+              <div className="muted" style={{ fontSize: 12 }}>{c.myop.km?.toFixed(1) ?? "—"} km · {c.myop.min?.toFixed(0) ?? "—"} min</div>
+            </div>
+            <div style={{ textAlign: "right", minWidth: 100 }}>
+              <div style={{ fontSize: 22, fontWeight: 700, color: c.score >= 0.5 ? "var(--ok)" : c.score >= 0.35 ? "var(--warn)" : "var(--muted)" }}>
+                {(c.score * 100).toFixed(0)}%
+              </div>
+              <div className="muted" style={{ fontSize: 11 }}>punteggio</div>
+              <div style={{ fontSize: 11, marginTop: 4, color: c.would_correlate ? "var(--ok)" : "var(--muted)" }}>
+                {c.would_correlate ? "✓ sopra soglia" : "sotto soglia 50%"}
+              </div>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 /* ============== Root ============== */
 const App = () => {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
@@ -990,6 +1115,7 @@ const App = () => {
     dpf: "DPF / FAP",
     myopel: "MyOpel · Stellantis",
     trends: "Trend & AI Insights",
+    admin: "Admin · Diagnostica",
   };
 
   // keyboard nav
@@ -1029,6 +1155,7 @@ const App = () => {
             {view === "dpf"       && <DpfView />}
             {view === "myopel"    && <MyOpelView />}
             {view === "trends"    && <TrendsView />}
+            {view === "admin"     && <AdminView />}
           </div>
         </div>
       </main>

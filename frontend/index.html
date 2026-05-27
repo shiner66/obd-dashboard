@@ -2,7 +2,10 @@
 <html lang="it">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1a1f26">
   <title>OBD Trip Platform</title>
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -28,7 +31,8 @@
       var VEHICLE = {name:'OBD Trip Platform',ecu:'',adapter:'',vin:'',odometer:null,
         fuelLevel:null,fuelAutonomy:null,adblueRange:null,
         nextService:{days:null,km:null,passed:false},
-        dpfSoot:null,dpfAvgRegenKm:null,dpfSinceRegenKm:null,battery:null};
+        dpfSoot:null,dpfAvgRegenKm:null,dpfSinceRegenKm:null,battery:null,
+        dpfReplaceKm:null,dpfRegenCapability:null,dpfRegenState:null,oilDilutionPct:null};
     }
   </script>
   <script type="text/babel" src="components.jsx"></script>

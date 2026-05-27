@@ -5,7 +5,6 @@ import logging
 import math
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
 from pathlib import Path
 
 import aiofiles
@@ -15,79 +14,30 @@ from fastapi.responses import Response
 
 from . import database as db
 from .parsers import csv_parser, myop_parser
+from .services import correlator as corr_svc
 from .services import insights as insight_svc
 from .services.watcher import Watcher
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
 
-OBD_FILES_DIR  = Path(os.getenv("OBD_FILES_DIR",  "/data/obd"))
-MYOP_FILES_DIR = Path(os.getenv("MYOP_FILES_DIR", "/data/myop"))
-DB_PATH        = Path(os.getenv("DB_PATH",        "/data/db/trips.db"))
+OBD_FILES_DIR   = Path(os.getenv("OBD_FILES_DIR",   "/data/obd"))
+MYOP_FILES_DIR  = Path(os.getenv("MYOP_FILES_DIR",  "/data/myop"))
+DB_PATH         = Path(os.getenv("DB_PATH",         "/data/db/trips.db"))
+VEHICLE_NAME    = os.getenv("VEHICLE_NAME",    "Opel Corsa F Elegance")
+VEHICLE_ECU     = os.getenv("VEHICLE_ECU",     "MD1CS003 — 1.5d BlueHDi")
+VEHICLE_ADAPTER = os.getenv("VEHICLE_ADAPTER", "BTLE IOS-Vlink")
 
 _watcher = Watcher()
 
 
-# ── Trip correlation ──────────────────────────────────────────────────────────
-
-def _parse_dt(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
-        try:
-            return datetime.strptime(s[:19], fmt[:len(fmt)])
-        except ValueError:
-            continue
-    return None
-
-
-def _trips_match(obd: dict, myop: dict) -> bool:
-    """Return True if an OBD trip and a myop trip are the same real-world trip."""
-    t1 = _parse_dt(obd.get("start"))
-    t2 = _parse_dt(myop.get("start"))
-    if t1 is None or t2 is None:
-        return False
-    if abs((t1 - t2).total_seconds()) > 600:   # ±10 min
-        return False
-    d1 = obd.get("distanceKm") or 0
-    d2 = myop.get("distanceKm") or 0
-    if d1 > 0 and d2 > 0:
-        ratio = abs(d1 - d2) / max(d1, d2)
-        if ratio > 0.25:                        # ±25 % tolerance
-            return False
-    return True
-
-
-def _correlate_new_obd(obd_trip: dict) -> None:
-    """After saving an OBD trip, check if any unmatched myop trip matches it."""
-    all_trips = db.get_all_trips()
-    for t in all_trips:
-        if "myopel" not in t.get("sources", []):
-            continue
-        if "obd" in t.get("sources", []):
-            continue                            # already merged
-        if _trips_match(obd_trip, t):
-            log.info("Correlating OBD %s → myop %s", obd_trip["id"], t["id"])
-            db.enrich_with_myop(obd_trip["id"], t)
-            break
-
-
-def _correlate_new_myop(myop_trip: dict) -> None:
-    """After saving a myop trip, check if any OBD trip matches it."""
-    all_trips = db.get_all_trips()
-    for t in all_trips:
-        if "obd" not in t.get("sources", []):
-            continue
-        if _trips_match(t, myop_trip):
-            log.info("Correlating myop %s → OBD %s", myop_trip["id"], t["id"])
-            db.enrich_with_myop(t["id"], myop_trip)
-            break
-
-
 # ── File processing ───────────────────────────────────────────────────────────
+# Files are persisted as-is. Cross-trip reconciliation (OBD chain merge,
+# OBD↔MyOpel correlation, MyOpel dedupe) is delegated to corr_svc and runs
+# after every batch — see _post_process().
 
 def _process_obd_file(path: Path) -> list[str]:
-    """Parse an OBD CSV/BRC file, save trips, run insights, correlate. Returns new trip IDs."""
+    """Parse an OBD CSV/BRC file, save new trips, run per-trip insights. Returns new trip IDs."""
     trips = csv_parser.parse_file(path)
     new_ids: list[str] = []
     for trip in trips:
@@ -96,25 +46,40 @@ def _process_obd_file(path: Path) -> list[str]:
             continue
         trip["insights"] = insight_svc.per_trip(trip)
         db.save_trip(trip)
-        _correlate_new_obd(trip)
         new_ids.append(trip["id"])
         log.info("Saved OBD trip %s (%.1f km)", trip["id"], trip.get("distanceKm") or 0)
+    if new_ids:
+        _post_process()
     return new_ids
 
 
 def _process_myop_file(path: Path) -> list[str]:
-    """Parse a .myop file, save trips, correlate. Returns new trip IDs."""
+    """Parse a .myop file, save new trips. Returns new trip IDs."""
     trips = myop_parser.parse_file(path)
     new_ids: list[str] = []
     for trip in trips:
         if db.trip_exists(trip["id"]):
-            _correlate_new_myop(trip)
             continue
         db.save_trip(trip)
-        _correlate_new_myop(trip)
         new_ids.append(trip["id"])
         log.info("Saved myop trip %s", trip["id"])
+    if new_ids:
+        _post_process()
     return new_ids
+
+
+def _post_process() -> None:
+    """Run autonomous correlation + refresh insights. Safe to call repeatedly."""
+    try:
+        counts = corr_svc.auto_correlate_all()
+    except Exception:
+        log.exception("auto_correlate_all failed")
+        counts = {}
+    # Recompute per-trip insights when correlation actually changed something
+    # (merges can absorb fields that affect rules like soot threshold or EGT).
+    if any(counts.values()):
+        _recompute_all_insights()
+    _refresh_cross_trip_insights()
 
 
 def _scan_directory(directory: Path, process_fn, extensions: tuple[str, ...]) -> None:
@@ -139,16 +104,37 @@ async def lifespan(app: FastAPI):
     _scan_directory(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
     _scan_directory(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
 
+    # Final reconciliation pass after the initial scan — handles any leftover
+    # duplicates or chains from previous runs.
+    try:
+        corr_svc.auto_correlate_all()
+    except Exception:
+        log.exception("Startup auto_correlate_all failed")
+
     _watcher.watch(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
     _watcher.watch(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
     _watcher.start()
 
-    # Regenerate cross-trip insights and store on the most recent trip
+    _recompute_all_insights()
     _refresh_cross_trip_insights()
 
     yield
 
     _watcher.stop()
+
+
+def _recompute_all_insights() -> None:
+    try:
+        trips = db.get_all_trips()
+        updated = 0
+        for trip in trips:
+            if "obd" not in trip.get("sources", []):
+                continue
+            db.update_insights(trip["id"], insight_svc.per_trip(trip))
+            updated += 1
+        log.info("Recomputed per-trip insights for %d OBD trips", updated)
+    except Exception:
+        log.exception("Per-trip insight recompute failed")
 
 
 def _refresh_cross_trip_insights() -> None:
@@ -199,9 +185,9 @@ def _build_vehicle(trips: list[dict]) -> dict:
     vin = next((t.get("vin", "") for t in myop_trips if t.get("vin")), "")
 
     return {
-        "name":          "Peugeot 308 SW",
-        "ecu":           "MD1CS003 — 1.5 BlueHDi",
-        "adapter":       "BTLE IOS-Vlink",
+        "name":          VEHICLE_NAME,
+        "ecu":           VEHICLE_ECU,
+        "adapter":       VEHICLE_ADAPTER,
         "vin":           vin,
         "odometer":      latest.get("odometerKm"),
         "fuelLevel":     fuel_level,
@@ -212,10 +198,15 @@ def _build_vehicle(trips: list[dict]) -> dict:
             "km":     km_svc,
             "passed": bool(maint_passed),
         },
-        "dpfSoot":         latest_obd.get("dpfSootPct"),
-        "dpfAvgRegenKm":   latest_obd.get("dpfAvgRegenKm"),
-        "dpfSinceRegenKm": latest_obd.get("dpfSinceRegenKm"),
-        "battery":         latest_obd.get("batteryStartupV"),
+        "dpfSoot":            latest_obd.get("dpfClosedSoot"),
+        "dpfClosedSoot":      latest_obd.get("dpfClosedSoot"),
+        "dpfAvgRegenKm":      latest_obd.get("dpfAvgRegenKm"),
+        "dpfSinceRegenKm":    latest_obd.get("dpfSinceRegenKm"),
+        "dpfReplaceKm":       latest_obd.get("dpfReplaceKm"),
+        "dpfRegenCapability": latest_obd.get("dpfRegenCapability"),
+        "dpfRegenState":      latest_obd.get("dpfRegenState"),
+        "oilDilutionPct":     latest_obd.get("oilDilutionPct"),
+        "battery":            latest_obd.get("batteryStartupV"),
     }
 
 
@@ -310,7 +301,6 @@ async def upload_obd(file: UploadFile):
         await f.write(await file.read())
     try:
         new_ids = _process_obd_file(dest)
-        _refresh_cross_trip_insights()
         return {"status": "ok", "new_trips": new_ids}
     except Exception as e:
         log.exception("Error processing uploaded OBD file")
@@ -325,13 +315,153 @@ async def upload_myop(file: UploadFile):
         await f.write(await file.read())
     try:
         new_ids = _process_myop_file(dest)
-        _refresh_cross_trip_insights()
         return {"status": "ok", "new_trips": new_ids}
     except Exception as e:
         log.exception("Error processing uploaded myop file")
         raise HTTPException(status_code=422, detail=str(e))
 
 
+@app.post("/api/v1/trips/merge")
+async def merge_trips(payload: dict):
+    """Merge trips: { primary_id: str, secondary_ids: [str] }"""
+    primary_id = payload.get("primary_id")
+    secondary_ids = payload.get("secondary_ids", [])
+    if not primary_id or not secondary_ids:
+        raise HTTPException(status_code=400, detail="primary_id and secondary_ids required")
+    try:
+        result = db.merge_trips(primary_id, secondary_ids)
+        return {"ok": True, "merged": result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.get("/api/v1/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/api/v1/admin/correlate")
+def admin_correlate():
+    """Force an autonomous correlation pass (merge chains, correlate, dedupe).
+
+    Normally runs automatically on every upload and at startup. Use this
+    endpoint after manual DB edits or to verify reconciliation is up-to-date.
+    """
+    counts = corr_svc.auto_correlate_all()
+    _refresh_cross_trip_insights()
+    return counts
+
+
+@app.get("/api/v1/admin/uncorrelated")
+def admin_uncorrelated():
+    """Return candidate trip pairs that may be the same journey but are not yet correlated.
+
+    Reports every (OBD, MyOpel) pair whose score exceeds 0.25 (well below the
+    0.50 auto-merge threshold), sorted descending by score.  Pairs at or above
+    0.50 were already correlated automatically; pairs below indicate either
+    genuine separate trips or a data quality issue worth investigating.
+    """
+    trips = db.get_all_trips()
+    obd_trips  = [t for t in trips if "obd"    in t.get("sources", [])
+                  and "myopel" not in t.get("sources", [])]
+    myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
+                  and "obd"    not in t.get("sources", [])]
+
+    candidates = []
+    for myop in myop_trips:
+        for obd in obd_trips:
+            score = corr_svc._score(obd, myop)
+            if score >= 0.25:
+                candidates.append({
+                    "score":          round(score, 3),
+                    "auto_threshold": corr_svc.MIN_MATCH_SCORE,
+                    "would_correlate": score >= corr_svc.MIN_MATCH_SCORE,
+                    "obd": {
+                        "id":    obd["id"],
+                        "start": obd.get("start"),
+                        "end":   obd.get("end"),
+                        "km":    obd.get("distanceKm"),
+                        "min":   obd.get("durationMin"),
+                    },
+                    "myop": {
+                        "id":    myop["id"],
+                        "start": myop.get("start"),
+                        "end":   myop.get("end"),
+                        "km":    myop.get("distanceKm"),
+                        "min":   myop.get("durationMin"),
+                    },
+                })
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "standalone_obd":  len(obd_trips),
+        "standalone_myop": len(myop_trips),
+        "candidates":      candidates,
+    }
+
+
+@app.post("/api/v1/admin/recompute-insights")
+def recompute_insights():
+    """Recompute per-trip insights for all OBD trips using current rules.
+
+    Safe to call multiple times. Use after updating insight/DPF logic to
+    refresh the stored insights without re-uploading CSV files.
+    """
+    trips = db.get_all_trips()
+    updated = 0
+    for trip in trips:
+        if "obd" not in trip.get("sources", []):
+            continue
+        new_insights = insight_svc.per_trip(trip)
+        db.update_insights(trip["id"], new_insights)
+        updated += 1
+    log.info("recompute-insights: updated %d OBD trips", updated)
+    return {"updated": updated}
+
+
+@app.get("/api/v1/debug/data-error")
+def debug_data_error():
+    """Diagnose why data.js fails: find the first trip field that can't be serialized."""
+    import traceback
+    trips = db.get_all_trips()
+    results = []
+
+    # Try serializing VEHICLE
+    try:
+        vehicle = _build_vehicle(trips)
+        json.dumps(vehicle)
+        results.append({"section": "VEHICLE", "ok": True})
+    except Exception as e:
+        results.append({"section": "VEHICLE", "ok": False, "error": str(e),
+                        "trace": traceback.format_exc()})
+
+    # Try serializing TREND_INSIGHTS
+    try:
+        ti = getattr(app.state, "trend_insights", [])
+        json.dumps(ti)
+        results.append({"section": "TREND_INSIGHTS", "ok": True})
+    except Exception as e:
+        results.append({"section": "TREND_INSIGHTS", "ok": False, "error": str(e)})
+
+    # Try serializing each trip individually to pin down the bad one
+    bad_trips = []
+    for t in trips:
+        try:
+            json.dumps(t)
+        except Exception as e:
+            # Find the bad field
+            bad_fields = []
+            for k, v in t.items():
+                try:
+                    json.dumps(v)
+                except Exception as fe:
+                    bad_fields.append({"field": k, "type": type(v).__name__,
+                                       "value": repr(v)[:200], "error": str(fe)})
+            bad_trips.append({"trip_id": t.get("id"), "bad_fields": bad_fields})
+
+    if bad_trips:
+        results.append({"section": "TRIPS", "ok": False, "bad_trips": bad_trips})
+    else:
+        results.append({"section": "TRIPS", "ok": True, "count": len(trips)})
+
+    return results

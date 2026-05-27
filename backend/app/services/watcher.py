@@ -2,6 +2,7 @@
 from __future__ import annotations
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -18,12 +19,21 @@ class _Handler(FileSystemEventHandler):
 
     def _handle(self, path: str) -> None:
         p = Path(path)
-        if p.suffix.lower() in self._exts:
-            log.info("Watcher detected new file: %s", p)
+        if p.suffix.lower() not in self._exts:
+            return
+        log.info("Watcher detected new file: %s", p)
+        # Retry with increasing delays: the file may not be fully written when
+        # the creation event fires (e.g. slow copy or mobile file transfer).
+        for attempt, delay in enumerate([0.5, 2.0, 5.0]):
+            time.sleep(delay)
             try:
                 self._cb(p)
+                return
             except Exception:
-                log.exception("Error processing %s", p)
+                if attempt < 2:
+                    log.warning("Attempt %d failed for %s, retrying…", attempt + 1, p)
+                else:
+                    log.exception("Error processing %s (all attempts failed)", p)
 
     def on_created(self, event: FileCreatedEvent) -> None:
         if not event.is_directory:

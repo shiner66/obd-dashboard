@@ -1,10 +1,15 @@
 """SQLite persistence — one JSON blob per heavy field to keep schema simple."""
 from __future__ import annotations
 import json
+import logging
 import sqlite3
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 _DB_PATH: Path | None = None
+_ROME = ZoneInfo("Europe/Rome")
+log = logging.getLogger(__name__)
 
 
 def init(db_path: str | Path) -> None:
@@ -13,6 +18,65 @@ def init(db_path: str | Path) -> None:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _conn() as con:
         con.executescript(_SCHEMA)
+        # Idempotent column migrations
+        existing = {row[1] for row in con.execute("PRAGMA table_info(trips)").fetchall()}
+        if "merged_ids" not in existing:
+            con.execute("ALTER TABLE trips ADD COLUMN merged_ids TEXT DEFAULT NULL")
+        if "vin" not in existing:
+            con.execute("ALTER TABLE trips ADD COLUMN vin TEXT DEFAULT NULL")
+    _run_data_migrations()
+
+
+# ── Data migrations (tracked via PRAGMA user_version) ─────────────────────────
+
+def _run_data_migrations() -> None:
+    """Apply pending one-time data migrations in version order."""
+    with _conn() as con:
+        version = con.execute("PRAGMA user_version").fetchone()[0]
+
+    if version < 1:
+        _migrate_v1_fix_myop_dst()
+        with _conn() as con:
+            con.execute("PRAGMA user_version = 1")
+
+
+def _migrate_v1_fix_myop_dst() -> None:
+    """Migration 1: subtract DST offset from myop timestamps stored in CEST.
+
+    Stellantis applies the CEST offset twice in summer, making stored times
+    1 hour ahead of true Italian local time.  Winter trips (DST=0) are
+    unaffected.  Run exactly once at startup after the parser fix is deployed.
+    """
+    trips = get_all_trips()
+    fixed = 0
+    for trip in trips:
+        if "myopel" not in trip.get("sources", []):
+            continue
+        start = trip.get("start")
+        if not start:
+            continue
+        try:
+            dt_s = datetime.fromisoformat(start)
+            dst = dt_s.replace(tzinfo=_ROME).dst()
+            if not dst or dst.total_seconds() == 0:
+                continue
+            new_start = (dt_s - dst).isoformat()
+            end = trip.get("end") or ""
+            new_end = end
+            if end:
+                try:
+                    new_end = (datetime.fromisoformat(end) - dst).isoformat()
+                except ValueError:
+                    pass
+            with _conn() as con:
+                con.execute(
+                    "UPDATE trips SET start_local=?, end_local=? WHERE id=?",
+                    (new_start, new_end, trip["id"]),
+                )
+            fixed += 1
+        except Exception:
+            log.exception("migrate_v1: error on trip %s", trip.get("id"))
+    log.info("migrate_v1_fix_myop_dst: corrected %d myop trips", fixed)
 
 
 def _conn() -> sqlite3.Connection:
@@ -75,6 +139,8 @@ CREATE TABLE IF NOT EXISTS trips (
     pid_series_json      TEXT,        -- JSON {slug: [60 values]}
     pid_catalog_json     TEXT,        -- JSON [{slug,name,unit,kind,group}]
     insights_json        TEXT,        -- JSON [{category,level,title,body}]
+    merged_ids           TEXT DEFAULT NULL,
+    vin                  TEXT DEFAULT NULL,
     created_at           TEXT DEFAULT (datetime('now'))
 );
 """
@@ -84,6 +150,19 @@ def trip_exists(trip_id: str) -> bool:
     with _conn() as con:
         row = con.execute("SELECT 1 FROM trips WHERE id=?", (trip_id,)).fetchone()
         return row is not None
+
+
+def delete_trip(trip_id: str) -> None:
+    with _conn() as con:
+        con.execute("DELETE FROM trips WHERE id=?", (trip_id,))
+
+
+def update_insights(trip_id: str, insights: list) -> None:
+    with _conn() as con:
+        con.execute(
+            "UPDATE trips SET insights_json=? WHERE id=?",
+            (json.dumps(insights), trip_id),
+        )
 
 
 def save_trip(trip: dict) -> None:
@@ -110,7 +189,7 @@ def save_trip(trip: dict) -> None:
                 myop_fuel_consumed_l, myop_price_fuel,
                 myop_days_to_service, myop_km_to_service, myop_maintenance_passed,
                 alerts_json, gps_track_json, pid_values_json,
-                pid_series_json, pid_catalog_json, insights_json
+                pid_series_json, pid_catalog_json, insights_json, vin
             ) VALUES (
                 ?,?,?,?,?,?,
                 ?,?,?,?,
@@ -126,7 +205,7 @@ def save_trip(trip: dict) -> None:
                 ?,?,
                 ?,?,?,
                 ?,?,?,
-                ?,?,?
+                ?,?,?,?
             )
         """, (
             trip.get("id"),
@@ -178,6 +257,7 @@ def save_trip(trip: dict) -> None:
             _j(trip.get("pidSeriesFull")),
             _j(trip.get("pidCatalog", [])),
             _j(trip.get("insights", [])),
+            trip.get("vin"),
         ))
 
 
@@ -208,7 +288,8 @@ def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
                 myop_days_to_service= ?,
                 myop_km_to_service  = ?,
                 myop_maintenance_passed = ?,
-                alerts_json         = json(?)
+                alerts_json         = json(?),
+                vin                 = COALESCE(vin, ?)
             WHERE id = ?
         """, (
             myop_trip.get("myopId"),
@@ -220,8 +301,124 @@ def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
             myop_trip.get("kmToService"),
             1 if myop_trip.get("maintenancePassed") else 0,
             json.dumps(myop_trip.get("alerts", [])),
+            myop_trip.get("vin"),
             obd_trip_id,
         ))
+
+
+def merge_trips(primary_id: str, secondary_ids: list[str]) -> dict:
+    """Merge secondary trips into primary. Returns updated primary trip dict."""
+    import json as _json
+    with _conn() as con:
+        primary = con.execute("SELECT * FROM trips WHERE id=?", (primary_id,)).fetchone()
+        if not primary:
+            raise ValueError(f"Primary trip {primary_id} not found")
+        primary = dict(primary)
+
+        secondaries = []
+        for sid in secondary_ids:
+            row = con.execute("SELECT * FROM trips WHERE id=?", (sid,)).fetchone()
+            if row:
+                secondaries.append(dict(row))
+
+        if not secondaries:
+            return _row_to_trip(primary)
+
+        # Compute merged end time (latest)
+        all_ends = [primary.get("end_local", ""), *[s.get("end_local", "") for s in secondaries]]
+        merged_end = max(e for e in all_ends if e)
+
+        # Sum numeric fields
+        def _sum(*vals):
+            return sum(v for v in vals if v is not None) or None
+
+        # Duration = sum of all durations
+        merged_dur = _sum(primary.get("duration_min"), *[s.get("duration_min") for s in secondaries])
+
+        # Distance = sum
+        merged_dist = _sum(primary.get("distance_km"), *[s.get("distance_km") for s in secondaries])
+
+        # Fuel = sum
+        merged_fuel = _sum(primary.get("fuel_consumed_l"), *[s.get("fuel_consumed_l") for s in secondaries])
+
+        # Recalculate L/100km
+        merged_l100 = (merged_fuel / merged_dist * 100) if (merged_dist and merged_fuel and merged_dist > 0) else primary.get("consumption_l100km")
+
+        # Recalculate avg speed from merged totals; take MAX across all rows for max speed
+        merged_avg_speed = (
+            merged_dist / (merged_dur / 60.0)
+            if (merged_dist and merged_dur and merged_dur > 0)
+            else primary.get("avg_speed_kmh")
+        )
+        max_speeds = [primary.get("max_speed_kmh"), *[s.get("max_speed_kmh") for s in secondaries]]
+        merged_max_speed = max((v for v in max_speeds if v is not None), default=None)
+
+        # Sources: union (stored as source column — keep primary's)
+        # alerts: merge from alerts_json
+        def _alerts(row):
+            try:
+                return _json.loads(row.get("alerts_json") or "[]")
+            except Exception:
+                return []
+        all_alerts = list(set(a for r in [primary, *secondaries] for a in _alerts(r)))
+
+        # Merge myop_trip_id and vin (take first non-null)
+        merged_myop_id = primary.get("myop_trip_id")
+        merged_vin     = primary.get("vin")
+        for s in secondaries:
+            if not merged_myop_id and s.get("myop_trip_id"):
+                merged_myop_id = s.get("myop_trip_id")
+            if not merged_vin and s.get("vin"):
+                merged_vin = s.get("vin")
+
+        # GPS tracks: concatenate in chain order so the merged path is continuous
+        def _track(row):
+            try:
+                return _json.loads(row.get("gps_track_json") or "[]")
+            except Exception:
+                return []
+        merged_track = _track(primary)
+        for s in secondaries:
+            merged_track.extend(_track(s))
+        merged_track_json = _json.dumps(merged_track) if merged_track else None
+
+        con.execute("""
+            UPDATE trips SET
+                end_local           = ?,
+                duration_min        = ?,
+                distance_km         = ?,
+                avg_speed_kmh       = ?,
+                max_speed_kmh       = ?,
+                fuel_consumed_l     = ?,
+                consumption_l100km  = ?,
+                alerts_json         = ?,
+                gps_track_json      = ?,
+                myop_trip_id        = ?,
+                vin                 = ?,
+                merged_ids          = ?
+            WHERE id = ?
+        """, (
+            merged_end,
+            merged_dur,
+            merged_dist,
+            merged_avg_speed,
+            merged_max_speed,
+            merged_fuel,
+            merged_l100,
+            _json.dumps(all_alerts),
+            merged_track_json,
+            merged_myop_id,
+            merged_vin,
+            _json.dumps([primary_id, *secondary_ids]),
+            primary_id,
+        ))
+
+        # Delete secondary trips
+        for sid in secondary_ids:
+            con.execute("DELETE FROM trips WHERE id=?", (sid,))
+
+        row = con.execute("SELECT * FROM trips WHERE id=?", (primary_id,)).fetchone()
+        return _row_to_trip(dict(row))
 
 
 def _row_to_trip(row: dict) -> dict:
@@ -253,12 +450,16 @@ def _row_to_trip(row: dict) -> dict:
         "oilMaxC":               row.get("oil_temp_max_c"),
         "odometerKm":            row.get("odometer_km"),
         "airTempC":              row.get("air_temp_c"),
-        "fuelConsumedL":         row.get("fuel_consumed_l"),
-        "consumptionL100km":     row.get("consumption_l100km"),
+        "fuelConsumedL":         row.get("fuel_consumed_l") or row.get("myop_fuel_consumed_l"),
+        "consumptionL100km":     row.get("consumption_l100km") or (
+            round(row["myop_fuel_consumed_l"] / row["distance_km"] * 100, 2)
+            if row.get("myop_fuel_consumed_l") and row.get("distance_km")
+            else None
+        ),
         "dpfSootPct":            row.get("dpf_soot_pct"),
         "dpfClosedSoot":         row.get("dpf_closed_soot"),
         "dpfRegenActive":        row.get("dpf_regen_active") or 0,
-        "dpfRegenState":         row.get("dpf_regen_state") or "idle",
+        "dpfRegenState":         row.get("dpf_regen_state") or (None if row.get("source") == "myop" else "idle"),
         "dpfRegenCapability":    row.get("dpf_regen_capability"),
         "dpfRegenCapabilityST":  row.get("dpf_regen_capability_st"),
         "dpfSinceRegenKm":       row.get("dpf_since_regen_km"),
@@ -272,6 +473,9 @@ def _row_to_trip(row: dict) -> dict:
         "batteryStartupV":       row.get("battery_startup_v"),
         "oilDilutionPct":        row.get("oil_dilution_pct"),
         "ssState":               row.get("ss_state"),
+        "daysToService":         row.get("myop_days_to_service"),
+        "kmToService":           row.get("myop_km_to_service"),
+        "maintenancePassed":     bool(row.get("myop_maintenance_passed")),
         "fuelLevel":             row.get("myop_fuel_level"),
         "fuelAutonomy":          row.get("myop_fuel_autonomy"),
         "priceFuel":             row.get("myop_price_fuel"),
@@ -284,4 +488,6 @@ def _row_to_trip(row: dict) -> dict:
         "pidSeriesFull":         _j("pid_series_json"),
         "pidCatalog":            _j("pid_catalog_json") or [],
         "insights":              _j("insights_json") or [],
+        "mergedIds":             _j("merged_ids"),
+        "vin":                   row.get("vin"),
     }

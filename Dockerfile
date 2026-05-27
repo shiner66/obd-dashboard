@@ -42,7 +42,10 @@ RUN chmod +x /entrypoint.sh
 
 ENV OBD_FILES_DIR=/data/obd \
     MYOP_FILES_DIR=/data/myop \
-    DB_PATH=/data/db/trips.db
+    DB_PATH=/data/db/trips.db \
+    VEHICLE_NAME="Opel Corsa F Elegance" \
+    VEHICLE_ECU="MD1CS003 — 1.5d BlueHDi" \
+    VEHICLE_ADAPTER="BTLE IOS-Vlink"
 
 EXPOSE 80
 
