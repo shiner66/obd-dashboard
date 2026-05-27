@@ -197,28 +197,6 @@ def auto_correlate_all() -> dict:
               "myop_correlated": 0, "myop_duplicates_removed": 0,
               "myop_recorrelated": 0}
 
-    # ── Step 0: cleanup ───────────────────────────────────────────────────────
-    # Delete standalone myop entries that were already absorbed into an OBD trip
-    # (happens when the .myop file is re-imported after the first correlation).
-    with db._conn() as con:
-        res = con.execute("""
-            DELETE FROM trips
-            WHERE source = 'myop'
-              AND CAST(SUBSTR(id, 6) AS INTEGER) IN (
-                  SELECT myop_trip_id FROM trips
-                  WHERE myop_trip_id IS NOT NULL
-              )
-        """)
-        if res.rowcount:
-            log.info("Removed %d re-imported standalone myop duplicates", res.rowcount)
-            counts["myop_duplicates_removed"] += res.rowcount
-
-    # Refresh after cleanup
-    trips = db.get_all_trips()
-    obd_trips  = [t for t in trips if "obd"    in t.get("sources", [])]
-    myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
-                  and "obd" not in t.get("sources", [])]
-
     # ── Step 0.5: remove overlapping OBD sub-recordings ──────────────────────
     # CarScanner creates a new CSV when the OBD adapter reconnects mid-journey.
     # The new file starts inside an already-running trip (negative gap).
