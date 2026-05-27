@@ -1,33 +1,47 @@
 """
 Autonomous trip correlation & merging.
 
-Handles three reconciliation problems automatically:
+Handles four reconciliation problems automatically:
 
-1. OBD-to-OBD chain merge — CarScanner sometimes splits a single real-world
+1. OBD-to-OBD overlap dedup — CarScanner reconnects mid-journey and creates a
+   new CSV that starts inside an already-running trip.  The shorter sub-recording
+   is discarded; the primary (earliest start) is kept.
+
+2. OBD-to-OBD chain merge — CarScanner sometimes splits a single real-world
    journey into multiple CSV files (adapter dropout, brief engine restart at
    a gas pump). Consecutive OBD trips within MERGE_GAP_S are merged.
 
-2. OBD-to-MyOpel correlation — Stellantis and CarScanner report the same
+3. OBD-to-MyOpel correlation — Stellantis and CarScanner report the same
    trip independently. We match them on a weighted score (start time +
    distance + duration), then enrich the OBD entry with MyOpel fields
    (fuel cost, alerts, service countdown) and drop the standalone MyOpel.
 
-3. MyOpel-to-MyOpel deduplication — Stellantis occasionally re-issues the
+4. MyOpel-to-MyOpel deduplication — Stellantis occasionally re-issues the
    same trip with a new ID after retroactive updates. Same-day myop trips
    with near-identical start time and distance are deduped.
 
 All operations are idempotent — re-running auto_correlate_all() on a clean
 database is a no-op.
+
+Timestamp note — Stellantis raw timestamps:
+  Most trips are stored as Italian local time with a spurious Z suffix (Group A).
+  Occasional trips are 1 h ahead of true local time due to a Stellantis DST
+  double-application bug (Group B).  The parser strips the Z; the scoring
+  function tries both raw and DST-adjusted (raw − 1 h) times and picks the
+  better time_score, so both groups match correctly.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from .. import database as db
 
 log = logging.getLogger(__name__)
+
+_ROME = ZoneInfo("Europe/Rome")
 
 # Tunables — chosen from real-world data, not arbitrary.
 MERGE_GAP_S        = 300       # OBD-OBD chain: 5 min between end of A and start of B
@@ -51,23 +65,47 @@ def _parse_dt(s: str | None) -> datetime | None:
     return None
 
 
+def _dst_offset(dt: datetime) -> timedelta:
+    """DST offset for Europe/Rome at the given naive local datetime."""
+    dst = dt.replace(tzinfo=_ROME).dst()
+    return dst if dst else timedelta(0)
+
+
 # ── Scoring ───────────────────────────────────────────────────────────────────
 
 def _score(a: dict, b: dict) -> float:
     """Weighted similarity score in [0, 1]. Higher = more likely the same trip.
 
-    Hard reject (score 0) if start times differ by more than MATCH_TIME_WINDOW_S
-    or distances disagree by more than MATCH_DISTANCE_TOL.
+    Hard reject (score 0) if distances disagree by more than MATCH_DISTANCE_TOL.
+    For time, we try both the raw MyOpel timestamp and the DST-adjusted version
+    (raw − 1 h) and take the better time_score.  This handles:
+      - Group A trips (majority): raw timestamp is already correct Italian local
+      - Group B trips: Stellantis applied DST twice → raw is 1 h ahead of true local
     """
     t_a = _parse_dt(a.get("start"))
     t_b = _parse_dt(b.get("start"))
     if not t_a or not t_b:
         return 0.0
 
-    dt = abs((t_a - t_b).total_seconds())
-    if dt > MATCH_TIME_WINDOW_S:
-        return 0.0
-    time_score = 1.0 - dt / MATCH_TIME_WINDOW_S
+    def _time_score(t1: datetime, t2: datetime) -> float:
+        dt = abs((t1 - t2).total_seconds())
+        if dt > MATCH_TIME_WINDOW_S:
+            return 0.0
+        return 1.0 - dt / MATCH_TIME_WINDOW_S
+
+    # For Group B Stellantis trips the raw timestamp is 1 h ahead of true local.
+    # DST-adjustment (raw − 1 h) gives a much higher time_score in those cases.
+    # We apply the adjustment only when it improves the score by ≥ 0.30 AND the
+    # raw score is below 0.90 (i.e. raw was not already a strong match).
+    # The time window is a hard constraint: if the chosen score is 0, reject.
+    ts_raw     = _time_score(t_a, t_b)
+    ts_dst_adj = _time_score(t_a, t_b - _dst_offset(t_b))
+    if (ts_dst_adj - ts_raw) >= 0.30 and ts_raw < 0.90:
+        time_score = ts_dst_adj
+    else:
+        time_score = ts_raw
+    if time_score == 0.0:
+        return 0.0  # outside time window — hard reject
 
     d_a = a.get("distanceKm") or 0
     d_b = b.get("distanceKm") or 0
@@ -89,7 +127,7 @@ def _score(a: dict, b: dict) -> float:
 
     # Distance is the primary signal (OBD and MyOpel measure the same km).
     # Time is secondary — OBD starts at engine-on, MyOpel at first movement,
-    # so up to an hour of gap is possible.  Duration is a weak signal
+    # so up to an hour of gap is normal.  Duration is a weak signal
     # (OBD = engine-on time, MyOpel = travel time) so weight it lightly.
     return 0.40 * time_score + 0.50 * dist_score + 0.10 * dur_score
 
@@ -155,7 +193,7 @@ def auto_correlate_all() -> dict:
     myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
                   and "obd" not in t.get("sources", [])]
 
-    counts = {"obd_chains_merged": 0, "obd_trips_absorbed": 0,
+    counts = {"obd_overlaps_removed": 0, "obd_chains_merged": 0, "obd_trips_absorbed": 0,
               "myop_correlated": 0, "myop_duplicates_removed": 0,
               "myop_recorrelated": 0}
 
@@ -181,6 +219,41 @@ def auto_correlate_all() -> dict:
     myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
                   and "obd" not in t.get("sources", [])]
 
+    # ── Step 0.5: remove overlapping OBD sub-recordings ──────────────────────
+    # CarScanner creates a new CSV when the OBD adapter reconnects mid-journey.
+    # The new file starts inside an already-running trip (negative gap).
+    # We keep the primary recording (earliest start, most data) and delete the rest.
+    sorted_obd = sorted(obd_trips, key=lambda t: t.get("start") or "")
+    to_remove_ids: set[str] = set()
+    for i, trip_a in enumerate(sorted_obd):
+        if trip_a["id"] in to_remove_ids:
+            continue
+        end_a = _parse_dt(trip_a.get("end"))
+        if not end_a:
+            continue
+        for trip_b in sorted_obd[i + 1:]:
+            if trip_b["id"] in to_remove_ids:
+                continue
+            start_b = _parse_dt(trip_b.get("start"))
+            if not start_b:
+                continue
+            if start_b >= end_a:
+                break  # sorted by start — no more overlaps possible
+            # trip_b starts before trip_a ends: it's a sub-recording of the same journey
+            to_remove_ids.add(trip_b["id"])
+            log.info("Removing overlapping OBD sub-recording %s (superseded by %s)",
+                     trip_b["id"], trip_a["id"])
+
+    for tid in to_remove_ids:
+        db.delete_trip(tid)
+    counts["obd_overlaps_removed"] += len(to_remove_ids)
+
+    if to_remove_ids:
+        trips = db.get_all_trips()
+        obd_trips  = [t for t in trips if "obd"    in t.get("sources", [])]
+        myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
+                      and "obd" not in t.get("sources", [])]
+
     # 1. OBD-to-OBD chain merge
     chains = _detect_obd_chains(obd_trips)
     for chain in chains:
@@ -199,7 +272,10 @@ def auto_correlate_all() -> dict:
 
     # 2. OBD-to-MyOpel correlation
     # First pass: match standalone MyOpel against uncorrelated OBD trips.
-    unmatched_obd = [t for t in obd_trips if "myopel" not in t.get("sources", [])]
+    # Skip OBD trips with no meaningful distance — they are artefacts.
+    unmatched_obd = [t for t in obd_trips
+                     if "myopel" not in t.get("sources", [])
+                     and (t.get("distanceKm") or 0) >= 1.0]
     matched_myop_ids: set[str] = set()
 
     for myop in myop_trips:
