@@ -352,6 +352,54 @@ def admin_correlate():
     return counts
 
 
+@app.get("/api/v1/admin/uncorrelated")
+def admin_uncorrelated():
+    """Return candidate trip pairs that may be the same journey but are not yet correlated.
+
+    Reports every (OBD, MyOpel) pair whose score exceeds 0.25 (well below the
+    0.50 auto-merge threshold), sorted descending by score.  Pairs at or above
+    0.50 were already correlated automatically; pairs below indicate either
+    genuine separate trips or a data quality issue worth investigating.
+    """
+    trips = db.get_all_trips()
+    obd_trips  = [t for t in trips if "obd"    in t.get("sources", [])
+                  and "myopel" not in t.get("sources", [])]
+    myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
+                  and "obd"    not in t.get("sources", [])]
+
+    candidates = []
+    for myop in myop_trips:
+        for obd in obd_trips:
+            score = corr_svc._score(obd, myop)
+            if score >= 0.25:
+                candidates.append({
+                    "score":          round(score, 3),
+                    "auto_threshold": corr_svc.MIN_MATCH_SCORE,
+                    "would_correlate": score >= corr_svc.MIN_MATCH_SCORE,
+                    "obd": {
+                        "id":    obd["id"],
+                        "start": obd.get("start"),
+                        "end":   obd.get("end"),
+                        "km":    obd.get("distanceKm"),
+                        "min":   obd.get("durationMin"),
+                    },
+                    "myop": {
+                        "id":    myop["id"],
+                        "start": myop.get("start"),
+                        "end":   myop.get("end"),
+                        "km":    myop.get("distanceKm"),
+                        "min":   myop.get("durationMin"),
+                    },
+                })
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "standalone_obd":  len(obd_trips),
+        "standalone_myop": len(myop_trips),
+        "candidates":      candidates,
+    }
+
+
 @app.post("/api/v1/admin/recompute-insights")
 def recompute_insights():
     """Recompute per-trip insights for all OBD trips using current rules.

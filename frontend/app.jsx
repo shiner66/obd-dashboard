@@ -56,6 +56,7 @@ const Sidebar = ({ active, setActive }) => {
     { id: "dpf",       icon: "chart",    label: "DPF / FAP" },
     { id: "myopel",    icon: "fuel",     label: "MyOpel" },
     { id: "trends",    icon: "trend",    label: "Trend & AI" },
+    { id: "admin",     icon: "gauge",    label: "Admin" },
   ];
 
   // Trip counts
@@ -990,6 +991,103 @@ const TrendsView = () => {
   );
 };
 
+/* ============== Admin view ============== */
+const AdminView = () => {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [correlating, setCorrelating] = useState(false);
+
+  const check = async () => {
+    setLoading(true);
+    try {
+      const r = await fetch("/api/v1/admin/uncorrelated");
+      setData(await r.json());
+    } catch(e) {
+      setData({ error: e.message });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const correlate = async () => {
+    setCorrelating(true);
+    try {
+      const r = await fetch("/api/v1/admin/correlate", { method: "POST" });
+      const res = await r.json();
+      await check();
+      alert("Correlazione completata: " + JSON.stringify(res));
+    } catch(e) {
+      alert("Errore: " + e.message);
+    } finally {
+      setCorrelating(false);
+    }
+  };
+
+  const fmt = (s) => s ? s.slice(0,16).replace("T"," ") : "—";
+
+  return (
+    <div className="page-single" style={{ maxWidth: 900 }}>
+      <div className="section-head">
+        <span className="section-title">Diagnostica correlazione</span>
+      </div>
+
+      <div className="card" style={{ marginBottom: 16 }}>
+        <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
+          <button className="icon-btn" onClick={check} disabled={loading}>
+            {loading ? "…" : "Verifica trip non correlati"}
+          </button>
+          <button className="icon-btn" onClick={correlate} disabled={correlating} style={{ background: "var(--warn-soft)", color: "var(--warn)" }}>
+            {correlating ? "…" : "Forza correlazione"}
+          </button>
+          {data && !data.error && (
+            <span className="muted" style={{ fontSize: 12, alignSelf: "center" }}>
+              OBD soli: <b>{data.standalone_obd}</b> · MyOpel soli: <b>{data.standalone_myop}</b> · Candidati: <b>{data.candidates?.length ?? 0}</b>
+            </span>
+          )}
+        </div>
+      </div>
+
+      {data?.error && (
+        <div className="insight-card critical"><b>Errore:</b> {data.error}</div>
+      )}
+
+      {data?.candidates?.length === 0 && (
+        <div className="card" style={{ color: "var(--ok)", padding: 16 }}>
+          Nessun trip sovrapposto non correlato trovato.
+        </div>
+      )}
+
+      {data?.candidates?.map((c, i) => (
+        <div key={i} className="card" style={{ marginBottom: 10, borderLeft: `3px solid ${c.would_correlate ? "var(--ok)" : "var(--warn)"}` }}>
+          <div className="row" style={{ gap: 16, flexWrap: "wrap", alignItems: "flex-start" }}>
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <div className="lbl" style={{ marginBottom: 4 }}>OBD</div>
+              <div className="mono" style={{ fontSize: 12 }}>{c.obd.id}</div>
+              <div style={{ fontSize: 13 }}>{fmt(c.obd.start)} → {fmt(c.obd.end)}</div>
+              <div className="muted" style={{ fontSize: 12 }}>{c.obd.km?.toFixed(1) ?? "—"} km · {c.obd.min?.toFixed(0) ?? "—"} min</div>
+            </div>
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <div className="lbl" style={{ marginBottom: 4 }}>MyOpel</div>
+              <div className="mono" style={{ fontSize: 12 }}>{c.myop.id}</div>
+              <div style={{ fontSize: 13 }}>{fmt(c.myop.start)} → {fmt(c.myop.end)}</div>
+              <div className="muted" style={{ fontSize: 12 }}>{c.myop.km?.toFixed(1) ?? "—"} km · {c.myop.min?.toFixed(0) ?? "—"} min</div>
+            </div>
+            <div style={{ textAlign: "right", minWidth: 100 }}>
+              <div style={{ fontSize: 22, fontWeight: 700, color: c.score >= 0.5 ? "var(--ok)" : c.score >= 0.35 ? "var(--warn)" : "var(--muted)" }}>
+                {(c.score * 100).toFixed(0)}%
+              </div>
+              <div className="muted" style={{ fontSize: 11 }}>punteggio</div>
+              <div style={{ fontSize: 11, marginTop: 4, color: c.would_correlate ? "var(--ok)" : "var(--muted)" }}>
+                {c.would_correlate ? "✓ sopra soglia" : "sotto soglia 50%"}
+              </div>
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 /* ============== Root ============== */
 const App = () => {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
@@ -1017,6 +1115,7 @@ const App = () => {
     dpf: "DPF / FAP",
     myopel: "MyOpel · Stellantis",
     trends: "Trend & AI Insights",
+    admin: "Admin · Diagnostica",
   };
 
   // keyboard nav
@@ -1056,6 +1155,7 @@ const App = () => {
             {view === "dpf"       && <DpfView />}
             {view === "myopel"    && <MyOpelView />}
             {view === "trends"    && <TrendsView />}
+            {view === "admin"     && <AdminView />}
           </div>
         </div>
       </main>
