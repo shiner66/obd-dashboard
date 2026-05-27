@@ -1,10 +1,15 @@
 """SQLite persistence — one JSON blob per heavy field to keep schema simple."""
 from __future__ import annotations
 import json
+import logging
 import sqlite3
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 _DB_PATH: Path | None = None
+_ROME = ZoneInfo("Europe/Rome")
+log = logging.getLogger(__name__)
 
 
 def init(db_path: str | Path) -> None:
@@ -13,12 +18,65 @@ def init(db_path: str | Path) -> None:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _conn() as con:
         con.executescript(_SCHEMA)
-        # Idempotent migrations for columns added after the initial schema.
+        # Idempotent column migrations
         existing = {row[1] for row in con.execute("PRAGMA table_info(trips)").fetchall()}
         if "merged_ids" not in existing:
             con.execute("ALTER TABLE trips ADD COLUMN merged_ids TEXT DEFAULT NULL")
         if "vin" not in existing:
             con.execute("ALTER TABLE trips ADD COLUMN vin TEXT DEFAULT NULL")
+    _run_data_migrations()
+
+
+# ── Data migrations (tracked via PRAGMA user_version) ─────────────────────────
+
+def _run_data_migrations() -> None:
+    """Apply pending one-time data migrations in version order."""
+    with _conn() as con:
+        version = con.execute("PRAGMA user_version").fetchone()[0]
+
+    if version < 1:
+        _migrate_v1_fix_myop_dst()
+        with _conn() as con:
+            con.execute("PRAGMA user_version = 1")
+
+
+def _migrate_v1_fix_myop_dst() -> None:
+    """Migration 1: subtract DST offset from myop timestamps stored in CEST.
+
+    Stellantis applies the CEST offset twice in summer, making stored times
+    1 hour ahead of true Italian local time.  Winter trips (DST=0) are
+    unaffected.  Run exactly once at startup after the parser fix is deployed.
+    """
+    trips = get_all_trips()
+    fixed = 0
+    for trip in trips:
+        if "myopel" not in trip.get("sources", []):
+            continue
+        start = trip.get("start")
+        if not start:
+            continue
+        try:
+            dt_s = datetime.fromisoformat(start)
+            dst = dt_s.replace(tzinfo=_ROME).dst()
+            if not dst or dst.total_seconds() == 0:
+                continue
+            new_start = (dt_s - dst).isoformat()
+            end = trip.get("end") or ""
+            new_end = end
+            if end:
+                try:
+                    new_end = (datetime.fromisoformat(end) - dst).isoformat()
+                except ValueError:
+                    pass
+            with _conn() as con:
+                con.execute(
+                    "UPDATE trips SET start_local=?, end_local=? WHERE id=?",
+                    (new_start, new_end, trip["id"]),
+                )
+            fixed += 1
+        except Exception:
+            log.exception("migrate_v1: error on trip %s", trip.get("id"))
+    log.info("migrate_v1_fix_myop_dst: corrected %d myop trips", fixed)
 
 
 def _conn() -> sqlite3.Connection:
