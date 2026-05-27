@@ -477,7 +477,7 @@ const TripDpf = ({ trip }) => {
 };
 
 const TripPids = ({ trip }) => {
-  return <PidExplorerInner trip={trip} />;
+  return <PidExplorerInner trip={trip} catalog={trip.pidCatalog || []} />;
 };
 
 const TripInsights = ({ trip }) => {
@@ -507,12 +507,12 @@ const PidExplorer = () => {
           {PID_CATALOG.length} PID monitorati · {Object.keys(trip?.pidValues || {}).length} con dati
         </span>
       </div>
-      <PidExplorerInner trip={trip} />
+      <PidExplorerInner trip={trip} catalog={PID_CATALOG} />
     </div>
   );
 };
 
-const PidExplorerInner = ({ trip }) => {
+const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
   const [search, setSearch] = useState("");
   const [group, setGroup] = useState("Tutti");
   const [kind, setKind] = useState("Tutti");
@@ -521,7 +521,7 @@ const PidExplorerInner = ({ trip }) => {
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    let list = PID_CATALOG.filter(p => {
+    let list = catalog.filter(p => {
       if (group !== "Tutti" && p.group !== group) return false;
       if (kind !== "Tutti" && p.kind !== kind) return false;
       if (q && !p.name.toLowerCase().includes(q) && !p.short.toLowerCase().includes(q)
@@ -538,9 +538,9 @@ const PidExplorerInner = ({ trip }) => {
       return 0;
     });
     return list;
-  }, [search, group, kind, sortBy, trip]);
+  }, [search, group, kind, sortBy, trip, catalog]);
 
-  const selPid = PID_CATALOG.find(p => p.slug === selected);
+  const selPid = catalog.find(p => p.slug === selected);
   const selStats = trip?.pidValues?.[selected];
   const selSeries = trip?.pidSeriesFull?.[selected];
 
@@ -550,7 +550,7 @@ const PidExplorerInner = ({ trip }) => {
         <div style={{ padding: 12, borderBottom: "1px solid var(--line-soft)", display: "flex", flexDirection: "column", gap: 10 }}>
           <div className="search" style={{ width: "100%" }}>
             <Icon name="search" size={14} />
-            <input placeholder={`Cerca tra ${PID_CATALOG.length} PID…`} value={search} onChange={e => setSearch(e.target.value)} />
+            <input placeholder={`Cerca tra ${catalog.length} PID…`} value={search} onChange={e => setSearch(e.target.value)} />
           </div>
           <div className="filter-row">
             <button className={`chip ${group === "Tutti" ? "active" : ""}`} onClick={() => setGroup("Tutti")}>Tutti</button>
