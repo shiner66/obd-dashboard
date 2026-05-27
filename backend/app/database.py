@@ -2,8 +2,9 @@
 from __future__ import annotations
 import json
 import logging
+import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -39,17 +40,29 @@ def _run_data_migrations() -> None:
         with _conn() as con:
             con.execute("PRAGMA user_version = 1")
 
+    if version < 2:
+        _migrate_v2_restore_obd_and_reset_correlations()
+        with _conn() as con:
+            con.execute("PRAGMA user_version = 2")
+
+    if version < 3:
+        _migrate_v3_remove_sub1km_obd()
+        with _conn() as con:
+            con.execute("PRAGMA user_version = 3")
+
 
 def _migrate_v1_fix_myop_dst() -> None:
-    """Migration 1: subtract DST offset from myop timestamps stored in CEST.
+    """Migration 1: fix myop timestamps in CEST — standalone myop entries only.
 
-    Stellantis applies the CEST offset twice in summer, making stored times
-    1 hour ahead of true Italian local time.  Winter trips (DST=0) are
-    unaffected.  Run exactly once at startup after the parser fix is deployed.
+    NOTE: v1 was originally buggy and also modified OBD+myop trips (wrong).
+    This corrected version skips OBD trips.  The v2 migration undoes the damage
+    from the original v1 on OBD trips.
     """
     trips = get_all_trips()
     fixed = 0
     for trip in trips:
+        if "obd" in trip.get("sources", []):
+            continue  # OBD timestamps come from CarScanner — already correct
         if "myopel" not in trip.get("sources", []):
             continue
         start = trip.get("start")
@@ -76,7 +89,86 @@ def _migrate_v1_fix_myop_dst() -> None:
             fixed += 1
         except Exception:
             log.exception("migrate_v1: error on trip %s", trip.get("id"))
-    log.info("migrate_v1_fix_myop_dst: corrected %d myop trips", fixed)
+    log.info("migrate_v1_fix_myop_dst: corrected %d standalone myop trips", fixed)
+
+
+_OBD_ID_RE = re.compile(r"^obd-(\d{4}-\d{2}-\d{2})[_ ](\d{2})-(\d{2})-(\d{2})$")
+
+
+def _id_to_start(trip_id: str) -> datetime | None:
+    """Recover the correct start datetime from the OBD trip ID (= CarScanner filename timestamp)."""
+    m = _OBD_ID_RE.match(trip_id)
+    if not m:
+        return None
+    try:
+        return datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}:{m.group(3)}:{m.group(4)}")
+    except ValueError:
+        return None
+
+
+def _migrate_v2_restore_obd_and_reset_correlations() -> None:
+    """Migration 2: restore OBD trip timestamps and reset all myop correlations.
+
+    Migration v1 (buggy version) wrongly subtracted 1 h from OBD trips that
+    had already been correlated with MyOpel data.  The correct OBD start time
+    is always encoded in the trip ID (derived from the CarScanner filename, which
+    uses Italian local time).
+
+    We also clear all myop_trip_id references so that auto_correlate_all() can
+    re-correlate from scratch with the corrected timestamps and the improved
+    scoring function (which handles both raw and DST-adjusted MyOpel times).
+    """
+    with _conn() as con:
+        rows = con.execute("SELECT id, start_local, end_local FROM trips WHERE source='obd_csv'").fetchall()
+
+    restored = 0
+    for row in rows:
+        tid = row["id"]
+        correct_start = _id_to_start(tid)
+        if correct_start is None:
+            continue
+        try:
+            db_start = datetime.fromisoformat(row["start_local"][:19])
+        except (ValueError, TypeError):
+            continue
+
+        delta = correct_start - db_start
+        if abs(delta.total_seconds()) < 60:
+            continue  # already correct
+
+        # Shift end_local by the same delta
+        new_end = row["end_local"]
+        if new_end:
+            try:
+                new_end = (datetime.fromisoformat(new_end[:26]) + delta).isoformat()
+            except (ValueError, TypeError):
+                pass
+
+        with _conn() as con:
+            con.execute(
+                "UPDATE trips SET start_local=?, end_local=? WHERE id=?",
+                (correct_start.isoformat(), new_end, tid),
+            )
+        restored += 1
+
+    # Reset all myop correlations — auto_correlate_all() re-runs from scratch
+    with _conn() as con:
+        con.execute("UPDATE trips SET myop_trip_id=NULL WHERE source='obd_csv'")
+
+    log.info(
+        "migrate_v2: restored timestamps for %d OBD trips; reset all myop correlations",
+        restored,
+    )
+
+
+def _migrate_v3_remove_sub1km_obd() -> None:
+    """Migration 3: delete OBD trips shorter than 1 km that slipped in before the filter."""
+    with _conn() as con:
+        res = con.execute(
+            "DELETE FROM trips WHERE source='obd_csv' AND (distance_km IS NULL OR distance_km < 1.0)"
+        )
+    if res.rowcount:
+        log.info("migrate_v3: deleted %d sub-1km OBD trips", res.rowcount)
 
 
 def _conn() -> sqlite3.Connection:
