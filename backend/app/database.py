@@ -25,6 +25,8 @@ def init(db_path: str | Path) -> None:
             con.execute("ALTER TABLE trips ADD COLUMN merged_ids TEXT DEFAULT NULL")
         if "vin" not in existing:
             con.execute("ALTER TABLE trips ADD COLUMN vin TEXT DEFAULT NULL")
+        if "myop_leg_ids" not in existing:
+            con.execute("ALTER TABLE trips ADD COLUMN myop_leg_ids TEXT DEFAULT NULL")
     _run_data_migrations()
 
 
@@ -49,6 +51,11 @@ def _run_data_migrations() -> None:
         _migrate_v3_remove_sub1km_obd()
         with _conn() as con:
             con.execute("PRAGMA user_version = 3")
+
+    if version < 4:
+        _migrate_v4_fix_distance_and_reset_correlation()
+        with _conn() as con:
+            con.execute("PRAGMA user_version = 4")
 
 
 def _migrate_v1_fix_myop_dst() -> None:
@@ -171,6 +178,34 @@ def _migrate_v3_remove_sub1km_obd() -> None:
         log.info("migrate_v3: deleted %d sub-1km OBD trips", res.rowcount)
 
 
+def _migrate_v4_fix_distance_and_reset_correlation() -> None:
+    """Migration 4: re-ingest OBD trips with corrected distance and reset correlation.
+
+    The previous parser computed OBD trip distance from the noisy GPS-speed
+    integral, which diverged badly from the true distance, broke correlation,
+    and left sub-1 km "phantom" trips (long idle recordings) in the DB that the
+    odometer-based distance now correctly rejects.
+
+    Rather than patch each stored row, we delete all OBD trips so the startup
+    directory scan re-parses them from the source CSV/BRC files (the persistent
+    source of truth in the watched /data/obd folder) with the corrected logic.
+    Standalone MyOpel legs absorbed by earlier correlations are likewise restored
+    when the cumulative .myop file is re-scanned. auto_correlate_all() then
+    regroups everything from scratch with the new session-grouping algorithm.
+
+    If the source files are unavailable the OBD aggregates are rebuilt on the
+    next file drop; MyOpel data is untouched.
+    """
+    with _conn() as con:
+        n_obd = con.execute("SELECT COUNT(*) FROM trips WHERE source='obd_csv'").fetchone()[0]
+        con.execute("DELETE FROM trips WHERE source='obd_csv'")
+        # Drop the standalone-MyOpel rows too: the cumulative .myop file re-adds
+        # every leg on the next scan, so this guarantees a clean, complete regroup
+        # instead of a mix of old correlated state and freshly parsed OBD trips.
+        con.execute("DELETE FROM trips WHERE source='myop'")
+    log.info("migrate_v4: cleared %d OBD trips for re-ingest with corrected distances", n_obd)
+
+
 def _conn() -> sqlite3.Connection:
     if _DB_PATH is None:
         raise RuntimeError("Database not initialised — call init() first")
@@ -225,6 +260,7 @@ CREATE TABLE IF NOT EXISTS trips (
     myop_days_to_service INTEGER,
     myop_km_to_service   INTEGER,
     myop_maintenance_passed INTEGER,
+    myop_leg_ids         TEXT,        -- JSON array of MyOpel leg ids absorbed
     alerts_json          TEXT,        -- JSON array of int
     gps_track_json       TEXT,        -- JSON [[lat,lon],...]
     pid_values_json      TEXT,        -- JSON {slug: stats}
@@ -369,10 +405,12 @@ def get_trip(trip_id: str) -> dict | None:
 
 def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
     """Retroactively add myop fields to an existing OBD trip."""
+    leg_ids = myop_trip.get("myopLegIds")
     with _conn() as con:
         con.execute("""
             UPDATE trips SET
                 myop_trip_id        = ?,
+                myop_leg_ids        = ?,
                 myop_fuel_level     = ?,
                 myop_fuel_autonomy  = ?,
                 myop_fuel_consumed_l= ?,
@@ -385,6 +423,7 @@ def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
             WHERE id = ?
         """, (
             myop_trip.get("myopId"),
+            json.dumps(leg_ids) if leg_ids else None,
             myop_trip.get("fuelLevel"),
             myop_trip.get("fuelAutonomy"),
             myop_trip.get("fuelConsumedL"),
@@ -529,6 +568,7 @@ def _row_to_trip(row: dict) -> dict:
         "sources":               sources,
         "filename":              row.get("filename"),
         "myopId":                row.get("myop_trip_id"),
+        "myopLegIds":            _j("myop_leg_ids"),
         "start":                 row.get("start_local"),
         "start_utc":             row.get("start_utc"),
         "end":                   row.get("end_local"),

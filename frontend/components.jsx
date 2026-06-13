@@ -195,12 +195,19 @@ const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accen
   const dash = circ * pct;
   const finalPct = value / max;
   const color = finalPct >= 0.9 ? "var(--crit)" : finalPct >= 0.7 ? "var(--warn)" : strokeColor;
+  const gid = `gauge-${String(strokeColor).replace(/[^\w]/g, "")}-${Math.round(finalPct * 100)}`;
   return (
     <div className="gauge-radial">
       <svg viewBox="0 0 120 120">
-        <circle cx={c} cy={c} r={r} fill="none" stroke="var(--bg-3)" strokeWidth="10" />
-        <circle cx={c} cy={c} r={r} fill="none" stroke={color}
-                strokeWidth="10" strokeLinecap="round"
+        <defs>
+          <linearGradient id={gid} x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity="0.55" />
+            <stop offset="100%" stopColor={color} />
+          </linearGradient>
+        </defs>
+        <circle cx={c} cy={c} r={r} fill="none" stroke="oklch(0.5 0.02 256 / 0.18)" strokeWidth="9" />
+        <circle cx={c} cy={c} r={r} fill="none" stroke={`url(#${gid})`}
+                strokeWidth="9" strokeLinecap="round"
                 strokeDasharray={`${dash} ${circ - dash}`} />
       </svg>
       <div className="gauge-value">

@@ -32,7 +32,7 @@ const TopBar = ({ view, onSearch, onMenu }) => (
       <Icon name="list" size={18} />
     </button>
     <div>
-      <div className="crumb">OBD Trip Platform · Opel Corsa F · MD1CS003</div>
+      <div className="crumb">{VEHICLE.name} · {VEHICLE.ecu}</div>
       <h1>{view}</h1>
     </div>
     <div className="topbar-spacer" />
@@ -48,11 +48,12 @@ const TopBar = ({ view, onSearch, onMenu }) => (
 
 /* ============== Sidebar ============== */
 const Sidebar = ({ active, setActive }) => {
+  const usefulPids = PID_CATALOG.filter(p => p.useful !== false).length;
   const items = [
     { id: "dashboard", icon: "gauge",    label: "Dashboard" },
     { id: "trips",     icon: "list",     label: "Viaggi",       badge: TRIPS.length },
     { id: "map",       icon: "map",      label: "Mappa" },
-    { id: "pids",      icon: "pid",      label: "PID Explorer", badge: PID_CATALOG.length },
+    { id: "pids",      icon: "pid",      label: "PID Explorer", badge: usefulPids },
     { id: "dpf",       icon: "chart",    label: "DPF / FAP" },
     { id: "myopel",    icon: "fuel",     label: "MyOpel" },
     { id: "trends",    icon: "trend",    label: "Trend & AI" },
@@ -68,8 +69,8 @@ const Sidebar = ({ active, setActive }) => {
       <div className="brand">
         <div className="brand-mark"></div>
         <div>
-          <div className="brand-name">OBD Trip</div>
-          <div className="brand-sub">v0.4.2 · live</div>
+          <div className="brand-name">OBD Cockpit</div>
+          <div className="brand-sub"><span className="live-dot"></span>v0.5 · live</div>
         </div>
       </div>
 
@@ -279,7 +280,11 @@ const TripDetail = ({ trip }) => {
           </h2>
           <div className="detail-sub">
             {trip.filename && <span>📄 {trip.filename}</span>}
-            {trip.myopId && <span>MyOpel #{trip.myopId}</span>}
+            {trip.myopId && (
+              <span>MyOpel #{trip.myopId}
+                {trip.myopLegIds && trip.myopLegIds.length > 1 && ` +${trip.myopLegIds.length - 1} tratte`}
+              </span>
+            )}
             {trip.dpfRegenState && <DpfPill state={trip.dpfRegenState} />}
             {trip.alerts && trip.alerts.map(c => <AlertChip key={c} code={c} />)}
           </div>
@@ -389,7 +394,9 @@ const TripOverview = ({ trip }) => {
             <span className="section-sub">.myop · canale ufficiale TCU</span>
           </div>
           <div className="stat-grid" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
-            <StatCard label="ID Stellantis" value={trip.myopId ?? "—"} />
+            <StatCard label="ID Stellantis" value={trip.myopId ?? "—"}
+                      sub={trip.myopLegIds && trip.myopLegIds.length > 1
+                           ? `${trip.myopLegIds.length} tratte unite` : undefined} />
             <StatCard label="Odometro fine" value={trip.odometerKm?.toLocaleString("it-IT") ?? "—"} unit="km" />
             {trip.fuelLevel && <StatCard label="Tank a fine" value={trip.fuelLevel} unit="%" />}
             {trip.fuelAutonomy && <StatCard label="Autonomia" value={trip.fuelAutonomy} unit="km" />}
@@ -518,10 +525,21 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
   const [kind, setKind] = useState("Tutti");
   const [selected, setSelected] = useState("rpm");
   const [sortBy, setSortBy] = useState("name");
+  const [showAll, setShowAll] = useState(false);
+
+  const usefulCount = useMemo(
+    () => catalog.filter(p => p.useful !== false && trip?.pidValues?.[p.slug]).length,
+    [catalog, trip]
+  );
+  const totalCount = useMemo(
+    () => catalog.filter(p => trip?.pidValues?.[p.slug]).length,
+    [catalog, trip]
+  );
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     let list = catalog.filter(p => {
+      if (!showAll && p.useful === false) return false;
       if (group !== "Tutti" && p.group !== group) return false;
       if (kind !== "Tutti" && p.kind !== kind) return false;
       if (q && !p.name.toLowerCase().includes(q) && !p.short.toLowerCase().includes(q)
@@ -538,7 +556,7 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
       return 0;
     });
     return list;
-  }, [search, group, kind, sortBy, trip, catalog]);
+  }, [search, group, kind, sortBy, trip, catalog, showAll]);
 
   const selPid = catalog.find(p => p.slug === selected);
   const selStats = trip?.pidValues?.[selected];
@@ -548,9 +566,15 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
     <div style={{ display: "grid", gridTemplateColumns: "1fr 420px", gap: 16, alignItems: "flex-start" }} className="pid-explorer-grid">
       <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)", overflow: "hidden" }}>
         <div style={{ padding: 12, borderBottom: "1px solid var(--line-soft)", display: "flex", flexDirection: "column", gap: 10 }}>
-          <div className="search" style={{ width: "100%" }}>
-            <Icon name="search" size={14} />
-            <input placeholder={`Cerca tra ${catalog.length} PID…`} value={search} onChange={e => setSearch(e.target.value)} />
+          <div className="row" style={{ gap: 10 }}>
+            <div className="search" style={{ flex: 1 }}>
+              <Icon name="search" size={14} />
+              <input placeholder="Cerca PID…" value={search} onChange={e => setSearch(e.target.value)} />
+            </div>
+            <div className="seg" title="Mostra solo i PID significativi o tutti quelli registrati">
+              <button className={showAll ? "" : "active"} onClick={() => setShowAll(false)}>Utili {usefulCount}</button>
+              <button className={showAll ? "active" : ""} onClick={() => setShowAll(true)}>Tutti {totalCount}</button>
+            </div>
           </div>
           <div className="filter-row">
             <button className={`chip ${group === "Tutti" ? "active" : ""}`} onClick={() => setGroup("Tutti")}>Tutti</button>
@@ -1088,6 +1112,33 @@ const AdminView = () => {
   );
 };
 
+/* ============== Mobile bottom tab bar ============== */
+const BottomNav = ({ active, setActive, onMenu }) => {
+  const items = [
+    { id: "dashboard", icon: "gauge", label: "Home" },
+    { id: "trips",     icon: "list",  label: "Viaggi" },
+    { id: "map",       icon: "map",   label: "Mappa" },
+    { id: "dpf",       icon: "chart", label: "DPF" },
+  ];
+  const secondary = ["pids", "myopel", "trends", "admin"];
+  return (
+    <nav className="bottom-nav">
+      {items.map(it => (
+        <button key={it.id}
+                className={`bn-item ${active === it.id ? "active" : ""}`}
+                onClick={() => setActive(it.id)}>
+          <span className="bn-ico"><Icon name={it.icon} size={18} /></span>
+          <span>{it.label}</span>
+        </button>
+      ))}
+      <button className={`bn-item ${secondary.includes(active) ? "active" : ""}`} onClick={onMenu}>
+        <span className="bn-ico"><Icon name="list" size={18} /></span>
+        <span>Altro</span>
+      </button>
+    </nav>
+  );
+};
+
 /* ============== Root ============== */
 const App = () => {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
@@ -1144,6 +1195,7 @@ const App = () => {
       }
     }}>
       <Sidebar active={view} setActive={setView} />
+      <BottomNav active={view} setActive={setView} onMenu={() => setDrawerOpen(v => !v)} />
       <main className="main">
         <TopBar view={viewLabels[view]} onMenu={() => setDrawerOpen(v => !v)} />
         <div className="content">

@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import Iterable
 from zoneinfo import ZoneInfo
 
 from .. import database as db
@@ -50,6 +49,57 @@ MATCH_DISTANCE_TOL  = 0.30     # OBD-MyOpel: ±30% distance
 MIN_MATCH_SCORE     = 0.50     # Below this, refuse to correlate
 DEDUPE_TIME_S       = 600      # MyOpel-MyOpel dedupe: ±10 min start
 DEDUPE_DISTANCE_TOL = 0.10     # MyOpel-MyOpel dedupe: ±10% distance
+
+# OBD↔MyOpel session grouping: one OBD engine-on session frequently spans several
+# MyOpel legs (Stellantis splits a drive at short stops). A leg belongs to a
+# session when its start falls inside the OBD window, padded for clock skew and
+# MyOpel's minute-rounding. The OBD recording always starts at engine-on, i.e.
+# slightly *before* the first MyOpel leg's first-movement timestamp.
+SESSION_PRE_S  = 360   # a leg may start up to 6 min before engine-on (rounding/skew)
+SESSION_POST_S = 360   # …and its start must be within 6 min of engine-off
+
+
+def _leg_in_session(leg_start: datetime, obd_start: datetime, obd_end: datetime) -> datetime | None:
+    """Return the effective leg-start time if the leg belongs to this OBD session.
+
+    Tries the raw MyOpel timestamp and the DST-adjusted one (raw − 1 h) to absorb
+    the Stellantis Group-B double-DST trips, exactly like _score() does.
+    """
+    lo = obd_start - timedelta(seconds=SESSION_PRE_S)
+    hi = obd_end + timedelta(seconds=SESSION_POST_S)
+    for cand in (leg_start, leg_start - _dst_offset(leg_start)):
+        if lo <= cand <= hi:
+            return cand
+    return None
+
+
+def _aggregate_myop_legs(legs: list[dict]) -> dict:
+    """Collapse the MyOpel legs of one OBD session into a single enrichment dict.
+
+    Fuel and cost are summed; service countdown, fuel level and autonomy take the
+    last leg (end-of-session state); alerts are unioned.
+    """
+    last = legs[-1]
+    total_fuel = sum(l.get("fuelConsumedL") or 0 for l in legs)
+    total_cost = sum(l.get("costEur") or 0 for l in legs)
+    total_dist = sum(l.get("distanceKm") or 0 for l in legs)
+    eff_price  = (total_cost / total_fuel) if (total_cost and total_fuel) else last.get("priceFuel")
+    leg_ids    = [l.get("myopId") for l in legs if l.get("myopId") is not None]
+    alerts     = sorted({a for l in legs for a in (l.get("alerts") or [])})
+    return {
+        "myopId":            leg_ids[0] if leg_ids else last.get("myopId"),
+        "myopLegIds":        leg_ids,
+        "myopDistanceKm":    round(total_dist, 2) if total_dist else None,
+        "fuelLevel":         last.get("fuelLevel"),
+        "fuelAutonomy":      last.get("fuelAutonomy"),
+        "fuelConsumedL":     round(total_fuel, 3) if total_fuel else None,
+        "priceFuel":         round(eff_price, 3) if eff_price else None,
+        "daysToService":     last.get("daysToService"),
+        "kmToService":       last.get("kmToService"),
+        "maintenancePassed": any(l.get("maintenancePassed") for l in legs),
+        "alerts":            alerts,
+        "vin":               next((l.get("vin") for l in legs if l.get("vin")), None),
+    }
 
 
 # ── Datetime parsing ──────────────────────────────────────────────────────────
@@ -132,18 +182,6 @@ def _score(a: dict, b: dict) -> float:
     return 0.40 * time_score + 0.50 * dist_score + 0.10 * dur_score
 
 
-def _best_match(target: dict, candidates: Iterable[dict]) -> tuple[dict | None, float]:
-    """Return (best_trip, score) or (None, 0) if no candidate clears MIN_MATCH_SCORE."""
-    best, best_score = None, 0.0
-    for c in candidates:
-        s = _score(target, c)
-        if s > best_score:
-            best, best_score = c, s
-    if best_score < MIN_MATCH_SCORE:
-        return None, 0.0
-    return best, best_score
-
-
 # ── OBD-to-OBD chain detection ────────────────────────────────────────────────
 
 def _detect_obd_chains(obd_trips: list[dict]) -> list[list[str]]:
@@ -194,8 +232,8 @@ def auto_correlate_all() -> dict:
                   and "obd" not in t.get("sources", [])]
 
     counts = {"obd_overlaps_removed": 0, "obd_chains_merged": 0, "obd_trips_absorbed": 0,
-              "myop_correlated": 0, "myop_duplicates_removed": 0,
-              "myop_recorrelated": 0}
+              "myop_correlated": 0, "myop_legs_absorbed": 0,
+              "myop_duplicates_removed": 0}
 
     # ── Step 0.5: remove overlapping OBD sub-recordings ──────────────────────
     # CarScanner creates a new CSV when the OBD adapter reconnects mid-journey.
@@ -259,42 +297,47 @@ def auto_correlate_all() -> dict:
         myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
                       and "obd" not in t.get("sources", [])]
 
-    # 2. OBD-to-MyOpel correlation
-    # First pass: match standalone MyOpel against uncorrelated OBD trips.
-    # Skip OBD trips with no meaningful distance — they are artefacts.
-    unmatched_obd = [t for t in obd_trips
-                     if "myopel" not in t.get("sources", [])
-                     and (t.get("distanceKm") or 0) >= 1.0]
-    matched_myop_ids: set[str] = set()
+    # 2. OBD↔MyOpel session grouping
+    # Assign every standalone MyOpel leg to the OBD session whose engine-on
+    # window contains it. One OBD session can absorb several legs; legs that
+    # match no session stay standalone (drives recorded only by Stellantis).
+    obd_sessions = sorted(
+        [t for t in obd_trips if (t.get("distanceKm") or 0) >= 0.5],
+        key=lambda t: t.get("start") or "",
+    )
+    parsed_sessions = [
+        (t, _parse_dt(t.get("start")), _parse_dt(t.get("end")))
+        for t in obd_sessions
+    ]
 
-    for myop in myop_trips:
-        match, score = _best_match(myop, unmatched_obd)
-        if match:
-            log.info("Correlating myop %s → OBD %s (score=%.2f)", myop["id"], match["id"], score)
-            db.enrich_with_myop(match["id"], myop)
-            db.delete_trip(myop["id"])
-            unmatched_obd = [t for t in unmatched_obd if t["id"] != match["id"]]
-            matched_myop_ids.add(myop["id"])
-            counts["myop_correlated"] += 1
+    assignments: dict[str, list[dict]] = {}
+    for leg in myop_trips:
+        ls = _parse_dt(leg.get("start"))
+        if not ls:
+            continue
+        best_obd: dict | None = None
+        best_start: datetime | None = None
+        for obd, os_, oe in parsed_sessions:
+            if not os_ or not oe:
+                continue
+            if _leg_in_session(ls, os_, oe) is not None:
+                # Pick the session that began most recently before the leg —
+                # this disambiguates back-to-back sessions cleanly.
+                if best_start is None or os_ > best_start:
+                    best_obd, best_start = obd, os_
+        if best_obd is not None:
+            assignments.setdefault(best_obd["id"], []).append(leg)
 
-    # Second pass: standalone MyOpel trips still unmatched may have a better
-    # match with an already-correlated OBD trip (wrong previous correlation,
-    # e.g. established before a DST fix).  Use a higher score threshold (0.75)
-    # to avoid breaking good existing correlations.
-    remaining_myop = [m for m in myop_trips if m["id"] not in matched_myop_ids]
-    already_correlated_obd = [t for t in obd_trips if "myopel" in t.get("sources", [])]
-
-    for myop in remaining_myop:
-        match, score = _best_match(myop, already_correlated_obd)
-        if match and score >= 0.75:
-            log.info(
-                "Re-correlating: myop %s → OBD %s (score=%.2f, replacing existing myop)",
-                myop["id"], match["id"], score,
-            )
-            db.enrich_with_myop(match["id"], myop)
-            db.delete_trip(myop["id"])
-            already_correlated_obd = [t for t in already_correlated_obd if t["id"] != match["id"]]
-            counts["myop_recorrelated"] += 1
+    for obd_id, legs in assignments.items():
+        legs.sort(key=lambda l: l.get("start") or "")
+        agg = _aggregate_myop_legs(legs)
+        log.info("Correlating OBD %s ← %d MyOpel leg(s): %s",
+                 obd_id, len(legs), [l["id"] for l in legs])
+        db.enrich_with_myop(obd_id, agg)
+        for leg in legs:
+            db.delete_trip(leg["id"])
+        counts["myop_correlated"] += 1
+        counts["myop_legs_absorbed"] += len(legs)
 
     # 3. MyOpel-to-MyOpel dedupe (same trip resent with new ID)
     trips = db.get_all_trips()

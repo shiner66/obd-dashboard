@@ -32,6 +32,40 @@ def _slugify(name: str) -> str:
     return s or "pid"
 
 
+# ── PID usefulness classification ─────────────────────────────────────────────
+# CarScanner's MD1CS003 profile dumps ~180 PIDs, but ~120 are noise: internal
+# ECU bookkeeping flags, raw French-named signals (MP_*), and values that never
+# change. We tag each catalog entry `useful` so the UI can default to the ~60
+# meaningful PIDs while still allowing a "show all" toggle.
+#
+# A PID is useful when EITHER it has a curated short slug (hand-picked signals,
+# see CURATED_SLUG below) OR — dynamically — it carries a real engineering unit
+# and actually varies during the trip. The noise patterns force-exclude the
+# obvious internal/raw signals even when they happen to carry a unit.
+_PID_NOISE_RE = re.compile(
+    r"(?:^|\b)mp_[a-z]|"
+    r"first electronic|interface unit operating|in the process of adjust|"
+    r"wear condition|controlled air supply module|auxiliary heater|"
+    r"additional heater|abs/eks|restart request|restart control|"
+    r"inhibition transmitted|inhibit control|allowed stop|allowed by|"
+    r"permission from|permission based|return to (?:engine|starter)|"
+    r"network related engine restart",
+    re.I,
+)
+
+
+def _pid_useful(name: str, unit: str, vals: list[float]) -> bool:
+    """Decide whether a PID is worth surfacing by default in the UI."""
+    if _PID_NOISE_RE.search(name):
+        return False
+    if name in CURATED_SLUG:          # hand-curated signal → always useful
+        return True
+    if not unit:                       # raw flags without a physical unit → noise
+        return False
+    constant = (max(vals) == min(vals)) if vals else True
+    return not constant                # real measurement that actually moves
+
+
 # ── Short curated slugs matching the frontend PID_CATALOG ────────────────────
 CURATED_SLUG: dict[str, str] = {
     "Giri motore":                                                         "rpm",
@@ -385,17 +419,37 @@ def parse_file(path: str | Path) -> list[dict]:
             )
             fuel_consumed_l = round(max(0, fuel_consumed_l), 3)
 
-    # ── Distance (odometer delta or GPS speed integral) ────────────────────
-    distance_km = fields.get("distance_km_raw")
-    if distance_km is None and "Velocità (GPS)" in pid_window:
+    # ── Distance ──────────────────────────────────────────────────────────
+    # Reliability order (verified against MyOpel ground truth on the real corpus):
+    #   1. "Distanza percorsa:" trip counter  — direct, resets each trip
+    #   2. [ECM] Total mileage delta           — odometer, accurate when ≥ 2 km
+    #   3. GPS speed integral                  — noisy (over/under-counts), last resort
+    # The GPS integral was the previous default and is the root cause of the
+    # OBD↔MyOpel distance mismatches that broke correlation.
+    gps_dist: float | None = None
+    if "Velocità (GPS)" in pid_window:
         spd = pid_window["Velocità (GPS)"]
         if len(spd) >= 2:
-            distance_km = sum(
+            gps_dist = round(max(0, sum(
                 (spd[i][0] - spd[i-1][0]) / 3600
                 * (spd[i][1] + spd[i-1][1]) / 2
                 for i in range(1, len(spd))
-            )
-            distance_km = round(max(0, distance_km), 2)
+            )), 2)
+
+    odo_delta: float | None = None
+    odo_series = pid_window.get("[ECM] Total mileage")
+    if odo_series and len(odo_series) >= 2:
+        d = odo_series[-1][1] - odo_series[0][1]
+        if 0 < d < 2000:          # guard against odometer rollover / glitches
+            odo_delta = round(d, 2)
+
+    trip_counter = fields.get("distance_km_raw")
+    if trip_counter is not None and trip_counter > 0:
+        distance_km, distance_source = trip_counter, "trip_counter"
+    elif odo_delta is not None and odo_delta >= 2.0:
+        distance_km, distance_source = odo_delta, "odometer"
+    else:
+        distance_km, distance_source = gps_dist, "gps"
 
     consumption_l100km: float | None = None
     if fuel_consumed_l and distance_km:
@@ -453,12 +507,13 @@ def parse_file(path: str | Path) -> list[dict]:
         for _pfx in ("[ECM] ", "[TCU] ", "[ECM]", "[TCU]"):
             _name_clean = _name_clean.replace(_pfx, "")
         pid_catalog.append({
-            "slug":  slug,
-            "name":  pid_name,
-            "short": _name_clean.strip()[:32],
-            "unit":  unit,
-            "kind":  kind,
-            "group": _pid_group(pid_name),
+            "slug":   slug,
+            "name":   pid_name,
+            "short":  _name_clean.strip()[:32],
+            "unit":   unit,
+            "kind":   kind,
+            "group":  _pid_group(pid_name),
+            "useful": _pid_useful(pid_name, unit, vals),
         })
 
     return [{
@@ -470,6 +525,7 @@ def parse_file(path: str | Path) -> list[dict]:
         "end":                   _end_time(start_local, duration_min),
         "durationMin":           _r(duration_min, 1),
         "distanceKm":            _r(distance_km, 2),
+        "distanceSource":        distance_source,
         "avgSpeedKmh":           _r(fields.get("avg_speed_kmh"), 1),
         "maxSpeedKmh":           _r(fields.get("max_speed_kmh"), 1),
         "avgRpm":                int(fields["avg_rpm"]) if fields.get("avg_rpm") else None,

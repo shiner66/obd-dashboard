@@ -38,7 +38,7 @@ Il backend:
 - applica correzione **RBS byte-swap** per i PID errati del profilo MD1CS003 (briefing §7)
 - esegue la **DPF state machine** a 5 stati (`idle / requested / active / completed / post_regen`)
 - genera **AI Insights** in italiano (per-viaggio e cross-trip)
-- correla i viaggi OBD con quelli MyOpel (±10 min di partenza, ±25% di distanza)
+- correla i viaggi OBD con quelli MyOpel raggruppando per sessione motore-acceso (una registrazione OBD può contenere più tratte MyOpel)
 - serve `/api/v1/data.js` con i globali JS che il frontend si aspetta — zero modifiche ai componenti React
 
 ---
@@ -195,7 +195,9 @@ EOF
 - **Timezone bug Stellantis**: i timestamp `.myop` hanno suffisso `Z` ma sono in realtà locali (CET/CEST). Risolto in `myop_parser.py` con offset configurabile (`_TZ_OFFSET_H = 2` per CEST estivo).
 - **fuelConsumption MyOpel**: valore grezzo `/1_000_000` per ottenere i litri.
 - **Slug PID**: il backend mappa i nomi lunghi dei PID (es. `[ECM] Crankshaft speed`) a slug brevi (`rpm`, `egt_a`, `soot`, ecc.) tramite `CURATED_SLUG` in `csv_parser.py`, in modo che combaciaino con quelli hardcoded nel frontend.
-- **Correlazione OBD↔MyOpel**: due viaggi vengono fusi se partono entro ±10 min e la differenza di distanza è <25%. Mantengono lo stesso `id` OBD; i campi MyOpel (alerts, fuelLevel, costEur, manutenzione) vengono aggiunti retroattivamente.
+- **Curatela PID**: dei ~180 PID registrati dal profilo MD1CS003, ognuno è marcato `useful` se ha uno slug curato **oppure** se porta un'unità fisica reale e varia nel viaggio. I ~110 PID-rumore (flag interni ECU, segnali grezzi `MP_*`, contatori, valori costanti) restano accessibili tramite il toggle "Tutti" nel PID Explorer ma sono nascosti di default.
+- **Distanza OBD**: calcolata dal contatore di tratta `Distanza percorsa:` se presente, altrimenti dal delta dell'odometro `[ECM] Total mileage` (affidabile ≥2 km), e solo come ultima risorsa dall'integrale della velocità GPS (rumoroso). Questo era la causa principale delle correlazioni mancate.
+- **Correlazione OBD↔MyOpel**: ogni tratta MyOpel viene assegnata alla sessione OBD (motore acceso) la cui finestra temporale la contiene. Una singola sessione OBD può assorbire più tratte MyOpel (Stellantis spezza un viaggio alle soste brevi): distanza/carburante/costo vengono sommati, gli alert uniti, il countdown tagliando preso dall'ultima tratta. Mantengono lo stesso `id` OBD.
 
 ---
 

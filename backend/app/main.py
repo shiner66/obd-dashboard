@@ -211,13 +211,22 @@ def _build_vehicle(trips: list[dict]) -> dict:
 
 
 def _build_pid_catalog(trips: list[dict]) -> list[dict]:
-    """Merge PID catalogs from all trips; deduplicate by slug."""
+    """Merge PID catalogs from all trips; deduplicate by slug.
+
+    A PID is marked `useful` if it is useful in *any* trip — a signal that sits
+    constant in most sessions but actually moves in a few (e.g. EGT, regen flags)
+    is surfaced rather than hidden. This is the dynamic half of PID curation.
+    """
     seen: dict[str, dict] = {}
     for trip in trips:
         for entry in (trip.get("pidCatalog") or []):
             slug = entry.get("slug")
-            if slug and slug not in seen:
-                seen[slug] = entry
+            if not slug:
+                continue
+            if slug not in seen:
+                seen[slug] = dict(entry)
+            elif entry.get("useful") and not seen[slug].get("useful"):
+                seen[slug] = dict(entry)        # prefer the entry that flags it useful
     return list(seen.values())
 
 
