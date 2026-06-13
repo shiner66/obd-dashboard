@@ -563,6 +563,12 @@ def _row_to_trip(row: dict) -> dict:
     if not sources:
         sources = ["myopel" if row.get("source") == "myop" else "obd"]
 
+    _l100 = row.get("consumption_l100km") or (
+        row["myop_fuel_consumed_l"] / row["distance_km"] * 100
+        if row.get("myop_fuel_consumed_l") and row.get("distance_km") else None
+    )
+    _kml = round(100.0 / _l100, 2) if _l100 and _l100 > 0 else None
+
     return {
         "id":                    row["id"],
         "sources":               sources,
@@ -583,11 +589,8 @@ def _row_to_trip(row: dict) -> dict:
         "odometerKm":            row.get("odometer_km"),
         "airTempC":              row.get("air_temp_c"),
         "fuelConsumedL":         row.get("fuel_consumed_l") or row.get("myop_fuel_consumed_l"),
-        "consumptionL100km":     row.get("consumption_l100km") or (
-            round(row["myop_fuel_consumed_l"] / row["distance_km"] * 100, 2)
-            if row.get("myop_fuel_consumed_l") and row.get("distance_km")
-            else None
-        ),
+        "consumptionL100km":     round(_l100, 2) if _l100 else None,
+        "consumptionKmL":        _kml,
         "dpfSootPct":            row.get("dpf_soot_pct"),
         "dpfClosedSoot":         row.get("dpf_closed_soot"),
         "dpfRegenActive":        row.get("dpf_regen_active") or 0,

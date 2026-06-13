@@ -412,7 +412,7 @@ const TripCard = ({ trip, active, onClick }) => {
         </div>
         <div className="trip-stat">
           <span className="lbl">Consumo</span>
-          <span className="val">{trip.consumptionL100km?.toFixed(1) ?? "—"}<span className="unit"> L/100</span></span>
+          <span className="val">{trip.consumptionKmL?.toFixed(1) ?? "—"}<span className="unit"> km/L</span></span>
         </div>
       </div>
       <div className="trip-card-foot">

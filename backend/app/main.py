@@ -30,6 +30,11 @@ VEHICLE_ADAPTER = os.getenv("VEHICLE_ADAPTER", "BTLE IOS-Vlink")
 
 _watcher = Watcher()
 
+# During the initial directory scan we save every file first and reconcile once
+# at the end. Without this, each of ~100+ files would trigger a full O(n)
+# correlation + insight recompute, making a cold re-ingest O(n²) and slow.
+_bulk_loading = False
+
 
 # ── File processing ───────────────────────────────────────────────────────────
 # Files are persisted as-is. Cross-trip reconciliation (OBD chain merge,
@@ -39,16 +44,17 @@ _watcher = Watcher()
 def _process_obd_file(path: Path) -> list[str]:
     """Parse an OBD CSV/BRC file, save new trips, run per-trip insights. Returns new trip IDs."""
     trips = csv_parser.parse_file(path)
+    ctx = insight_svc.build_context(db.get_all_trips())
     new_ids: list[str] = []
     for trip in trips:
         if db.trip_exists(trip["id"]):
             log.info("Trip %s already in DB, skipping", trip["id"])
             continue
-        trip["insights"] = insight_svc.per_trip(trip)
+        trip["insights"] = insight_svc.per_trip(trip, ctx)
         db.save_trip(trip)
         new_ids.append(trip["id"])
         log.info("Saved OBD trip %s (%.1f km)", trip["id"], trip.get("distanceKm") or 0)
-    if new_ids:
+    if new_ids and not _bulk_loading:
         _post_process()
     return new_ids
 
@@ -63,7 +69,7 @@ def _process_myop_file(path: Path) -> list[str]:
         db.save_trip(trip)
         new_ids.append(trip["id"])
         log.info("Saved myop trip %s", trip["id"])
-    if new_ids:
+    if new_ids and not _bulk_loading:
         _post_process()
     return new_ids
 
@@ -98,14 +104,18 @@ def _scan_directory(directory: Path, process_fn, extensions: tuple[str, ...]) ->
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _bulk_loading
     db.init(DB_PATH)
     log.info("Database initialised at %s", DB_PATH)
 
+    # Bulk mode: save all files first, reconcile once at the end (avoids O(n²)).
+    _bulk_loading = True
     _scan_directory(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
     _scan_directory(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
+    _bulk_loading = False
 
-    # Final reconciliation pass after the initial scan — handles any leftover
-    # duplicates or chains from previous runs.
+    # Single reconciliation pass after the initial scan — chains, overlaps,
+    # OBD↔MyOpel grouping and dedupe, all at once.
     try:
         corr_svc.auto_correlate_all()
     except Exception:
@@ -126,11 +136,12 @@ async def lifespan(app: FastAPI):
 def _recompute_all_insights() -> None:
     try:
         trips = db.get_all_trips()
+        ctx = insight_svc.build_context(trips)
         updated = 0
         for trip in trips:
             if "obd" not in trip.get("sources", []):
                 continue
-            db.update_insights(trip["id"], insight_svc.per_trip(trip))
+            db.update_insights(trip["id"], insight_svc.per_trip(trip, ctx))
             updated += 1
         log.info("Recomputed per-trip insights for %d OBD trips", updated)
     except Exception:
@@ -417,11 +428,12 @@ def recompute_insights():
     refresh the stored insights without re-uploading CSV files.
     """
     trips = db.get_all_trips()
+    ctx = insight_svc.build_context(trips)
     updated = 0
     for trip in trips:
         if "obd" not in trip.get("sources", []):
             continue
-        new_insights = insight_svc.per_trip(trip)
+        new_insights = insight_svc.per_trip(trip, ctx)
         db.update_insights(trip["id"], new_insights)
         updated += 1
     log.info("recompute-insights: updated %d OBD trips", updated)

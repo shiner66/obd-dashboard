@@ -129,7 +129,7 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
   const totalKm = TRIPS.reduce((a, t) => a + (t.distanceKm || 0), 0);
   const totalMin = TRIPS.reduce((a, t) => a + (t.durationMin || 0), 0);
   const totalFuel = TRIPS.reduce((a, t) => a + (t.fuelConsumedL || 0), 0);
-  const avgCons = totalFuel > 0 ? (totalFuel / totalKm * 100) : 0;
+  const avgCons = totalFuel > 0 ? (totalKm / totalFuel) : 0;
   const cost = TRIPS.reduce((a, t) => a + (t.costEur || 0), 0);
   const fuelPriced = myop.filter(t => t.priceFuel);
   const avgFuelPrice = fuelPriced.length > 0
@@ -142,7 +142,7 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
         <StatCard label="Viaggi totali" value={TRIPS.length} sub={`${obd.length} OBD · ${myop.length} MyOpel`} />
         <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" sub="tutti i viaggi" />
         <StatCard label="Tempo guida" value={(totalMin / 60).toFixed(1)} unit="h" sub={`${Math.round(totalMin)} minuti`} />
-        <StatCard label="Consumo medio" value={avgCons.toFixed(2)} unit="L/100km" sub="da PID L/h integrato" />
+        <StatCard label="Consumo medio" value={avgCons.toFixed(1)} unit="km/L" sub={`≈ ${avgCons > 0 ? (100 / avgCons).toFixed(1) : "—"} L/100km`} />
         <StatCard label="Spesa MyOpel" value={`€${cost.toFixed(2)}`} sub={`${myop.length} viaggi · €${avgFuelPrice?.toFixed(3) ?? "—"}/L`} />
       </div>
 
@@ -346,7 +346,8 @@ const TripOverview = ({ trip }) => {
           <StatCard label="Durata"     value={trip.durationMin?.toFixed(1) ?? "—"} unit="min" />
           <StatCard label="Vel. media" value={trip.avgSpeedKmh?.toFixed(0) ?? "—"} unit="km/h" />
           <StatCard label="Vel. max"   value={trip.maxSpeedKmh?.toFixed(0) ?? "—"} unit="km/h" />
-          <StatCard label="Consumo"    value={trip.consumptionL100km?.toFixed(2) ?? "—"} unit="L/100km" />
+          <StatCard label="Consumo"    value={trip.consumptionKmL?.toFixed(1) ?? "—"} unit="km/L"
+                    sub={trip.consumptionL100km ? `${trip.consumptionL100km.toFixed(1)} L/100km` : undefined} />
           <StatCard label="Carburante" value={trip.fuelConsumedL?.toFixed(2) ?? "—"} unit="L" />
         </div>
       </div>
@@ -867,7 +868,7 @@ const MyOpelView = () => {
                     </td>
                     <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.distanceKm?.toFixed(1) ?? "—"} <span className="muted">km</span></td>
                     <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.durationMin?.toFixed(0) ?? "—"} <span className="muted">min</span></td>
-                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.consumptionL100km?.toFixed(2)} <span className="muted">L/100</span></td>
+                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.consumptionKmL?.toFixed(1) ?? "—"} <span className="muted">km/L</span></td>
                     <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.costEur ? `€${t.costEur.toFixed(2)}` : "—"}</td>
                     <td style={{ padding: "10px 12px" }}>
                       {t.alerts?.length > 0 ? (
@@ -937,7 +938,7 @@ const MyOpelView = () => {
 const TrendsView = () => {
   const obd = TRIPS.filter(t => t.sources.includes("obd")).sort((a, b) => a.start.localeCompare(b.start));
   const batteryTrend = obd.map(t => t.batteryStartupV);
-  const consTrend = TRIPS.filter(t => t.consumptionL100km).map(t => t.consumptionL100km);
+  const consTrend = TRIPS.filter(t => t.consumptionKmL).map(t => t.consumptionKmL);
   const distTrend = TRIPS.map(t => t.distanceKm);
   const adblueTrend = obd.map(t => t.adblueRangeKm);
   const sootTrend = obd.map(t => t.dpfClosedSoot);
@@ -952,9 +953,9 @@ const TrendsView = () => {
           <LineChart data={batteryTrend} color="var(--accent)" height={90} yLabel="V" />
         </div>
         <div className="trend-card">
-          <div className="section-head"><span className="section-title">Consumo</span><span className="section-sub">L/100km · tutti i viaggi</span></div>
-          <div className="big-num">{consTrend[consTrend.length - 1]?.toFixed(2)}<span className="unit">L/100km</span></div>
-          <LineChart data={consTrend} color="var(--ok)" height={90} yLabel="L/100" />
+          <div className="section-head"><span className="section-title">Consumo</span><span className="section-sub">km/L · tutti i viaggi</span></div>
+          <div className="big-num">{consTrend[consTrend.length - 1]?.toFixed(1)}<span className="unit">km/L</span></div>
+          <LineChart data={consTrend} color="var(--ok)" height={90} yLabel="km/L" />
         </div>
         <div className="trend-card">
           <div className="section-head"><span className="section-title">Distanza per viaggio</span><span className="section-sub">km</span></div>
