@@ -25,6 +25,34 @@ const ACCENT_COLORS = {
   sky:     "oklch(0.78 0.14 240)",
 };
 
+/* ============== Lazy per-trip hydration ==============
+   data.js carries only trip summaries; the heavy fields (track, pidValues,
+   pidSeriesFull) load on demand from /api/v1/trips/{id} and are cached. */
+const _tripCache = {};
+function useHydratedTrip(tripId) {
+  const summary = TRIPS.find(t => t.id === tripId);
+  const [full, setFull] = useState(_tripCache[tripId] || null);
+  useEffect(() => {
+    if (!tripId) return;
+    if (_tripCache[tripId]) { setFull(_tripCache[tripId]); return; }
+    let cancelled = false;
+    fetch(`/api/v1/trips/${encodeURIComponent(tripId)}`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (d && !cancelled) { _tripCache[tripId] = d; setFull(d); } })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [tripId]);
+  // While loading, return the summary so scalar stats render instantly;
+  // charts/PID tables/map fill in once the full trip arrives.
+  return (full && full.id === tripId) ? full : summary;
+}
+
+/* Sparkline for a single PID series of a not-yet-hydrated trip (DPF view). */
+const LazySeries = ({ tripId, slug, ...props }) => {
+  const trip = useHydratedTrip(tripId);
+  return <Sparkline data={trip?.pidSeriesFull?.[slug] || []} {...props} />;
+};
+
 /* ============== Top bar ============== */
 const TopBar = ({ view, onSearch, onMenu }) => (
   <div className="topbar">
@@ -261,8 +289,9 @@ const TripsView = ({ selectedId, setSelectedId }) => {
 };
 
 /* ============== Trip detail panel ============== */
-const TripDetail = ({ trip }) => {
+const TripDetail = ({ trip: summaryTrip }) => {
   const [tab, setTab] = useState("overview");
+  const trip = useHydratedTrip(summaryTrip.id);
   const isObd = trip.sources.includes("obd");
   const startDate = new Date(trip.start);
 
@@ -332,6 +361,11 @@ const TripOverview = ({ trip }) => {
                 <div className="row"><span className="sw" style={{background:"oklch(0.68 0.20 22)"}}></span>arrivo</div>
               </div>
             </>
+          ) : trip.hasTrack ? (
+            <div className="empty-state" style={{height: 340}}>
+              <Icon name="map" size={36} className="icon" />
+              <div>Carico tracciato GPS…</div>
+            </div>
           ) : (
             <div className="empty-state" style={{height: 340}}>
               <Icon name="map" size={36} className="icon" />
@@ -503,7 +537,9 @@ const TripInsights = ({ trip }) => {
 const PidExplorer = () => {
   const obdTrips = TRIPS.filter(t => t.sources.includes("obd"));
   const [tripId, setTripId] = useState(obdTrips[0]?.id);
-  const trip = obdTrips.find(t => t.id === tripId) || obdTrips[0];
+  const summary = obdTrips.find(t => t.id === tripId) || obdTrips[0];
+  const trip = useHydratedTrip(tripId || obdTrips[0]?.id);
+  const withData = trip?.pidValues ? Object.keys(trip.pidValues).length : (summary?.pidCount ?? 0);
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <div className="row" style={{ gap: 8 }}>
@@ -513,7 +549,7 @@ const PidExplorer = () => {
           {obdTrips.map(t => <option key={t.id} value={t.id}>{t.start.replace("T", " ")} · {t.durationMin}m · {t.distanceKm}km</option>)}
         </select>
         <span className="muted" style={{ marginLeft: "auto" }}>
-          {PID_CATALOG.length} PID monitorati · {Object.keys(trip?.pidValues || {}).length} con dati
+          {PID_CATALOG.length} PID monitorati · {withData} con dati
         </span>
       </div>
       <PidExplorerInner trip={trip} catalog={PID_CATALOG} />
@@ -708,23 +744,34 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
 
 /* ============== Map view (all trips) ============== */
 const MapView = () => {
-  const [selected, setSelected] = useState(TRIPS.find(t => t.track)?.id);
-  const obdTrips = TRIPS.filter(t => t.track);
+  const trackTrips = useMemo(() => TRIPS.filter(t => t.hasTrack), []);
+  const [selected, setSelected] = useState(trackTrips[0]?.id);
+  const [tracks, setTracks] = useState(null);   // {tripId: [[lat,lon],...]}
+  useEffect(() => {
+    fetch("/api/v1/tracks").then(r => (r.ok ? r.json() : {})).then(setTracks).catch(() => setTracks({}));
+  }, []);
+  // Merge fetched tracks into trip summaries
+  const obdTrips = useMemo(
+    () => trackTrips.map(t => ({ ...t, track: tracks?.[t.id] })).filter(t => t.track),
+    [trackTrips, tracks]
+  );
   const trip = obdTrips.find(t => t.id === selected);
   return (
     <div className="page-grid">
       <div className="trip-list">
         <div className="section-head" style={{ padding: "8px 4px" }}>
           <span className="section-title">Tracciati GPS</span>
-          <span className="section-sub">{obdTrips.length} con GPS</span>
+          <span className="section-sub">{trackTrips.length} con GPS{tracks === null ? " · carico…" : ""}</span>
         </div>
-        {obdTrips.map(t => (
+        {(obdTrips.length ? obdTrips : trackTrips).map(t => (
           <TripCard key={t.id} trip={t} active={t.id === selected} onClick={() => setSelected(t.id)} />
         ))}
       </div>
       <div className="detail">
         <div className="map-wrap map-fullpage">
-          <TripMap trip={trip} allTrips={obdTrips} height={"100%"} />
+          {tracks === null
+            ? <div className="empty-state"><Icon name="map" size={40} className="icon" /><div>Carico tracciati GPS…</div></div>
+            : <TripMap trip={trip} allTrips={obdTrips} height={"100%"} />}
           <div className="map-overlay">
             <div className="lbl">Provincia di Salerno</div>
             <div className="v">{trip?.distanceKm ?? "—"} km · {trip?.track?.length ?? 0} punti</div>
@@ -806,7 +853,7 @@ const DpfView = () => {
                 </div>
                 <div className="trip-stat" style={{ flex: 1, alignItems: "stretch" }}>
                   <span className="lbl">EGT curve</span>
-                  <Sparkline data={t.pidSeriesFull?.egt_a || []} color="var(--crit)" height={30} />
+                  <LazySeries tripId={t.id} slug="egt_a" color="var(--crit)" height={30} />
                 </div>
               </div>
             </div>

@@ -403,6 +403,23 @@ def get_trip(trip_id: str) -> dict | None:
     return _row_to_trip(dict(row)) if row else None
 
 
+def get_all_tracks() -> dict[str, list]:
+    """Lightweight: just id → GPS track, without deserializing the PID blobs."""
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT id, gps_track_json FROM trips WHERE gps_track_json IS NOT NULL"
+        ).fetchall()
+    out: dict[str, list] = {}
+    for r in rows:
+        try:
+            track = json.loads(r["gps_track_json"])
+            if track:
+                out[r["id"]] = track
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
     """Retroactively add myop fields to an existing OBD trip."""
     leg_ids = myop_trip.get("myopLegIds")
