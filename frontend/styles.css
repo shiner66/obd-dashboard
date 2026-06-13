@@ -510,16 +510,24 @@ button { font-family: inherit; }
 .insight {
   background: var(--card-grad), var(--glass);
   border: 1px solid var(--hairline); border-left: 3px solid var(--info);
-  border-radius: var(--r); padding: 13px 15px; display: flex; gap: 13px;
+  border-radius: var(--r); padding: 14px 16px; display: flex; gap: 13px; align-items: flex-start;
   box-shadow: var(--shadow-card);
   transition: transform var(--anim-fast) var(--ease), border-color var(--anim-fast) var(--ease);
 }
-.insight:hover { transform: translateX(3px); }
+.insight:hover { transform: translateY(var(--hover-lift)); border-color: var(--line); }
 .insight.warning { border-left-color: var(--warn); }
 .insight.critical { border-left-color: var(--crit); }
 .insight.info { border-left-color: var(--info); }
-.insight-cat { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-3); margin-top: 2px; flex: 0 0 60px; }
-.insight-body { flex: 1; }
+.insight-ico {
+  flex: 0 0 auto; width: 36px; height: 36px; border-radius: 11px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--info-soft); color: var(--info);
+  box-shadow: inset 0 0 0 1px oklch(0.76 0.110 248 / 0.25);
+}
+.insight.warning .insight-ico { background: var(--warn-soft); color: var(--warn); box-shadow: inset 0 0 0 1px oklch(0.82 0.155 80 / 0.3); }
+.insight.critical .insight-ico { background: var(--crit-soft); color: var(--crit); box-shadow: inset 0 0 0 1px oklch(0.66 0.215 22 / 0.35); }
+.insight-body { flex: 1; min-width: 0; }
+.insight-cat { font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--fg-3); margin-bottom: 2px; }
 .insight-title { font-weight: 700; color: var(--fg-0); margin-bottom: 3px; }
 .insight-text { color: var(--fg-2); font-size: 13px; line-height: 1.5; }
 

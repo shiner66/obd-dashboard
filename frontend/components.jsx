@@ -17,6 +17,13 @@ const Icon = ({ name, size = 16, className = "" }) => {
     car:      "M5 17h14M5 17a2 2 0 100 0 2 2 0 100 0zm14 0a2 2 0 100 0 2 2 0 100 0zM3 17v-5l2-5h14l2 5v5h-2M7 7h10",
     chart:    "M3 3v18h18M7 14l3-4 4 3 5-7",
     chevron:  "M9 6l6 6-6 6",
+    filter:   "M3 5h18l-7 8v6l-4 2v-8z",
+    engine:   "M14 14V5a2 2 0 10-4 0v9a4 4 0 104 0z",
+    battery:  "M3 9h14a1 1 0 011 1v4a1 1 0 01-1 1H3a1 1 0 01-1-1v-4a1 1 0 011-1zM21 11v2M6 11v2M9 11v2",
+    droplet:  "M12 3s6 7 6 11a6 6 0 11-12 0c0-4 6-11 6-11z",
+    wrench:   "M15 7a4 4 0 01-5 5l-5 5 2 2 5-5a4 4 0 005-5l-3 3-2-2 3-3z",
+    warn:     "M12 3l9 16H3zM12 10v4M12 17h.01",
+    info:     "M12 21a9 9 0 100-18 9 9 0 000 18zM12 11v5M12 8h.01",
   };
   return (
     <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none"
@@ -429,15 +436,28 @@ const TripCard = ({ trip, active, onClick }) => {
 };
 
 /* ============== Insight card ============== */
-const InsightCard = ({ insight }) => (
-  <div className={`insight ${insight.level}`}>
-    <div className="insight-cat">{insight.category}</div>
-    <div className="insight-body">
-      <div className="insight-title">{insight.title}</div>
-      <div className="insight-text">{insight.body}</div>
+const INSIGHT_ICON = {
+  dpf: "filter", fuel: "fuel", engine: "engine", battery: "battery",
+  adblue: "droplet", service: "wrench",
+};
+const INSIGHT_CAT_LABEL = {
+  dpf: "DPF / FAP", fuel: "Carburante", engine: "Motore", battery: "Batteria",
+  adblue: "AdBlue", service: "Tagliando",
+};
+const InsightCard = ({ insight }) => {
+  const icon = INSIGHT_ICON[insight.category]
+            || (insight.level === "critical" || insight.level === "warning" ? "warn" : "info");
+  return (
+    <div className={`insight ${insight.level}`}>
+      <div className="insight-ico"><Icon name={icon} size={17} /></div>
+      <div className="insight-body">
+        <div className="insight-cat">{INSIGHT_CAT_LABEL[insight.category] || insight.category}</div>
+        <div className="insight-title">{insight.title}</div>
+        <div className="insight-text">{insight.body}</div>
+      </div>
     </div>
-  </div>
-);
+  );
+};
 
 Object.assign(window, {
   Icon, Sparkline, LineChart, RadialGauge, TripMap,

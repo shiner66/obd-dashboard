@@ -192,7 +192,7 @@ EOF
 
 ## Note tecniche
 
-- **Timezone bug Stellantis**: i timestamp `.myop` hanno suffisso `Z` ma sono in realtà locali (CET/CEST). Risolto in `myop_parser.py` con offset configurabile (`_TZ_OFFSET_H = 2` per CEST estivo).
+- **Timezone bug Stellantis**: i timestamp `.myop` hanno suffisso `Z` ma sono in realtà locali (CET/CEST). `myop_parser.py` rimuove la `Z`; il correlatore prova sia l'orario grezzo sia quello corretto di -1 h (bug DST "gruppo B" di Stellantis) per agganciare comunque la tratta alla sessione OBD giusta.
 - **fuelConsumption MyOpel**: valore grezzo `/1_000_000` per ottenere i litri.
 - **Slug PID**: il backend mappa i nomi lunghi dei PID (es. `[ECM] Crankshaft speed`) a slug brevi (`rpm`, `egt_a`, `soot`, ecc.) tramite `CURATED_SLUG` in `csv_parser.py`, in modo che combaciaino con quelli hardcoded nel frontend.
 - **Curatela PID**: dei ~180 PID registrati dal profilo MD1CS003, ognuno è marcato `useful` se ha uno slug curato **oppure** se porta un'unità fisica reale e varia nel viaggio. I ~110 PID-rumore (flag interni ECU, segnali grezzi `MP_*`, contatori, valori costanti) restano accessibili tramite il toggle "Tutti" nel PID Explorer ma sono nascosti di default.

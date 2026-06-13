@@ -316,6 +316,14 @@ def _read_csv_rows(path: Path) -> list[tuple]:
     return raw_rows
 
 
+def trip_id_for_file(path: str | Path) -> str:
+    """The trip id parse_file() would assign — derivable from the filename alone.
+
+    Lets callers skip a full parse when the trip is already in the DB.
+    """
+    return f"obd-{Path(path).stem.replace(' ', '_')}"
+
+
 def parse_file(path: str | Path) -> list[dict]:
     """
     Parse a CarScanner CSV file and return a list containing one trip dict

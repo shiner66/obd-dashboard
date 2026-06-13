@@ -485,7 +485,8 @@ const TripDpf = ({ trip }) => {
 };
 
 const TripPids = ({ trip }) => {
-  return <PidExplorerInner trip={trip} catalog={trip.pidCatalog || []} />;
+  // Use the global catalog; PidExplorerInner filters to slugs this trip has data for.
+  return <PidExplorerInner trip={trip} catalog={PID_CATALOG} />;
 };
 
 const TripInsights = ({ trip }) => {
