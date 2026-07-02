@@ -1,9 +1,15 @@
-"""SQLite persistence — one JSON blob per heavy field to keep schema simple."""
+"""SQLite persistence — one JSON blob per heavy field to keep schema simple.
+
+Heavy JSON columns (GPS track, PID stats, PID series) are stored
+zlib-compressed; readers accept both compressed blobs and legacy plain text.
+"""
 from __future__ import annotations
 import json
 import logging
 import re
 import sqlite3
+import zlib
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -68,6 +74,11 @@ def _run_data_migrations() -> None:
         _migrate_v6_compact_storage()
         with _conn() as con:
             con.execute("PRAGMA user_version = 6")
+
+    if version < 7:
+        _migrate_v7_compress_blobs()
+        with _conn() as con:
+            con.execute("PRAGMA user_version = 7")
 
 
 def _migrate_v1_fix_myop_dst() -> None:
@@ -301,23 +312,98 @@ def _migrate_v6_compact_storage() -> None:
         except Exception:
             log.exception("migrate_v6: error compacting trip %s", tid)
 
-    # Reclaim the freed pages (must run outside any transaction).
-    try:
-        con = sqlite3.connect(_DB_PATH)
-        con.execute("VACUUM")
-        con.close()
-    except sqlite3.Error:
-        log.exception("migrate_v6: VACUUM failed (non-fatal)")
+    _vacuum()
     log.info("migrate_v6: compacted %d trips, catalog moved to global table", compacted)
 
 
-def _conn() -> sqlite3.Connection:
+def _migrate_v7_compress_blobs() -> None:
+    """Migration 7: zlib-compress the heavy JSON columns and VACUUM.
+
+    JSON is extremely repetitive (the same stat keys per PID per trip), so
+    zlib at level 6 typically shrinks these columns by 70-85 % for negligible
+    CPU. Readers are format-agnostic (compressed blob or legacy text).
+    """
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT id, gps_track_json, pid_values_json, pid_series_json FROM trips"
+        ).fetchall()
+
+    before = after = 0
+    for row in rows:
+        updates: dict[str, bytes] = {}
+        for col in ("gps_track_json", "pid_values_json", "pid_series_json"):
+            val = row[col]
+            if isinstance(val, str) and val:
+                packed = zlib.compress(val.encode("utf-8"), 6)
+                before += len(val)
+                after += len(packed)
+                updates[col] = packed
+        if updates:
+            sets = ", ".join(f"{c}=?" for c in updates)
+            with _conn() as con:
+                con.execute(f"UPDATE trips SET {sets} WHERE id=?",
+                            (*updates.values(), row["id"]))
+
+    _vacuum()
+    if before:
+        log.info("migrate_v7: JSON blobs %0.1f MB → %0.1f MB (−%d%%)",
+                 before / 1e6, after / 1e6, round((1 - after / before) * 100))
+
+
+# ── Compressed JSON helpers ───────────────────────────────────────────────────
+
+def _pack_json(obj) -> bytes | None:
+    """Serialize + zlib-compress an object for a heavy JSON column."""
+    if obj is None:
+        return None
+    return zlib.compress(json.dumps(obj, separators=(",", ":")).encode("utf-8"), 6)
+
+
+def _unpack_json(data):
+    """Read a JSON column that may be a zlib blob (new) or plain text (legacy)."""
+    if data is None:
+        return None
+    if isinstance(data, bytes):
+        try:
+            data = zlib.decompress(data).decode("utf-8")
+        except zlib.error:
+            data = data.decode("utf-8", "replace")
+    return json.loads(data) if data else None
+
+
+@contextmanager
+def _conn():
+    """Connection context: commit on success, rollback on error, always close.
+
+    `with sqlite3.connect(...)` alone only commits — it leaves the connection
+    open until GC, which keeps the WAL pinned and prevents VACUUM from ever
+    truncating the main file.
+    """
     if _DB_PATH is None:
         raise RuntimeError("Database not initialised — call init() first")
     con = sqlite3.connect(_DB_PATH)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
-    return con
+    try:
+        yield con
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def _vacuum() -> None:
+    """Checkpoint the WAL and rebuild the database file to its minimal size."""
+    try:
+        con = sqlite3.connect(_DB_PATH)
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.execute("VACUUM")
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.close()
+    except sqlite3.Error:
+        log.exception("VACUUM failed (non-fatal)")
 
 
 _SCHEMA = """
@@ -388,7 +474,49 @@ CREATE TABLE IF NOT EXISTS pid_catalog (
     grp     TEXT,
     useful  INTEGER DEFAULT 0
 );
+
+-- Ledger of ingested source files, keyed by sha256 of the *uncompressed*
+-- content (stable whether the file sits in the watch dir or gzipped in
+-- archive/). Lets the app archive/dedupe sources safely after ingestion.
+CREATE TABLE IF NOT EXISTS ingested_files (
+    sha256      TEXT PRIMARY KEY,
+    filename    TEXT,
+    kind        TEXT,              -- "obd" | "myop"
+    size_bytes  INTEGER,           -- original (uncompressed) size
+    trip_ids    TEXT,              -- JSON array of trip ids produced
+    archived_as TEXT,              -- path relative to the watch dir, if archived
+    ingested_at TEXT DEFAULT (datetime('now'))
+);
 """
+
+
+def file_ingested(sha256: str) -> dict | None:
+    with _conn() as con:
+        row = con.execute("SELECT * FROM ingested_files WHERE sha256=?", (sha256,)).fetchone()
+    return dict(row) if row else None
+
+
+def record_ingested_file(sha256: str, filename: str, kind: str, size_bytes: int,
+                         trip_ids: list[str], archived_as: str | None) -> None:
+    with _conn() as con:
+        con.execute("""
+            INSERT INTO ingested_files (sha256, filename, kind, size_bytes, trip_ids, archived_as)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(sha256) DO UPDATE SET
+                filename=excluded.filename,
+                archived_as=COALESCE(excluded.archived_as, ingested_files.archived_as)
+        """, (sha256, filename, kind, size_bytes, json.dumps(trip_ids), archived_as))
+
+
+def ledger_stats() -> dict:
+    with _conn() as con:
+        row = con.execute("""
+            SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes),0) AS original_bytes,
+                   SUM(CASE WHEN archived_as IS NOT NULL THEN 1 ELSE 0 END) AS archived
+            FROM ingested_files
+        """).fetchone()
+    return {"files": row["n"], "original_bytes": row["original_bytes"],
+            "archived": row["archived"] or 0}
 
 
 def upsert_pid_catalog(entries: list[dict]) -> None:
@@ -535,9 +663,9 @@ def save_trip(trip: dict) -> None:
             trip.get("kmToService"),
             1 if trip.get("maintenancePassed") else 0,
             _j(trip.get("alerts", [])),
-            _j(trip.get("track")),
-            _j(trip.get("pidValues")),
-            _j(trip.get("pidSeriesFull")),
+            _pack_json(trip.get("track")),
+            _pack_json(trip.get("pidValues")),
+            _pack_json(trip.get("pidSeriesFull")),
             _j(trip.get("insights", [])),
             trip.get("vin"),
         ))
@@ -566,7 +694,7 @@ def get_all_tracks() -> dict[str, list]:
     out: dict[str, list] = {}
     for r in rows:
         try:
-            track = json.loads(r["gps_track_json"])
+            track = _unpack_json(r["gps_track_json"])
             if track:
                 out[r["id"]] = track
         except (ValueError, TypeError):
@@ -678,13 +806,13 @@ def merge_trips(primary_id: str, secondary_ids: list[str]) -> dict:
         # GPS tracks: concatenate in chain order so the merged path is continuous
         def _track(row):
             try:
-                return _json.loads(row.get("gps_track_json") or "[]")
+                return _unpack_json(row.get("gps_track_json")) or []
             except Exception:
                 return []
         merged_track = _track(primary)
         for s in secondaries:
             merged_track.extend(_track(s))
-        merged_track_json = _json.dumps(merged_track) if merged_track else None
+        merged_track_json = _pack_json(merged_track) if merged_track else None
 
         con.execute("""
             UPDATE trips SET
@@ -726,7 +854,7 @@ def merge_trips(primary_id: str, secondary_ids: list[str]) -> dict:
 
 
 def _row_to_trip(row: dict) -> dict:
-    _j = lambda k: json.loads(row[k]) if row.get(k) else None
+    _j = lambda k: _unpack_json(row.get(k))
 
     sources: list[str] = []
     if row.get("source") in ("obd_csv", "obd_brc"):

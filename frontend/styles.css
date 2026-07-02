@@ -509,7 +509,7 @@ button { font-family: inherit; }
   background: radial-gradient(circle, var(--accent-soft), transparent 70%); opacity: 0.6; pointer-events: none;
 }
 .stat-card:hover { border-color: var(--line); transform: translateY(var(--hover-lift)); }
-.stat-card .lbl { font-size: 10.5px; color: var(--fg-3); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+.stat-card .lbl { font-size: 10.5px; color: var(--fg-3); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; padding-right: 34px; }
 .stat-card .val { font-family: var(--font-mono); font-size: 26px; color: var(--fg-0); font-weight: 600; line-height: 1; margin-top: 3px; letter-spacing: -0.02em; }
 .stat-card .val .unit { font-size: 12px; color: var(--fg-3); margin-left: 4px; font-weight: 400; }
 .stat-card .delta { font-size: 11px; color: var(--fg-2); font-family: var(--font-mono); display: flex; align-items: center; gap: 4px; margin-top: 4px; }
@@ -519,11 +519,75 @@ button { font-family: inherit; }
 /* Dashboard layout helpers */
 .kpi-grid { grid-template-columns: repeat(5, 1fr); }
 .dash-health { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap-grid); }
-.tank-tile { width: 120px; display: flex; flex-direction: column; gap: 8px; align-items: center; }
-.tank-tile .lbl { font-size: 11px; color: var(--fg-3); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
-.tank-tile .big { font-family: var(--font-mono); font-size: 28px; color: var(--fg-0); font-weight: 700; letter-spacing: -0.02em; }
-.tank-tile .big .pct { font-size: 13px; color: var(--fg-3); margin-left: 2px; font-weight: 400; }
+.charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap-grid); }
 .topbar-meta { font-size: 12px; white-space: nowrap; }
+
+/* ===== Hero cockpit band ===== */
+.hero-band {
+  position: relative; overflow: hidden;
+  display: flex; align-items: center; gap: 28px; flex-wrap: wrap;
+  padding: 26px 30px;
+  border-radius: var(--r-xl);
+  border: 1px solid var(--hairline);
+  background:
+    radial-gradient(60% 130% at 8% -20%,  oklch(0.62 0.16 var(--accent-h) / 0.30), transparent 65%),
+    radial-gradient(45% 120% at 92% 130%, oklch(0.58 0.15 var(--accent-h2) / 0.22), transparent 68%),
+    linear-gradient(160deg, oklch(0.24 0.025 256 / 0.85), oklch(0.18 0.02 256 / 0.9));
+  box-shadow: var(--shadow-2), inset 0 1px 0 oklch(1 0 0 / 0.06);
+  animation: slideUp var(--anim-med) var(--ease-out) both;
+}
+.hero-band::after {          /* sottile sheen diagonale */
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(115deg, transparent 42%, oklch(1 0 0 / 0.035) 50%, transparent 58%);
+}
+.hero-car {
+  position: absolute; right: -30px; bottom: -22px;
+  width: min(420px, 44%); opacity: 0.9; pointer-events: none;
+  filter: drop-shadow(0 18px 30px oklch(0 0 0 / 0.55));
+  -webkit-mask-image: linear-gradient(to left, black 55%, transparent 100%);
+  mask-image: linear-gradient(to left, black 55%, transparent 100%);
+}
+.hero-info { position: relative; z-index: 1; min-width: 230px; }
+.hero-kicker { font-family: var(--font-mono); font-size: 11.5px; color: var(--fg-3); letter-spacing: 0.04em; }
+.hero-title { margin: 4px 0 2px; font-size: 24px; font-weight: 800; letter-spacing: -0.02em; color: var(--fg-0); }
+.hero-odo {
+  font-family: var(--font-mono); font-weight: 700; letter-spacing: -0.03em;
+  font-size: 44px; line-height: 1.1;
+  background: linear-gradient(100deg, var(--fg-0), var(--accent-strong));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero-odo .u { font-size: 16px; color: var(--fg-3); -webkit-text-fill-color: var(--fg-3); margin-left: 2px; }
+.hero-chips { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+.chip-static {
+  font-size: 11px; padding: 4px 10px; border-radius: 999px;
+  background: oklch(0.5 0.02 256 / 0.16); border: 1px solid var(--hairline); color: var(--fg-2);
+}
+.hero-gauges { position: relative; z-index: 1; display: flex; gap: 26px; margin-left: auto; flex-wrap: wrap; }
+.hero-gauges .hg { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.hero-gauges .gauge-radial { width: 108px; height: 108px; }
+.hero-gauges .gauge-value .v { font-size: 24px; }
+.hg-lbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-2); font-weight: 700; margin-top: 4px; }
+.hg-sub { font-size: 10.5px; color: var(--fg-3); }
+
+/* KPI card icon */
+.stat-card { min-width: 0; }
+.stat-ico {
+  position: absolute; right: 12px; top: 12px; width: 30px; height: 30px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 9px; color: var(--accent-strong);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px oklch(0.80 0.145 var(--accent-h) / 0.22);
+}
+
+/* Health cards */
+.health-card {
+  background: var(--card-grad), var(--glass);
+  border: 1px solid var(--hairline); border-radius: var(--r-lg);
+  padding: 18px 20px; box-shadow: var(--shadow-card);
+  display: flex; flex-direction: column; gap: 9px;
+}
+.health-row { display: flex; justify-content: space-between; align-items: baseline; font-size: 13px; color: var(--fg-2); margin-top: 4px; }
+.health-row .v { color: var(--fg-0); font-weight: 600; }
 
 /* Section heads */
 .section-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
@@ -676,8 +740,9 @@ button { font-family: inherit; }
   .stat-grid { grid-template-columns: repeat(2, 1fr) !important; }
   .hero-grid { grid-template-columns: 1fr !important; }
   .page-grid { grid-template-columns: 360px 1fr; }
-  .dash-health { grid-template-columns: 1fr; }
+  .dash-health, .charts-row { grid-template-columns: 1fr; }
   .topbar-meta { display: none; }
+  .hero-car { opacity: 0.35; }
 }
 
 @media (max-width: 760px) {
@@ -744,7 +809,12 @@ button { font-family: inherit; }
   .insight { padding: 11px 13px; gap: 11px; }
   .insight-cat { flex: 0 0 56px; font-size: 9px; }
   .insight-text { font-size: 12.5px; }
-  .dpf-block .tank-tile { width: 100%; }
+  .hero-band { padding: 20px 18px; gap: 18px; }
+  .hero-car { display: none; }
+  .hero-odo { font-size: 34px; }
+  .hero-gauges { margin-left: 0; gap: 14px; justify-content: space-between; width: 100%; }
+  .hero-gauges .gauge-radial { width: 88px; height: 88px; }
+  .hero-gauges .gauge-value .v { font-size: 19px; }
 
   /* Bottom tab bar — app-like primary nav */
   .content { padding-bottom: calc(72px + env(safe-area-inset-bottom)); }

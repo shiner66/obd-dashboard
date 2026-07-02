@@ -24,6 +24,10 @@ const Icon = ({ name, size = 16, className = "" }) => {
     wrench:   "M15 7a4 4 0 01-5 5l-5 5 2 2 5-5a4 4 0 005-5l-3 3-2-2 3-3z",
     warn:     "M12 3l9 16H3zM12 10v4M12 17h.01",
     info:     "M12 21a9 9 0 100-18 9 9 0 000 18zM12 11v5M12 8h.01",
+    clock:    "M12 21a9 9 0 100-18 9 9 0 000 18zM12 7v5l3 3",
+    euro:     "M17 5.5A7 7 0 007 8.5m10 10a7 7 0 01-10-3M4 10.5h9M4 13.5h8",
+    road:     "M4 21L9 3h6l5 18M12 5v3m0 4v3m0 4v2",
+    archive:  "M3 4h18v4H3zM5 8v12h14V8M10 12h4",
   };
   return (
     <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none"
@@ -177,8 +181,57 @@ const LineChart = ({ data, height = 200, color = "var(--accent)", yLabel, accent
   );
 };
 
+/* ============== Bar chart (SVG, hover tooltip) ============== */
+const BarChart = ({ data, height = 120, color = "var(--accent)", yLabel = "" }) => {
+  // data: [{ label, value }]
+  if (!data || data.length === 0) return null;
+  const [hover, setHover] = useState(null);
+  const w = 600, padX = 10, padTop = 16, padBot = 18;
+  const innerW = w - padX * 2;
+  const innerH = height - padTop - padBot;
+  const max = Math.max(...data.map(d => d.value), 1);
+  const step = innerW / data.length;
+  const barW = Math.max(2, step - 2);   // 2px surface gap between bars
+  return (
+    <svg viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none"
+         style={{ width: "100%", height, display: "block" }}
+         onMouseLeave={() => setHover(null)}>
+      <line x1={padX} x2={w - padX} y1={padTop + innerH} y2={padTop + innerH}
+            stroke="var(--line-soft)" strokeWidth="1" />
+      <text x={padX + 2} y={padTop - 5} fill="var(--fg-3)" fontSize="10"
+            fontFamily="var(--font-mono)">{max.toFixed(0)} {yLabel}</text>
+      {data.map((d, i) => {
+        const h = Math.max(d.value > 0 ? 2 : 0, (d.value / max) * innerH);
+        const x = padX + i * step + (step - barW) / 2;
+        const y = padTop + innerH - h;
+        const isHover = hover === i;
+        return (
+          <g key={i} onMouseEnter={() => setHover(i)}>
+            {/* invisible full-height hit target, wider than the mark */}
+            <rect x={padX + i * step} y={padTop} width={step} height={innerH} fill="transparent" />
+            <rect x={x} y={y} width={barW} height={h} rx="3"
+                  fill={color} opacity={isHover ? 1 : 0.75} />
+          </g>
+        );
+      })}
+      {hover != null && data[hover] && (
+        <g pointerEvents="none">
+          <rect x={Math.min(padX + hover * step, w - 150)} y={padTop} width={140} height={20} rx={5}
+                fill="var(--bg-3)" opacity="0.96" />
+          <text x={Math.min(padX + hover * step, w - 150) + 8} y={padTop + 14}
+                fill="var(--fg-0)" fontSize="11" fontFamily="var(--font-mono)">
+            {data[hover].label} · {data[hover].value.toFixed(1)} {yLabel}
+          </text>
+        </g>
+      )}
+    </svg>
+  );
+};
+
 /* ============== Radial gauge ============== */
-const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accent)", duration = 900, decimals = 0 }) => {
+/* thresholds: color shifts to warn/crit as the value fills — right for "high
+   is bad" quantities (soot, temperature). Pass false for fuel/charge levels. */
+const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accent)", duration = 900, decimals = 0, thresholds = true }) => {
   // Animate from 0 to value on mount
   const [shown, setShown] = useState(0);
   useEffect(() => {
@@ -201,7 +254,8 @@ const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accen
   const circ = 2 * Math.PI * r;
   const dash = circ * pct;
   const finalPct = value / max;
-  const color = finalPct >= 0.9 ? "var(--crit)" : finalPct >= 0.7 ? "var(--warn)" : strokeColor;
+  const color = !thresholds ? strokeColor
+    : finalPct >= 0.9 ? "var(--crit)" : finalPct >= 0.7 ? "var(--warn)" : strokeColor;
   const gid = `gauge-${String(strokeColor).replace(/[^\w]/g, "")}-${Math.round(finalPct * 100)}`;
   return (
     <div className="gauge-radial">
@@ -378,8 +432,9 @@ const AlertChip = ({ code }) => {
 };
 
 /* ============== Stat card ============== */
-const StatCard = ({ label, value, unit, sub }) => (
+const StatCard = ({ label, value, unit, sub, icon }) => (
   <div className="stat-card">
+    {icon && <div className="stat-ico"><Icon name={icon} size={15} /></div>}
     <div className="lbl">{label}</div>
     <div className="val">
       {value}
@@ -460,7 +515,7 @@ const InsightCard = ({ insight }) => {
 };
 
 Object.assign(window, {
-  Icon, Sparkline, LineChart, RadialGauge, TripMap,
+  Icon, Sparkline, LineChart, BarChart, RadialGauge, TripMap,
   DpfPill, AlertChip, StatCard, TripCard, InsightCard,
   AnimatedNumber, AnimatedBar,
 });

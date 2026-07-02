@@ -3,6 +3,7 @@ MyOpel .myop parser — briefing §4.
 A .myop file is plain JSON with a list of {vin, trips[]} objects.
 """
 from __future__ import annotations
+import gzip
 import json
 import logging
 from pathlib import Path
@@ -158,7 +159,10 @@ def parse_file(path: str | Path) -> list[dict]:
     Parse a .myop file and return a list of trip dicts in frontend format.
     """
     path = Path(path)
-    with open(path, encoding="utf-8") as f:
+    opener = (gzip.open(path, "rt", encoding="utf-8")
+              if path.name.lower().endswith(".gz")
+              else open(path, encoding="utf-8"))
+    with opener as f:
         data = json.load(f)
 
     if not isinstance(data, list):

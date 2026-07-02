@@ -1,9 +1,12 @@
 """FastAPI application — OBD Trip Platform backend."""
 from __future__ import annotations
+import gzip
+import hashlib
 import json
 import logging
 import math
 import os
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -28,6 +31,14 @@ VEHICLE_NAME    = os.getenv("VEHICLE_NAME",    "Opel Corsa F Elegance")
 VEHICLE_ECU     = os.getenv("VEHICLE_ECU",     "MD1CS003 — 1.5d BlueHDi")
 VEHICLE_ADAPTER = os.getenv("VEHICLE_ADAPTER", "BTLE IOS-Vlink")
 
+# What to do with a source file once its content is safely in the DB:
+#   gzip   (default) — compress into <watch_dir>/archive/<name>.gz (~90 % smaller),
+#                      still re-parsable by future migrations
+#   keep             — leave the file untouched
+#   delete           — remove it (the DB + ledger become the only copy)
+SOURCE_ARCHIVE  = os.getenv("SOURCE_ARCHIVE", "gzip").strip().lower()
+ARCHIVE_SUBDIR  = "archive"
+
 _watcher = Watcher()
 
 # During the initial directory scan we save every file first and reconcile once
@@ -36,10 +47,63 @@ _watcher = Watcher()
 _bulk_loading = False
 
 
+# ── Source archiving & ledger ─────────────────────────────────────────────────
+# Once a file's content is in the DB it is recorded in the ingested_files
+# ledger (sha256 of the uncompressed content) and, by default, gzipped into
+# <watch_dir>/archive/. The archive stays re-parsable: startup scans read
+# .gz sources transparently, so parser improvements can always re-ingest.
+
+def _content_sha256(path: Path) -> str:
+    """sha256 of the uncompressed content — stable across plain and .gz copies."""
+    h = hashlib.sha256()
+    opener = gzip.open(path, "rb") if path.name.lower().endswith(".gz") else open(path, "rb")
+    with opener as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _content_size(path: Path) -> int:
+    if not path.name.lower().endswith(".gz"):
+        return path.stat().st_size
+    n = 0
+    with gzip.open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            n += len(chunk)
+    return n
+
+
+def _in_archive(path: Path, base_dir: Path) -> bool:
+    return path.parent == base_dir / ARCHIVE_SUBDIR
+
+
+def _archive_source(path: Path, base_dir: Path) -> str | None:
+    """Apply the SOURCE_ARCHIVE policy. Returns the archived path (relative
+    to base_dir) or None. Never touches files already under archive/."""
+    if _in_archive(path, base_dir):
+        return str(path.relative_to(base_dir))
+    if SOURCE_ARCHIVE == "keep":
+        return None
+    if SOURCE_ARCHIVE == "delete":
+        path.unlink(missing_ok=True)
+        log.info("Deleted ingested source %s (SOURCE_ARCHIVE=delete)", path.name)
+        return None
+    # default: gzip
+    adir = base_dir / ARCHIVE_SUBDIR
+    adir.mkdir(parents=True, exist_ok=True)
+    target = adir / (path.name + ".gz")
+    if not target.exists():
+        with open(path, "rb") as src, gzip.open(target, "wb", compresslevel=9) as dst:
+            shutil.copyfileobj(src, dst)
+    path.unlink(missing_ok=True)
+    log.info("Archived %s → %s (%.0f%% smaller)", path.name, target.name,
+             (1 - target.stat().st_size / max(_content_size(target), 1)) * 100)
+    return str(target.relative_to(base_dir))
+
+
 # ── File processing ───────────────────────────────────────────────────────────
-# Files are persisted as-is. Cross-trip reconciliation (OBD chain merge,
-# OBD↔MyOpel correlation, MyOpel dedupe) is delegated to corr_svc and runs
-# after every batch — see _post_process().
+# Cross-trip reconciliation (OBD chain merge, OBD↔MyOpel correlation, MyOpel
+# dedupe) is delegated to corr_svc and runs after every batch — _post_process().
 
 def _process_obd_file(path: Path) -> list[str]:
     """Parse an OBD CSV/BRC file, save new trips, run per-trip insights. Returns new trip IDs."""
@@ -48,8 +112,16 @@ def _process_obd_file(path: Path) -> list[str]:
     # the space/underscore duplicate files) we avoid re-reading thousands of rows.
     expected_id = csv_parser.trip_id_for_file(path)
     if expected_id and db.trip_exists(expected_id):
+        if not _in_archive(path, OBD_FILES_DIR):
+            # Content already ingested under this id — ledger + archive policy.
+            sha = _content_sha256(path)
+            size = _content_size(path)
+            archived = _archive_source(path, OBD_FILES_DIR)
+            db.record_ingested_file(sha, path.name, "obd", size, [expected_id], archived)
         return []
 
+    sha = _content_sha256(path)
+    size = _content_size(path)
     trips = csv_parser.parse_file(path)
     # During bulk load, insights are recomputed once at the end — skip the
     # per-file context build (which would scan the whole DB on every file).
@@ -63,13 +135,25 @@ def _process_obd_file(path: Path) -> list[str]:
         db.save_trip(trip)
         new_ids.append(trip["id"])
         log.info("Saved OBD trip %s (%.1f km)", trip["id"], trip.get("distanceKm") or 0)
+    # Ledger + archive also when parse produced no trips (sub-1 km recordings):
+    # otherwise the file would be re-parsed at every startup forever.
+    archived = _archive_source(path, OBD_FILES_DIR)
+    db.record_ingested_file(sha, path.name, "obd", size,
+                            new_ids or [t["id"] for t in trips], archived)
     if new_ids and not _bulk_loading:
         _post_process()
     return new_ids
 
 
 def _process_myop_file(path: Path) -> list[str]:
-    """Parse a .myop file, save new trips. Returns new trip IDs."""
+    """Parse a .myop file, save new trips. Returns new trip IDs.
+
+    .myop files are always re-parsed (never skipped via the ledger): each one
+    is cumulative, and re-adding absorbed legs at startup is what lets the
+    correlator rebuild its grouping after a migration reset.
+    """
+    sha = _content_sha256(path)
+    size = _content_size(path)
     trips = myop_parser.parse_file(path)
     new_ids: list[str] = []
     for trip in trips:
@@ -78,6 +162,8 @@ def _process_myop_file(path: Path) -> list[str]:
         db.save_trip(trip)
         new_ids.append(trip["id"])
         log.info("Saved myop trip %s", trip["id"])
+    archived = _archive_source(path, MYOP_FILES_DIR)
+    db.record_ingested_file(sha, path.name, "myop", size, new_ids, archived)
     if new_ids and not _bulk_loading:
         _post_process()
     return new_ids
@@ -98,15 +184,22 @@ def _post_process() -> None:
 
 
 def _scan_directory(directory: Path, process_fn, extensions: tuple[str, ...]) -> None:
-    """Scan a directory for existing files not yet in the DB."""
-    if not directory.exists():
-        return
-    for f in sorted(directory.iterdir()):
-        if f.suffix.lower() in extensions:
-            try:
-                process_fn(f)
-            except Exception:
-                log.exception("Error scanning %s", f)
+    """Scan a directory (and its archive/ subdir, .gz included) for files not yet in the DB."""
+    candidates: list[Path] = []
+    if directory.exists():
+        candidates += [f for f in sorted(directory.iterdir())
+                       if f.is_file() and f.suffix.lower() in extensions]
+    adir = directory / ARCHIVE_SUBDIR
+    if adir.exists():
+        gz_exts = tuple(e + ".gz" for e in extensions)
+        candidates += [f for f in sorted(adir.iterdir())
+                       if f.is_file() and (f.suffix.lower() in extensions
+                                           or f.name.lower().endswith(gz_exts))]
+    for f in candidates:
+        try:
+            process_fn(f)
+        except Exception:
+            log.exception("Error scanning %s", f)
 
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
@@ -363,6 +456,38 @@ async def merge_trips(payload: dict):
 @app.get("/api/v1/health")
 def health():
     return {"status": "ok"}
+
+
+def _dir_bytes(d: Path, recursive: bool = False) -> int:
+    if not d.exists():
+        return 0
+    it = d.rglob("*") if recursive else d.iterdir()
+    return sum(f.stat().st_size for f in it if f.is_file())
+
+
+@app.get("/api/v1/admin/storage")
+def admin_storage():
+    """Disk usage breakdown: DB, source dirs, archives, and ledger savings."""
+    db_bytes = sum(p.stat().st_size for p in
+                   (DB_PATH, DB_PATH.with_name(DB_PATH.name + "-wal"),
+                    DB_PATH.with_name(DB_PATH.name + "-shm")) if p.exists())
+    obd_arch  = _dir_bytes(OBD_FILES_DIR / ARCHIVE_SUBDIR)
+    myop_arch = _dir_bytes(MYOP_FILES_DIR / ARCHIVE_SUBDIR)
+    obd_raw   = _dir_bytes(OBD_FILES_DIR)
+    myop_raw  = _dir_bytes(MYOP_FILES_DIR)
+    ledger = db.ledger_stats()
+    return {
+        "archive_mode":       SOURCE_ARCHIVE,
+        "db_bytes":           db_bytes,
+        "obd_pending_bytes":  obd_raw,      # not yet archived (watch dir root)
+        "myop_pending_bytes": myop_raw,
+        "obd_archive_bytes":  obd_arch,
+        "myop_archive_bytes": myop_arch,
+        "total_bytes":        db_bytes + obd_raw + myop_raw + obd_arch + myop_arch,
+        "ledger_files":       ledger["files"],
+        "ledger_archived":    ledger["archived"],
+        "ledger_original_bytes": ledger["original_bytes"],
+    }
 
 
 @app.post("/api/v1/admin/correlate")

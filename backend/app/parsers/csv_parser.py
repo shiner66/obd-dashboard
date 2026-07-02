@@ -5,6 +5,7 @@ per-PID stats, GPS track, RBS correction, DPF state machine.
 """
 from __future__ import annotations
 import csv
+import gzip
 import logging
 import re
 import statistics
@@ -281,11 +282,26 @@ def _parse_seconds(s: str) -> float | None:
     return None
 
 
+def _open_text(path: Path):
+    """Open a source file for text reading, transparently handling .gz archives."""
+    if path.name.lower().endswith(".gz"):
+        return gzip.open(path, "rt", newline="", encoding="utf-8-sig")
+    return open(path, newline="", encoding="utf-8-sig")
+
+
+def source_stem(path: str | Path) -> str:
+    """Filename without .csv/.brc and the optional .gz archive suffix."""
+    name = Path(path).name
+    if name.lower().endswith(".gz"):
+        name = name[:-3]
+    return Path(name).stem
+
+
 def _read_csv_rows(path: Path) -> list[tuple]:
     """Try semicolon delimiter first, then comma, returning parsed rows."""
     raw_rows: list[tuple] = []
     for delimiter in (";", ",", "\t"):
-        with open(path, newline="", encoding="utf-8-sig") as f:
+        with _open_text(path) as f:
             reader = csv.reader(f, delimiter=delimiter)
             header = next(reader, None)
             rows_seen = 0
@@ -322,7 +338,7 @@ def trip_id_for_file(path: str | Path) -> str:
 
     Lets callers skip a full parse when the trip is already in the DB.
     """
-    return f"obd-{Path(path).stem.replace(' ', '_')}"
+    return f"obd-{source_stem(path).replace(' ', '_')}"
 
 
 def parse_file(path: str | Path) -> list[dict]:
@@ -334,7 +350,7 @@ def parse_file(path: str | Path) -> list[dict]:
     filename = path.name
 
     # ── Timestamp from filename (local Italian time → strip timezone info) ──
-    stem = path.stem  # "2026-05-20_19-57-16" or "2026-05-20 19-57-16"
+    stem = source_stem(path)  # "2026-05-20_19-57-16" or "2026-05-20 19-57-16"
     start_local = start_utc = ""
     for fmt in ("%Y-%m-%d_%H-%M-%S", "%Y-%m-%d %H-%M-%S"):
         try:
@@ -357,7 +373,7 @@ def parse_file(path: str | Path) -> list[dict]:
     if not raw_rows:
         # Log the raw first 5 lines to help diagnose unknown formats.
         try:
-            with open(path, encoding="utf-8-sig", errors="replace") as _f:
+            with _open_text(path) as _f:
                 preview = [next(_f, "") for _ in range(5)]
             log.error("No valid rows in %s — first 5 lines: %r", filename, preview)
         except Exception:

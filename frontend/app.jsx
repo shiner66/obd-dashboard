@@ -198,56 +198,156 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
     .filter(t => t.consumptionKmL)
     .slice(-30);
 
+  // km per calendar day, last 3 weeks (gaps kept as zero — honest activity view)
+  const kmByDay = useMemo(() => {
+    const per = {};
+    TRIPS.forEach(t => {
+      const d = (t.start || "").slice(0, 10);
+      if (d) per[d] = (per[d] || 0) + (t.distanceKm || 0);
+    });
+    const days = Object.keys(per).sort();
+    if (!days.length) return [];
+    const last = new Date(days[days.length - 1]);
+    const out = [];
+    for (let i = 20; i >= 0; i--) {
+      const d = new Date(last); d.setDate(last.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
+      out.push({
+        label: d.toLocaleDateString("it-IT", { day: "2-digit", month: "short" }),
+        value: per[key] || 0,
+      });
+    }
+    return out;
+  }, []);
+
+  const regenPct = (VEHICLE.dpfSinceRegenKm != null && VEHICLE.dpfAvgRegenKm > 0)
+    ? Math.min(100, VEHICLE.dpfSinceRegenKm / VEHICLE.dpfAvgRegenKm * 100) : null;
+
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+      {/* ── Hero cockpit ─────────────────────────────────────────── */}
+      <section className="hero-band">
+        {VEHICLE.vin && (
+          <img className="hero-car" alt=""
+               src={`https://visual3d-secure.opel-vauxhall.com/V3DImage.ashx?client=MyMarque&vin=${encodeURIComponent(VEHICLE.vin)}&format=png&width=560&view=001`}
+               onError={e => { e.target.style.display = "none"; }} />
+        )}
+        <div className="hero-info">
+          <div className="hero-kicker">{VEHICLE.ecu} · {VEHICLE.adapter}</div>
+          <h2 className="hero-title">{VEHICLE.name}</h2>
+          <div className="hero-odo">
+            <AnimatedNumber value={VEHICLE.odometer || 0} /> <span className="u">km</span>
+          </div>
+          <div className="hero-chips">
+            <DpfPill state={VEHICLE.dpfRegenState || "idle"} />
+            {VEHICLE.vin && <span className="chip-static mono">VIN ···{VEHICLE.vin.slice(-6)}</span>}
+            {VEHICLE.battery != null && <span className="chip-static mono">{VEHICLE.battery.toFixed(2)} V allo spunto</span>}
+          </div>
+        </div>
+        <div className="hero-gauges">
+          <div className="hg">
+            <RadialGauge value={VEHICLE.fuelLevel ?? 0} max={100} label="%" thresholds={false} />
+            <div className="hg-lbl">Serbatoio</div>
+            <div className="hg-sub mono">{fmtInt(VEHICLE.fuelAutonomy)} km</div>
+          </div>
+          <div className="hg">
+            <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" decimals={1} />
+            <div className="hg-lbl">Soot DPF</div>
+            <div className="hg-sub mono">rigenera a ~8 g/L</div>
+          </div>
+          {regenPct != null && (
+            <div className="hg">
+              <RadialGauge value={regenPct} max={100} label="% ciclo" strokeColor="var(--info)" />
+              <div className="hg-lbl">Verso la regen</div>
+              <div className="hg-sub mono">{VEHICLE.dpfSinceRegenKm?.toFixed(0)} / {VEHICLE.dpfAvgRegenKm?.toFixed(0)} km</div>
+            </div>
+          )}
+        </div>
+      </section>
+
       <div className="stat-grid kpi-grid stagger">
-        <StatCard label="Viaggi totali" value={TRIPS.length} sub={`${obd.length} OBD · ${myop.length} MyOpel`} />
-        <StatCard label="Distanza" value={totalKm.toFixed(0)} unit="km" sub="tutti i viaggi" />
-        <StatCard label="Tempo guida" value={(totalMin / 60).toFixed(1)} unit="h" sub={`${Math.round(totalMin)} minuti`} />
-        <StatCard label="Consumo medio" value={avgCons.toFixed(1)} unit="km/L" sub={`≈ ${avgCons > 0 ? (100 / avgCons).toFixed(1) : "—"} L/100km`} />
-        <StatCard label="Spesa carburante" value={`€${cost.toFixed(0)}`} sub={`${myop.length} viaggi · €${avgFuelPrice?.toFixed(3) ?? "—"}/L`} />
+        <StatCard icon="list"  label="Viaggi totali" value={TRIPS.length} sub={`${obd.length} OBD · ${myop.length} MyOpel`} />
+        <StatCard icon="road"  label="Distanza" value={totalKm.toFixed(0)} unit="km" sub="tutti i viaggi" />
+        <StatCard icon="clock" label="Tempo guida" value={(totalMin / 60).toFixed(1)} unit="h" sub={`${Math.round(totalMin)} minuti`} />
+        <StatCard icon="fuel"  label="Consumo medio" value={avgCons.toFixed(1)} unit="km/L" sub={`≈ ${avgCons > 0 ? (100 / avgCons).toFixed(1) : "—"} L/100km`} />
+        <StatCard icon="euro"  label="Spesa carburante" value={`€${cost.toFixed(0)}`} sub={`${myop.length} viaggi · €${avgFuelPrice?.toFixed(3) ?? "—"}/L`} />
+      </div>
+
+      <div className="charts-row">
+        {kmByDay.length > 0 && (
+          <div className="trend-card">
+            <div className="section-head" style={{ marginBottom: 4 }}>
+              <span className="section-title">Attività · km per giorno</span>
+              <span className="section-sub">ultime 3 settimane</span>
+            </div>
+            <BarChart data={kmByDay} color="var(--accent)" height={130} yLabel="km" />
+          </div>
+        )}
+        {consSeries.length >= 3 && (
+          <div className="trend-card">
+            <div className="section-head" style={{ marginBottom: 4 }}>
+              <span className="section-title">Consumo per viaggio</span>
+              <span className="section-sub">km/L · ultimi {consSeries.length}</span>
+              <span style={{ flex: 1 }} />
+              <span className="big-num" style={{ fontSize: 22 }}>
+                {consSeries[consSeries.length - 1].consumptionKmL.toFixed(1)}<span className="unit">km/L</span>
+              </span>
+            </div>
+            <LineChart data={consSeries.map(t => t.consumptionKmL)} color="var(--ok)" height={130} yLabel="km/L" />
+          </div>
+        )}
       </div>
 
       <div className="dash-health">
-        <div className="dpf-block">
-          <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" decimals={1} />
-          <div className="dpf-meta">
-            <div><div className="lbl">Soot DPF</div><div className="v">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</div></div>
-            <div><div className="lbl">Km dall'ultima regen</div><div className="v">{VEHICLE.dpfSinceRegenKm ?? "—"} <span className="muted">/ {VEHICLE.dpfAvgRegenKm ?? "—"}</span></div></div>
-            <div><div className="lbl">Vita residua DPF</div><div className="v">{VEHICLE.dpfReplaceKm ? (VEHICLE.dpfReplaceKm / 1000).toFixed(0) + "k km" : "—"}</div></div>
-            <div><div className="lbl">Stato</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState || "idle"} /></div></div>
+        <div className="health-card">
+          <div className="section-head" style={{ marginBottom: 10 }}>
+            <span className="section-title">DPF / FAP</span>
+            <span style={{ flex: 1 }} />
+            <DpfPill state={VEHICLE.dpfRegenState || "idle"} />
+          </div>
+          <div className="health-row">
+            <span>Km dall'ultima regen</span>
+            <span className="v mono">{VEHICLE.dpfSinceRegenKm?.toFixed(0) ?? "—"} <span className="muted">/ {VEHICLE.dpfAvgRegenKm?.toFixed(0) ?? "—"}</span></span>
+          </div>
+          {regenPct != null && <AnimatedBar value={regenPct} max={100} color="var(--info)" height={5} />}
+          <div className="health-row">
+            <span>Soot (closed loop)</span>
+            <span className="v mono">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</span>
+          </div>
+          {VEHICLE.dpfClosedSoot != null && (
+            <AnimatedBar value={VEHICLE.dpfClosedSoot} max={10} height={5}
+                         color={VEHICLE.dpfClosedSoot >= 7 ? "var(--crit)" : VEHICLE.dpfClosedSoot >= 5 ? "var(--warn)" : "var(--accent)"} />
+          )}
+          <div className="health-row">
+            <span>Vita residua filtro</span>
+            <span className="v mono">{VEHICLE.dpfReplaceKm ? fmtInt(Math.round(VEHICLE.dpfReplaceKm)) + " km" : "—"}</span>
           </div>
         </div>
 
-        <div className="dpf-block">
-          <div className="tank-tile">
-            <div className="lbl">Serbatoio</div>
-            <div className="big">{VEHICLE.fuelLevel ?? "—"}<span className="pct">%</span></div>
-            <div style={{ width: 80 }}><AnimatedBar value={VEHICLE.fuelLevel || 0} max={100} color="var(--accent)" /></div>
-            <div className="muted mono" style={{ fontSize: 11 }}>{fmtInt(VEHICLE.fuelAutonomy)} km</div>
+        <div className="health-card">
+          <div className="section-head" style={{ marginBottom: 10 }}>
+            <span className="section-title">Livelli & servizio</span>
           </div>
-          <div className="dpf-meta">
-            <div><div className="lbl">AdBlue</div><div className="v">{fmtInt(VEHICLE.adblueRange)} <span className="muted">km</span></div></div>
-            <div><div className="lbl">Batteria (spunto)</div><div className="v">{VEHICLE.battery?.toFixed(2) ?? "—"} <span className="muted">V</span></div></div>
-            <div><div className="lbl">Tagliando</div><div className="v">{VEHICLE.nextService?.days ?? "—"} <span className="muted">g · {fmtInt(VEHICLE.nextService?.km)} km</span></div></div>
-            <div><div className="lbl">Diluizione olio</div><div className="v">{VEHICLE.oilDilutionPct != null ? VEHICLE.oilDilutionPct + " %" : "—"}</div></div>
+          <div className="health-row">
+            <span>AdBlue</span>
+            <span className="v mono">{fmtInt(VEHICLE.adblueRange)} <span className="muted">km</span></span>
           </div>
+          {VEHICLE.adblueRange != null && <AnimatedBar value={Math.min(VEHICLE.adblueRange, 6000)} max={6000} color="var(--accent)" height={5} />}
+          <div className="health-row">
+            <span>Prossimo tagliando</span>
+            <span className="v mono">{VEHICLE.nextService?.days ?? "—"} <span className="muted">g · {fmtInt(VEHICLE.nextService?.km)} km</span></span>
+          </div>
+          {VEHICLE.nextService?.km != null && <AnimatedBar value={Math.min(VEHICLE.nextService.km, 30000)} max={30000} color="var(--ok)" height={5} />}
+          <div className="health-row">
+            <span>Diluizione olio</span>
+            <span className="v mono">{VEHICLE.oilDilutionPct != null ? VEHICLE.oilDilutionPct + " %" : "—"}</span>
+          </div>
+          {VEHICLE.oilDilutionPct != null && (
+            <AnimatedBar value={VEHICLE.oilDilutionPct} max={10} height={5}
+                         color={VEHICLE.oilDilutionPct > 5 ? "var(--crit)" : VEHICLE.oilDilutionPct > 3.5 ? "var(--warn)" : "var(--ok)"} />
+          )}
         </div>
       </div>
-
-      {consSeries.length >= 3 && (
-        <div className="trend-card">
-          <div className="section-head" style={{ marginBottom: 4 }}>
-            <span className="section-title">Consumo per viaggio</span>
-            <span className="section-sub">km/L · ultimi {consSeries.length} viaggi con dato</span>
-            <span style={{ flex: 1 }} />
-            <span className="big-num" style={{ fontSize: 22 }}>
-              {consSeries[consSeries.length - 1].consumptionKmL.toFixed(1)}<span className="unit">km/L</span>
-            </span>
-          </div>
-          <LineChart data={consSeries.map(t => t.consumptionKmL)} color="var(--ok)" height={110} yLabel="km/L" />
-        </div>
-      )}
 
       <div>
         <div className="section-head">
@@ -1123,6 +1223,49 @@ const TrendsView = () => {
 };
 
 /* ============== Admin view ============== */
+const fmtBytes = (n) => {
+  if (n == null) return "—";
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + " KB";
+  return n + " B";
+};
+
+const StoragePanel = () => {
+  const [s, setS] = useState(null);
+  useEffect(() => {
+    fetch("/api/v1/admin/storage").then(r => (r.ok ? r.json() : null)).then(setS).catch(() => {});
+  }, []);
+  if (!s) return null;
+  const archived = s.obd_archive_bytes + s.myop_archive_bytes;
+  const saved = Math.max(0, s.ledger_original_bytes - archived);
+  const savedPct = s.ledger_original_bytes > 0 ? saved / s.ledger_original_bytes * 100 : 0;
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <div className="section-head">
+        <span className="section-title">Spazio su disco</span>
+        <span className="section-sub">policy sorgenti: {s.archive_mode}</span>
+      </div>
+      <div className="stat-grid" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
+        <StatCard icon="archive" label="Database" value={fmtBytes(s.db_bytes)}
+                  sub="trip + PID compressi (zlib)" />
+        <StatCard icon="archive" label="Archivio sorgenti" value={fmtBytes(archived)}
+                  sub={`${s.ledger_archived} di ${s.ledger_files} file gzippati`} />
+        <StatCard icon="download" label="Da elaborare" value={fmtBytes(s.obd_pending_bytes + s.myop_pending_bytes)}
+                  sub="in attesa nelle cartelle watch" />
+        <StatCard icon="trend" label="Spazio risparmiato" value={fmtBytes(saved)}
+                  sub={`−${savedPct.toFixed(0)}% sui sorgenti originali`} />
+      </div>
+      <div className="muted" style={{ fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
+        Dopo l'elaborazione i CSV/.myop vengono compressi in <span className="mono">archive/</span> e
+        registrati nel ledger (sha256): restano ri-analizzabili dalle migrazioni future.
+        Imposta <span className="mono">SOURCE_ARCHIVE=keep</span> per non toccarli o{" "}
+        <span className="mono">delete</span> per eliminarli dopo l'ingestione.
+      </div>
+    </div>
+  );
+};
+
 const AdminView = () => {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -1158,6 +1301,8 @@ const AdminView = () => {
 
   return (
     <div className="page-single" style={{ maxWidth: 900 }}>
+      <StoragePanel />
+
       <div className="section-head">
         <span className="section-title">Diagnostica correlazione</span>
       </div>
