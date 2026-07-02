@@ -22,9 +22,9 @@ COPY frontend/tweaks-panel.jsx  /usr/share/nginx/html/tweaks-panel.jsx
 
 # Bundle vendor JS locally — no CDN dependency at runtime
 RUN wget -q -O /usr/share/nginx/html/vendor-react.js \
-        https://unpkg.com/react@18.3.1/umd/react.development.js \
+        https://unpkg.com/react@18.3.1/umd/react.production.min.js \
     && wget -q -O /usr/share/nginx/html/vendor-react-dom.js \
-        https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js \
+        https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js \
     && wget -q -O /usr/share/nginx/html/vendor-babel.js \
         https://unpkg.com/@babel/standalone@7.29.0/babel.min.js \
     && wget -q -O /usr/share/nginx/html/vendor-leaflet.js \

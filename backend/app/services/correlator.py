@@ -58,17 +58,38 @@ DEDUPE_DISTANCE_TOL = 0.10     # MyOpel-MyOpel dedupe: ±10% distance
 SESSION_PRE_S  = 360   # a leg may start up to 6 min before engine-on (rounding/skew)
 SESSION_POST_S = 360   # …and its start must be within 6 min of engine-off
 
+# Distance sanity for session grouping. A MyOpel leg is a *sub-segment* of the
+# OBD session, so neither a single leg nor the sum of all assigned legs can
+# exceed the session distance by more than measurement disagreement allows.
+# Without this cap, a separate short drive whose start happens to fall inside a
+# long idle-heavy OBD window gets silently absorbed and poisons fuel/cost stats.
+LEG_DISTANCE_SLACK_KM = 1.0    # absolute slack for odometer rounding on short legs
 
-def _leg_in_session(leg_start: datetime, obd_start: datetime, obd_end: datetime) -> datetime | None:
+
+def _distance_budget_km(obd_km: float | None) -> float | None:
+    if not obd_km or obd_km <= 0:
+        return None
+    return obd_km * (1.0 + MATCH_DISTANCE_TOL) + LEG_DISTANCE_SLACK_KM
+
+
+def _leg_in_session(leg_start: datetime, obd_start: datetime, obd_end: datetime,
+                    *, allow_dst: bool) -> datetime | None:
     """Return the effective leg-start time if the leg belongs to this OBD session.
 
-    Tries the raw MyOpel timestamp and the DST-adjusted one (raw − 1 h) to absorb
-    the Stellantis Group-B double-DST trips, exactly like _score() does.
+    Pass 1 (allow_dst=False) uses only the raw MyOpel timestamp — correct for
+    the Group-A majority. Pass 2 (allow_dst=True) additionally tries raw − 1 h
+    for the Stellantis Group-B double-DST trips. The DST candidate is only ever
+    used for legs whose raw time matched *no* session: trying both candidates
+    unconditionally let separate drives starting up to 1 h after engine-off be
+    absorbed into the previous session during summer.
     """
     lo = obd_start - timedelta(seconds=SESSION_PRE_S)
     hi = obd_end + timedelta(seconds=SESSION_POST_S)
-    for cand in (leg_start, leg_start - _dst_offset(leg_start)):
-        if lo <= cand <= hi:
+    if lo <= leg_start <= hi:
+        return leg_start
+    if allow_dst:
+        cand = leg_start - _dst_offset(leg_start)
+        if cand != leg_start and lo <= cand <= hi:
             return cand
     return None
 
@@ -257,8 +278,8 @@ def auto_correlate_all() -> dict:
                 break  # sorted by start — no more overlaps possible
             # trip_b starts before trip_a ends — overlapping recording.
             # Keep whichever has more PIDs (richer data); if tied, keep the longer one.
-            pids_a = len(trip_a.get("pidCatalog") or [])
-            pids_b = len(trip_b.get("pidCatalog") or [])
+            pids_a = len(trip_a.get("pidValues") or {})
+            pids_b = len(trip_b.get("pidValues") or {})
             dur_a  = trip_a.get("durationMin") or 0
             dur_b  = trip_b.get("durationMin") or 0
             if pids_b > pids_a or (pids_b == pids_a and dur_b > dur_a):
@@ -310,26 +331,84 @@ def auto_correlate_all() -> dict:
         for t in obd_sessions
     ]
 
-    assignments: dict[str, list[dict]] = {}
-    for leg in myop_trips:
+    def _find_session(leg: dict, *, allow_dst: bool) -> dict | None:
         ls = _parse_dt(leg.get("start"))
         if not ls:
-            continue
+            return None
+        leg_km = leg.get("distanceKm") or 0
         best_obd: dict | None = None
         best_start: datetime | None = None
         for obd, os_, oe in parsed_sessions:
             if not os_ or not oe:
                 continue
-            if _leg_in_session(ls, os_, oe) is not None:
-                # Pick the session that began most recently before the leg —
-                # this disambiguates back-to-back sessions cleanly.
-                if best_start is None or os_ > best_start:
-                    best_obd, best_start = obd, os_
-        if best_obd is not None:
-            assignments.setdefault(best_obd["id"], []).append(leg)
+            if _leg_in_session(ls, os_, oe, allow_dst=allow_dst) is None:
+                continue
+            budget = _distance_budget_km(obd.get("distanceKm"))
+            if budget is not None and leg_km > budget:
+                continue  # leg longer than the whole session — different drive
+            # Pick the session that began most recently before the leg —
+            # this disambiguates back-to-back sessions cleanly.
+            if best_start is None or os_ > best_start:
+                best_obd, best_start = obd, os_
+        return best_obd
 
+    assignments: dict[str, list[dict]] = {}
+    unmatched: list[dict] = []
+    for leg in myop_trips:
+        target = _find_session(leg, allow_dst=False)
+        if target is not None:
+            assignments.setdefault(target["id"], []).append(leg)
+        else:
+            unmatched.append(leg)
+    # Second pass, DST-adjusted candidates for Group-B trips only.
+    still_unmatched: list[dict] = []
+    for leg in unmatched:
+        target = _find_session(leg, allow_dst=True)
+        if target is not None:
+            assignments.setdefault(target["id"], []).append(leg)
+        else:
+            still_unmatched.append(leg)
+
+    # Third pass — score-based fallback for legs no window could claim.
+    # Covers Group-B legs whose shifted start misses the padding by minutes and
+    # recordings where the OBD adapter connected only mid-drive. Unlike window
+    # matching, _score() demands distance agreement (±30 %) *and* start within
+    # ±60 min, so it can't absorb a foreign leg the way the old always-try-DST
+    # logic did. One leg per session, sessions with no other match only.
+    free_sessions = [t for t in obd_sessions
+                     if t["id"] not in assignments and t.get("myopId") is None]
+    scored: list[tuple[float, dict, dict]] = []
+    for leg in still_unmatched:
+        for obd in free_sessions:
+            s = _score(obd, leg)
+            if s >= MIN_MATCH_SCORE:
+                scored.append((s, leg, obd))
+    scored.sort(key=lambda x: -x[0])
+    used_legs: set[str] = set()
+    used_obd: set[str] = set()
+    for s, leg, obd in scored:
+        if leg["id"] in used_legs or obd["id"] in used_obd:
+            continue
+        used_legs.add(leg["id"])
+        used_obd.add(obd["id"])
+        assignments.setdefault(obd["id"], []).append(leg)
+        log.info("Score-fallback correlation %s ← %s (score %.2f)", obd["id"], leg["id"], s)
+
+    session_km = {t["id"]: (t.get("distanceKm") or 0) for t in obd_sessions}
     for obd_id, legs in assignments.items():
         legs.sort(key=lambda l: l.get("start") or "")
+        # Sum-of-legs budget: legs are sub-segments of one session, so their
+        # total distance can't exceed the session's. When it does, drop the
+        # shortest legs first (edge stragglers) until the total fits.
+        budget = _distance_budget_km(session_km.get(obd_id))
+        if budget is not None:
+            total = sum(l.get("distanceKm") or 0 for l in legs)
+            while len(legs) > 1 and total > budget:
+                dropped = min(legs, key=lambda l: l.get("distanceKm") or 0)
+                legs.remove(dropped)
+                total -= dropped.get("distanceKm") or 0
+                log.info("Session %s: leg %s dropped (sum %.1f km > budget %.1f km)",
+                         obd_id, dropped["id"], total + (dropped.get("distanceKm") or 0), budget)
         agg = _aggregate_myop_legs(legs)
         log.info("Correlating OBD %s ← %d MyOpel leg(s): %s",
                  obd_id, len(legs), [l["id"] for l in legs])

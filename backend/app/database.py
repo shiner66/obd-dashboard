@@ -27,6 +27,8 @@ def init(db_path: str | Path) -> None:
             con.execute("ALTER TABLE trips ADD COLUMN vin TEXT DEFAULT NULL")
         if "myop_leg_ids" not in existing:
             con.execute("ALTER TABLE trips ADD COLUMN myop_leg_ids TEXT DEFAULT NULL")
+        if "myop_distance_km" not in existing:
+            con.execute("ALTER TABLE trips ADD COLUMN myop_distance_km REAL DEFAULT NULL")
     _run_data_migrations()
 
 
@@ -56,6 +58,16 @@ def _run_data_migrations() -> None:
         _migrate_v4_fix_distance_and_reset_correlation()
         with _conn() as con:
             con.execute("PRAGMA user_version = 4")
+
+    if version < 5:
+        _migrate_v5_reset_myop_correlations()
+        with _conn() as con:
+            con.execute("PRAGMA user_version = 5")
+
+    if version < 6:
+        _migrate_v6_compact_storage()
+        with _conn() as con:
+            con.execute("PRAGMA user_version = 6")
 
 
 def _migrate_v1_fix_myop_dst() -> None:
@@ -206,6 +218,99 @@ def _migrate_v4_fix_distance_and_reset_correlation() -> None:
     log.info("migrate_v4: cleared %d OBD trips for re-ingest with corrected distances", n_obd)
 
 
+def _migrate_v5_reset_myop_correlations() -> None:
+    """Migration 5: reset all OBD↔MyOpel correlations for the hardened grouper.
+
+    The previous session-grouping tried the DST-adjusted (raw − 1 h) timestamp
+    for *every* leg and never checked distances, so separate MyOpel drives were
+    occasionally absorbed into the wrong OBD session. Clearing the enrichment
+    lets auto_correlate_all() regroup from scratch with the raw-first two-pass
+    matching and the distance budget. Absorbed legs are restored automatically:
+    the cumulative .myop file in the watch directory re-adds every missing leg
+    on the next startup scan.
+
+    OBD alerts always come from MyOpel legs, so they are reset together with
+    the other enrichment fields.
+    """
+    with _conn() as con:
+        res = con.execute("""
+            UPDATE trips SET
+                myop_trip_id = NULL, myop_leg_ids = NULL, myop_distance_km = NULL,
+                myop_fuel_level = NULL, myop_fuel_autonomy = NULL,
+                myop_fuel_consumed_l = NULL, myop_price_fuel = NULL,
+                myop_days_to_service = NULL, myop_km_to_service = NULL,
+                myop_maintenance_passed = 0, alerts_json = '[]'
+            WHERE source = 'obd_csv' AND myop_trip_id IS NOT NULL
+        """)
+    if res.rowcount:
+        log.info("migrate_v5: reset myop correlation on %d OBD trips", res.rowcount)
+
+
+def _migrate_v6_compact_storage() -> None:
+    """Migration 6: move PID catalogs to the global table and compact JSON blobs.
+
+    Before: every OBD trip stored its own ~36 KB pid_catalog_json (≈3 MB of
+    duplication), full-precision floats in the series, and 13+ decimal GPS
+    coordinates. This migration:
+      • merges all per-trip catalogs into the pid_catalog table, then clears
+        pid_catalog_json
+      • rounds series values to 2 decimals and drops constant series (their
+        sparkline is a flat line — the stats row already tells the story)
+      • rounds GPS coordinates to 5 decimals (≈1.1 m, below GPS accuracy)
+      • VACUUMs to reclaim the freed pages
+    """
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT id, pid_catalog_json, pid_series_json, gps_track_json "
+            "FROM trips WHERE pid_catalog_json IS NOT NULL OR pid_series_json IS NOT NULL "
+            "OR gps_track_json IS NOT NULL"
+        ).fetchall()
+
+    compacted = 0
+    for row in rows:
+        tid = row["id"]
+        try:
+            catalog = json.loads(row["pid_catalog_json"]) if row["pid_catalog_json"] else []
+            if catalog:
+                upsert_pid_catalog(catalog)
+
+            series = json.loads(row["pid_series_json"]) if row["pid_series_json"] else None
+            if series:
+                slim = {}
+                for slug, vals in series.items():
+                    if not vals:
+                        continue
+                    nums = [v for v in vals if isinstance(v, (int, float))]
+                    if nums and min(nums) == max(nums):
+                        continue  # constant — nothing to plot
+                    slim[slug] = [round(v, 2) if isinstance(v, float) else v for v in vals]
+                series = slim or None
+
+            track = json.loads(row["gps_track_json"]) if row["gps_track_json"] else None
+            if track:
+                track = [[round(p[0], 5), round(p[1], 5)] for p in track if len(p) >= 2]
+
+            with _conn() as con:
+                con.execute(
+                    "UPDATE trips SET pid_catalog_json=NULL, pid_series_json=?, gps_track_json=? WHERE id=?",
+                    (json.dumps(series) if series else None,
+                     json.dumps(track) if track else None,
+                     tid),
+                )
+            compacted += 1
+        except Exception:
+            log.exception("migrate_v6: error compacting trip %s", tid)
+
+    # Reclaim the freed pages (must run outside any transaction).
+    try:
+        con = sqlite3.connect(_DB_PATH)
+        con.execute("VACUUM")
+        con.close()
+    except sqlite3.Error:
+        log.exception("migrate_v6: VACUUM failed (non-fatal)")
+    log.info("migrate_v6: compacted %d trips, catalog moved to global table", compacted)
+
+
 def _conn() -> sqlite3.Connection:
     if _DB_PATH is None:
         raise RuntimeError("Database not initialised — call init() first")
@@ -261,17 +366,64 @@ CREATE TABLE IF NOT EXISTS trips (
     myop_km_to_service   INTEGER,
     myop_maintenance_passed INTEGER,
     myop_leg_ids         TEXT,        -- JSON array of MyOpel leg ids absorbed
+    myop_distance_km     REAL,        -- sum of absorbed MyOpel leg distances
     alerts_json          TEXT,        -- JSON array of int
     gps_track_json       TEXT,        -- JSON [[lat,lon],...]
     pid_values_json      TEXT,        -- JSON {slug: stats}
     pid_series_json      TEXT,        -- JSON {slug: [60 values]}
-    pid_catalog_json     TEXT,        -- JSON [{slug,name,unit,kind,group}]
+    pid_catalog_json     TEXT,        -- legacy, superseded by the pid_catalog table
     insights_json        TEXT,        -- JSON [{category,level,title,body}]
     merged_ids           TEXT DEFAULT NULL,
     vin                  TEXT DEFAULT NULL,
     created_at           TEXT DEFAULT (datetime('now'))
 );
+
+-- Global PID catalog, deduplicated by slug (previously duplicated per trip).
+CREATE TABLE IF NOT EXISTS pid_catalog (
+    slug    TEXT PRIMARY KEY,
+    name    TEXT,
+    short   TEXT,
+    unit    TEXT,
+    kind    TEXT,
+    grp     TEXT,
+    useful  INTEGER DEFAULT 0
+);
 """
+
+
+def upsert_pid_catalog(entries: list[dict]) -> None:
+    """Merge catalog entries into the global table.
+
+    `useful` is sticky: a PID that moves in *any* trip stays surfaced even if
+    it sits constant in most sessions (e.g. EGT spikes only during regens).
+    """
+    if not entries:
+        return
+    with _conn() as con:
+        con.executemany("""
+            INSERT INTO pid_catalog (slug, name, short, unit, kind, grp, useful)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(slug) DO UPDATE SET
+                useful = MAX(pid_catalog.useful, excluded.useful)
+        """, [
+            (e.get("slug"), e.get("name"), e.get("short"), e.get("unit"),
+             e.get("kind"), e.get("group"), 1 if e.get("useful") else 0)
+            for e in entries if e.get("slug")
+        ])
+
+
+def get_pid_catalog() -> list[dict]:
+    with _conn() as con:
+        rows = con.execute("SELECT * FROM pid_catalog ORDER BY name").fetchall()
+    return [{
+        "slug":   r["slug"],
+        "name":   r["name"] or r["slug"],
+        "short":  r["short"] or r["name"] or r["slug"],
+        "unit":   r["unit"] or "",
+        "kind":   r["kind"] or "number",
+        "group":  r["grp"] or "Sensori",
+        "useful": bool(r["useful"]),
+    } for r in rows]
 
 
 def trip_exists(trip_id: str) -> bool:
@@ -300,6 +452,9 @@ def save_trip(trip: dict) -> None:
     is_obd  = "obd" in sources
     is_myop = "myopel" in sources
 
+    # The catalog is global — one row per slug, not one copy per trip.
+    upsert_pid_catalog(trip.get("pidCatalog") or [])
+
     with _conn() as con:
         con.execute("""
             INSERT OR REPLACE INTO trips (
@@ -317,7 +472,7 @@ def save_trip(trip: dict) -> None:
                 myop_fuel_consumed_l, myop_price_fuel,
                 myop_days_to_service, myop_km_to_service, myop_maintenance_passed,
                 alerts_json, gps_track_json, pid_values_json,
-                pid_series_json, pid_catalog_json, insights_json, vin
+                pid_series_json, insights_json, vin
             ) VALUES (
                 ?,?,?,?,?,?,
                 ?,?,?,?,
@@ -333,7 +488,7 @@ def save_trip(trip: dict) -> None:
                 ?,?,
                 ?,?,?,
                 ?,?,?,
-                ?,?,?,?
+                ?,?,?
             )
         """, (
             trip.get("id"),
@@ -383,7 +538,6 @@ def save_trip(trip: dict) -> None:
             _j(trip.get("track")),
             _j(trip.get("pidValues")),
             _j(trip.get("pidSeriesFull")),
-            _j(trip.get("pidCatalog", [])),
             _j(trip.get("insights", [])),
             trip.get("vin"),
         ))
@@ -428,6 +582,7 @@ def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
             UPDATE trips SET
                 myop_trip_id        = ?,
                 myop_leg_ids        = ?,
+                myop_distance_km    = ?,
                 myop_fuel_level     = ?,
                 myop_fuel_autonomy  = ?,
                 myop_fuel_consumed_l= ?,
@@ -441,6 +596,7 @@ def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
         """, (
             myop_trip.get("myopId"),
             json.dumps(leg_ids) if leg_ids else None,
+            myop_trip.get("myopDistanceKm"),
             myop_trip.get("fuelLevel"),
             myop_trip.get("fuelAutonomy"),
             myop_trip.get("fuelConsumedL"),
@@ -580,10 +736,19 @@ def _row_to_trip(row: dict) -> dict:
     if not sources:
         sources = ["myopel" if row.get("source") == "myop" else "obd"]
 
-    _l100 = row.get("consumption_l100km") or (
-        row["myop_fuel_consumed_l"] / row["distance_km"] * 100
-        if row.get("myop_fuel_consumed_l") and row.get("distance_km") else None
-    )
+    # Consumption: prefer the OBD-derived value; otherwise MyOpel fuel over the
+    # *MyOpel* distance — never over the OBD distance, because Stellantis may
+    # have recorded only part of the session (partial coverage produced absurd
+    # figures like 1.4 L/100 km before). The fallback is used only when the
+    # MyOpel legs cover most of the OBD session, so a 2-km leg absorbed into a
+    # 90-km session can't masquerade as the whole trip's consumption.
+    # Standalone myop rows have their own consumption_l100km from the parser.
+    _l100 = row.get("consumption_l100km")
+    if not _l100 and row.get("myop_fuel_consumed_l"):
+        _myop_km = row.get("myop_distance_km")
+        _obd_km  = row.get("distance_km")
+        if _myop_km and _myop_km > 0 and (not _obd_km or _myop_km >= 0.6 * _obd_km):
+            _l100 = row["myop_fuel_consumed_l"] / _myop_km * 100
     _kml = round(100.0 / _l100, 2) if _l100 and _l100 > 0 else None
 
     return {
@@ -592,6 +757,7 @@ def _row_to_trip(row: dict) -> dict:
         "filename":              row.get("filename"),
         "myopId":                row.get("myop_trip_id"),
         "myopLegIds":            _j("myop_leg_ids"),
+        "myopDistanceKm":        row.get("myop_distance_km"),
         "start":                 row.get("start_local"),
         "start_utc":             row.get("start_utc"),
         "end":                   row.get("end_local"),
@@ -638,7 +804,6 @@ def _row_to_trip(row: dict) -> dict:
         "track":                 _j("gps_track_json"),
         "pidValues":             _j("pid_values_json"),
         "pidSeriesFull":         _j("pid_series_json"),
-        "pidCatalog":            _j("pid_catalog_json") or [],
         "insights":              _j("insights_json") or [],
         "mergedIds":             _j("merged_ids"),
         "vin":                   row.get("vin"),

@@ -230,26 +230,6 @@ def _build_vehicle(trips: list[dict]) -> dict:
     }
 
 
-def _build_pid_catalog(trips: list[dict]) -> list[dict]:
-    """Merge PID catalogs from all trips; deduplicate by slug.
-
-    A PID is marked `useful` if it is useful in *any* trip — a signal that sits
-    constant in most sessions but actually moves in a few (e.g. EGT, regen flags)
-    is surfaced rather than hidden. This is the dynamic half of PID curation.
-    """
-    seen: dict[str, dict] = {}
-    for trip in trips:
-        for entry in (trip.get("pidCatalog") or []):
-            slug = entry.get("slug")
-            if not slug:
-                continue
-            if slug not in seen:
-                seen[slug] = dict(entry)
-            elif entry.get("useful") and not seen[slug].get("useful"):
-                seen[slug] = dict(entry)        # prefer the entry that flags it useful
-    return list(seen.values())
-
-
 def _build_pid_groups(catalog: list[dict]) -> dict[str, list[str]]:
     """Group slugs by group name → {group: [slug, ...]}."""
     groups: dict[str, list[str]] = {}
@@ -286,14 +266,14 @@ def data_js():
     try:
         trips = db.get_all_trips()
         vehicle = _safe(_build_vehicle(trips))
-        catalog = _safe(_build_pid_catalog(trips))
+        catalog = _safe(db.get_pid_catalog())
         groups  = _safe(_build_pid_groups(catalog))
         trend_insights = _safe(getattr(app.state, "trend_insights", []))
         # data.js carries only trip *summaries*. The heavy per-trip payload —
-        # pidCatalog (redundant with global), pidValues, pidSeriesFull and the
-        # GPS track — is loaded lazily via /api/v1/trips/{id} (and /tracks for
-        # the map) so the initial dashboard load stays small.
-        _HEAVY = ("pidCatalog", "pidValues", "pidSeriesFull", "track")
+        # pidValues, pidSeriesFull and the GPS track — is loaded lazily via
+        # /api/v1/trips/{id} (and /tracks for the map) so the initial
+        # dashboard load stays small.
+        _HEAVY = ("pidValues", "pidSeriesFull", "track")
         slim_trips = _safe([
             {**{k: v for k, v in t.items() if k not in _HEAVY},
              "hasTrack": bool(t.get("track")),
@@ -437,11 +417,39 @@ def admin_uncorrelated():
                     },
                 })
 
+    # Audit existing correlations: coverage = MyOpel km / OBD km should sit
+    # near 1. Far below → Stellantis recorded only part of the session (or a
+    # wrong leg was absorbed); far above → a foreign leg slipped in.
+    suspects = []
+    for t in trips:
+        if "obd" not in t.get("sources", []) or t.get("myopId") is None:
+            continue
+        obd_km  = t.get("distanceKm") or 0
+        myop_km = t.get("myopDistanceKm")
+        if not obd_km or myop_km is None:
+            continue
+        coverage = myop_km / obd_km
+        if 0.6 <= coverage <= 1.35:
+            continue
+        suspects.append({
+            "id":        t["id"],
+            "start":     t.get("start"),
+            "obd_km":    round(obd_km, 1),
+            "myop_km":   round(myop_km, 1),
+            "coverage":  round(coverage, 2),
+            "leg_ids":   t.get("myopLegIds") or [],
+            "reason":    ("copertura parziale — Stellantis ha registrato solo parte della sessione"
+                          if coverage < 0.6 else
+                          "tratte MyOpel oltre la distanza OBD — possibile tratta estranea"),
+        })
+    suspects.sort(key=lambda s: s["coverage"])
+
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return {
         "standalone_obd":  len(obd_trips),
         "standalone_myop": len(myop_trips),
         "candidates":      candidates,
+        "suspects":        suspects,
     }
 
 

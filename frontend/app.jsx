@@ -53,26 +53,50 @@ const LazySeries = ({ tripId, slug, ...props }) => {
   return <Sparkline data={trip?.pidSeriesFull?.[slug] || []} {...props} />;
 };
 
+/* Some signals exist under different slugs depending on the CarScanner profile
+   (e.g. coolant vs coolant_c). Picks the first slug with series data. */
+const pickSeries = (trip, slugs) => slugs.map(s => trip?.pidSeriesFull?.[s]).find(a => a && a.length > 1) || [];
+
+const fmtInt = (n) => n?.toLocaleString?.("it-IT") ?? "—";
+
 /* ============== Top bar ============== */
-const TopBar = ({ view, onSearch, onMenu }) => (
-  <div className="topbar">
-    <button className="menu-btn" onClick={onMenu} aria-label="Apri menu">
-      <Icon name="list" size={18} />
-    </button>
-    <div>
-      <div className="crumb">{VEHICLE.name} · {VEHICLE.ecu}</div>
-      <h1>{view}</h1>
+const exportTrips = async () => {
+  try {
+    const r = await fetch("/api/v1/trips");
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `obd-trips-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) { alert("Export fallito: " + e.message); }
+};
+
+const TopBar = ({ view, onMenu }) => {
+  const last = TRIPS[0];
+  return (
+    <div className="topbar">
+      <button className="menu-btn" onClick={onMenu} aria-label="Apri menu">
+        <Icon name="list" size={18} />
+      </button>
+      <div>
+        <div className="crumb">{VEHICLE.name} · {VEHICLE.ecu}</div>
+        <h1>{view}</h1>
+      </div>
+      <div className="topbar-spacer" />
+      {last && (
+        <span className="topbar-meta mono muted">
+          ultimo viaggio {new Date(last.start).toLocaleDateString("it-IT", { day: "2-digit", month: "short" })}
+          {" · "}{last.distanceKm?.toFixed(1)} km
+        </span>
+      )}
+      <button className="icon-btn" onClick={exportTrips} title="Scarica tutti i viaggi in JSON">
+        <Icon name="download" size={14} /><span>Esporta</span>
+      </button>
     </div>
-    <div className="topbar-spacer" />
-    <div className="search">
-      <Icon name="search" size={14} />
-      <input placeholder="Cerca viaggi, PID, alert…" onChange={e => onSearch?.(e.target.value)} />
-      <span className="kbd">⌘K</span>
-    </div>
-    <button className="icon-btn"><Icon name="download" size={14} /><span>Esporta</span></button>
-    <button className="icon-btn"><Icon name="bell" size={14} /></button>
-  </div>
-);
+  );
+};
 
 /* ============== Sidebar ============== */
 const Sidebar = ({ active, setActive }) => {
@@ -98,7 +122,7 @@ const Sidebar = ({ active, setActive }) => {
         <div className="brand-mark"></div>
         <div>
           <div className="brand-name">OBD Cockpit</div>
-          <div className="brand-sub"><span className="live-dot"></span>v0.5 · live</div>
+          <div className="brand-sub"><span className="live-dot"></span>v0.6 · live</div>
         </div>
       </div>
 
@@ -156,50 +180,74 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
   const myop = TRIPS.filter(t => t.sources.includes("myopel"));
   const totalKm = TRIPS.reduce((a, t) => a + (t.distanceKm || 0), 0);
   const totalMin = TRIPS.reduce((a, t) => a + (t.durationMin || 0), 0);
-  const totalFuel = TRIPS.reduce((a, t) => a + (t.fuelConsumedL || 0), 0);
-  const avgCons = totalFuel > 0 ? (totalKm / totalFuel) : 0;
+  // Average consumption over trips that have BOTH km and fuel — mixing all-trip
+  // km with fuel from a subset produced absurd averages.
+  const fueled = TRIPS.filter(t => t.fuelConsumedL > 0 && t.distanceKm > 0);
+  const totalFuel = fueled.reduce((a, t) => a + t.fuelConsumedL, 0);
+  const fueledKm  = fueled.reduce((a, t) => a + t.distanceKm, 0);
+  const avgCons = totalFuel > 0 ? (fueledKm / totalFuel) : 0;
   const cost = TRIPS.reduce((a, t) => a + (t.costEur || 0), 0);
   const fuelPriced = myop.filter(t => t.priceFuel);
   const avgFuelPrice = fuelPriced.length > 0
     ? fuelPriced.reduce((a, t) => a + t.priceFuel, 0) / fuelPriced.length
     : null;
 
+  // km/L per trip, chronological (last 30 trips with data)
+  const consSeries = [...TRIPS]
+    .sort((a, b) => (a.start || "").localeCompare(b.start || ""))
+    .filter(t => t.consumptionKmL)
+    .slice(-30);
+
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-      <div className="stat-grid stagger" style={{ gridTemplateColumns: "repeat(5, 1fr)" }}>
+      <div className="stat-grid kpi-grid stagger">
         <StatCard label="Viaggi totali" value={TRIPS.length} sub={`${obd.length} OBD · ${myop.length} MyOpel`} />
-        <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" sub="tutti i viaggi" />
+        <StatCard label="Distanza" value={totalKm.toFixed(0)} unit="km" sub="tutti i viaggi" />
         <StatCard label="Tempo guida" value={(totalMin / 60).toFixed(1)} unit="h" sub={`${Math.round(totalMin)} minuti`} />
         <StatCard label="Consumo medio" value={avgCons.toFixed(1)} unit="km/L" sub={`≈ ${avgCons > 0 ? (100 / avgCons).toFixed(1) : "—"} L/100km`} />
-        <StatCard label="Spesa MyOpel" value={`€${cost.toFixed(2)}`} sub={`${myop.length} viaggi · €${avgFuelPrice?.toFixed(3) ?? "—"}/L`} />
+        <StatCard label="Spesa carburante" value={`€${cost.toFixed(0)}`} sub={`${myop.length} viaggi · €${avgFuelPrice?.toFixed(3) ?? "—"}/L`} />
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+      <div className="dash-health">
         <div className="dpf-block">
-          <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" />
+          <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" decimals={1} />
           <div className="dpf-meta">
-            <div><div className="lbl">Closed soot</div><div className="v">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</div></div>
-            <div><div className="lbl">Km dall'ultima regen</div><div className="v">{VEHICLE.dpfSinceRegenKm} <span className="muted">/ {VEHICLE.dpfAvgRegenKm}</span></div></div>
-            <div><div className="lbl">Vita residua DPF</div><div className="v">{VEHICLE.dpfReplaceKm ? (VEHICLE.dpfReplaceKm / 1000).toFixed(1) + "k km" : "—"}</div></div>
+            <div><div className="lbl">Soot DPF</div><div className="v">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</div></div>
+            <div><div className="lbl">Km dall'ultima regen</div><div className="v">{VEHICLE.dpfSinceRegenKm ?? "—"} <span className="muted">/ {VEHICLE.dpfAvgRegenKm ?? "—"}</span></div></div>
+            <div><div className="lbl">Vita residua DPF</div><div className="v">{VEHICLE.dpfReplaceKm ? (VEHICLE.dpfReplaceKm / 1000).toFixed(0) + "k km" : "—"}</div></div>
             <div><div className="lbl">Stato</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState || "idle"} /></div></div>
           </div>
         </div>
 
         <div className="dpf-block">
-          <div style={{ width: 120, display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
-            <div style={{ fontSize: 11, color: "var(--fg-3)", textTransform: "uppercase", letterSpacing: "0.08em" }}>Tank</div>
-            <div style={{ fontFamily: "var(--font-mono)", fontSize: 28, color: "var(--fg-0)" }}>{VEHICLE.fuelLevel}%</div>
-            <div style={{ width: 80 }}><AnimatedBar value={VEHICLE.fuelLevel} max={100} color="var(--accent)" /></div>
-            <div className="muted mono" style={{ fontSize: 11 }}>{VEHICLE.fuelAutonomy} km</div>
+          <div className="tank-tile">
+            <div className="lbl">Serbatoio</div>
+            <div className="big">{VEHICLE.fuelLevel ?? "—"}<span className="pct">%</span></div>
+            <div style={{ width: 80 }}><AnimatedBar value={VEHICLE.fuelLevel || 0} max={100} color="var(--accent)" /></div>
+            <div className="muted mono" style={{ fontSize: 11 }}>{fmtInt(VEHICLE.fuelAutonomy)} km</div>
           </div>
           <div className="dpf-meta">
-            <div><div className="lbl">AdBlue range</div><div className="v">{VEHICLE.adblueRange?.toLocaleString("it-IT") ?? "—"} km</div></div>
-            <div><div className="lbl">Batteria avvio</div><div className="v">{VEHICLE.battery?.toFixed(2) ?? "—"} V</div></div>
-            <div><div className="lbl">Prox. tagliando</div><div className="v">{VEHICLE.nextService?.days ?? "—"} g</div></div>
-            <div><div className="lbl">Olio dilution</div><div className="v">{VEHICLE.oilDilutionPct != null ? VEHICLE.oilDilutionPct + " %" : "—"}</div></div>
+            <div><div className="lbl">AdBlue</div><div className="v">{fmtInt(VEHICLE.adblueRange)} <span className="muted">km</span></div></div>
+            <div><div className="lbl">Batteria (spunto)</div><div className="v">{VEHICLE.battery?.toFixed(2) ?? "—"} <span className="muted">V</span></div></div>
+            <div><div className="lbl">Tagliando</div><div className="v">{VEHICLE.nextService?.days ?? "—"} <span className="muted">g · {fmtInt(VEHICLE.nextService?.km)} km</span></div></div>
+            <div><div className="lbl">Diluizione olio</div><div className="v">{VEHICLE.oilDilutionPct != null ? VEHICLE.oilDilutionPct + " %" : "—"}</div></div>
           </div>
         </div>
       </div>
+
+      {consSeries.length >= 3 && (
+        <div className="trend-card">
+          <div className="section-head" style={{ marginBottom: 4 }}>
+            <span className="section-title">Consumo per viaggio</span>
+            <span className="section-sub">km/L · ultimi {consSeries.length} viaggi con dato</span>
+            <span style={{ flex: 1 }} />
+            <span className="big-num" style={{ fontSize: 22 }}>
+              {consSeries[consSeries.length - 1].consumptionKmL.toFixed(1)}<span className="unit">km/L</span>
+            </span>
+          </div>
+          <LineChart data={consSeries.map(t => t.consumptionKmL)} color="var(--ok)" height={110} yLabel="km/L" />
+        </div>
+      )}
 
       <div>
         <div className="section-head">
@@ -318,10 +366,6 @@ const TripDetail = ({ trip: summaryTrip }) => {
             {trip.alerts && trip.alerts.map(c => <AlertChip key={c} code={c} />)}
           </div>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button className="icon-btn"><Icon name="download" size={12} /> CSV</button>
-          <button className="icon-btn"><Icon name="settings" size={12} /></button>
-        </div>
       </div>
 
       <div className="tabs">
@@ -389,31 +433,36 @@ const TripOverview = ({ trip }) => {
       {isObd && (
         <div>
           <div className="section-head">
-            <span className="section-title">PID critici</span>
-            <span className="section-sub">curated</span>
+            <span className="section-title">Segnali chiave</span>
+            <span className="section-sub">andamento durante il viaggio</span>
           </div>
           <div className="spark-grid stagger">
             {[
-              { slug: "rpm",     name: "RPM",       unit: "rpm",  color: "var(--accent)" },
-              { slug: "speed",   name: "Velocità",  unit: "km/h", color: "var(--accent)" },
-              { slug: "coolant", name: "Liquido",   unit: "°C",   color: "var(--warn)" },
-              { slug: "egt_a",   name: "EGT post",  unit: "°C",   color: "var(--crit)" },
-              { slug: "closed_soot", name: "Closed soot", unit: "g/L", color: "var(--warn)" },
+              { slugs: ["rpm"],                          name: "Giri motore",   unit: "rpm",  color: "var(--accent)", agg: "mean" },
+              { slugs: ["speed", "speed_v"],             name: "Velocità",      unit: "km/h", color: "var(--accent)", agg: "mean" },
+              { slugs: ["coolant", "coolant_c"],         name: "Liquido raffr.",unit: "°C",   color: "var(--warn)",   agg: "max" },
+              { slugs: ["egt_a"],                        name: "EGT post-cat",  unit: "°C",   color: "var(--crit)",   agg: "max" },
+              { slugs: ["soot_cl", "closed_soot", "soot"], name: "Soot DPF",    unit: "g/L",  color: "var(--warn)",   agg: "last" },
+              { slugs: ["boost"],                        name: "Pressione turbo", unit: "bar", color: "var(--info)",  agg: "max" },
             ].map(p => {
-              const stats = trip.pidValues?.[p.slug];
-              const series = trip.pidSeriesFull?.[p.slug];
-              if (!stats) return null;
+              const slug = p.slugs.find(s => trip?.pidValues?.[s]);
+              if (!slug) return null;
+              const stats = trip.pidValues[slug];
+              const series = pickSeries(trip, p.slugs);
+              const shown = p.agg === "max" ? stats.max : p.agg === "mean" ? stats.mean : stats.last;
+              const unit = (PID_CATALOG.find(c => c.slug === slug)?.unit || p.unit).replace(/_/g, "/");
+              const f = v => (typeof v === "number" ? +v.toFixed(1) : v ?? "—");
               return (
-                <div className="spark-tile" key={p.slug}>
+                <div className="spark-tile" key={p.name}>
                   <div className="head">
                     <span className="name">{p.name}</span>
-                    <span className="val">{stats.last?.toFixed?.(stats.kind === "number" ? 0 : 0) ?? stats.last}<span style={{ color: "var(--fg-3)", fontSize: 11, marginLeft: 2 }}>{p.unit}</span></span>
+                    <span className="val">{f(shown)}<span style={{ color: "var(--fg-3)", fontSize: 11, marginLeft: 2 }}>{unit}</span></span>
                   </div>
                   <Sparkline data={series} color={p.color} />
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--fg-3)", fontFamily: "var(--font-mono)" }}>
-                    <span>min {stats.min}</span>
-                    <span>avg {stats.mean}</span>
-                    <span>max {stats.max}</span>
+                    <span>min {f(stats.min)}</span>
+                    <span>avg {f(stats.mean)}</span>
+                    <span>max {f(stats.max)}</span>
                   </div>
                 </div>
               );
@@ -433,11 +482,24 @@ const TripOverview = ({ trip }) => {
                       sub={trip.myopLegIds && trip.myopLegIds.length > 1
                            ? `${trip.myopLegIds.length} tratte unite` : undefined} />
             <StatCard label="Odometro fine" value={trip.odometerKm?.toLocaleString("it-IT") ?? "—"} unit="km" />
-            {trip.fuelLevel && <StatCard label="Tank a fine" value={trip.fuelLevel} unit="%" />}
+            {trip.fuelLevel && <StatCard label="Serbatoio a fine" value={trip.fuelLevel} unit="%" />}
             {trip.fuelAutonomy && <StatCard label="Autonomia" value={trip.fuelAutonomy} unit="km" />}
             {trip.costEur && <StatCard label="Costo stimato" value={`€${trip.costEur.toFixed(2)}`} sub={`@ €${trip.priceFuel}/L`} />}
             {trip.priceFuel && <StatCard label="Prezzo carburante" value={`€${trip.priceFuel}`} unit="/L" />}
           </div>
+          {trip.sources.includes("obd") && trip.myopDistanceKm != null && trip.distanceKm > 0 &&
+           (trip.myopDistanceKm / trip.distanceKm) < 0.6 && (
+            <div className="insight info" style={{ marginTop: 10 }}>
+              <div className="insight-ico"><Icon name="info" size={17} /></div>
+              <div className="insight-body">
+                <div className="insight-title">Copertura Stellantis parziale</div>
+                <div className="insight-text">
+                  MyOpel ha registrato {trip.myopDistanceKm.toFixed(1)} km dei {trip.distanceKm.toFixed(1)} km
+                  della sessione OBD: carburante e costo si riferiscono solo alle tratte registrate.
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </>
@@ -455,7 +517,7 @@ const TripDpf = ({ trip }) => {
   return (
     <>
       <div className="dpf-block">
-        <RadialGauge value={trip.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" />
+        <RadialGauge value={trip.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" decimals={1} />
         <div className="dpf-meta">
           <div><div className="lbl">Stato</div><div className="v"><DpfPill state={trip.dpfRegenState} /></div></div>
           <div><div className="lbl">Closed soot</div><div className="v">{trip.dpfClosedSoot != null ? trip.dpfClosedSoot + " g/L" : "—"}</div></div>
@@ -507,11 +569,11 @@ const TripDpf = ({ trip }) => {
 
       <div>
         <div className="section-head">
-          <span className="section-title">Andamento closed soot</span>
+          <span className="section-title">Andamento soot (closed loop)</span>
           <span className="section-sub">g/L — campioni DPF durante il viaggio</span>
         </div>
         <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)", padding: 12 }}>
-          <LineChart data={trip.pidSeriesFull?.closed_soot || trip.pidSeriesFull?.soot || []} color="var(--warn)" yLabel="g/L" />
+          <LineChart data={pickSeries(trip, ["soot_cl", "closed_soot", "soot"])} color="var(--warn)" yLabel="g/L" />
         </div>
       </div>
     </>
@@ -637,14 +699,14 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
         </div>
 
         <div className="pid-scroll">
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-            <thead style={{ position: "sticky", top: 0, background: "var(--bg-2)", zIndex: 2 }}>
-              <tr style={{ textAlign: "left", color: "var(--fg-3)" }}>
-                <th style={{ padding: "8px 12px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>PID</th>
-                <th style={{ padding: "8px 8px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>Group</th>
-                <th style={{ padding: "8px 8px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", textAlign: "right" }}>Last</th>
-                <th style={{ padding: "8px 8px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", textAlign: "right" }}>Min/Max</th>
-                <th style={{ padding: "8px 8px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>Trace</th>
+          <table className="data-table pid-table">
+            <thead>
+              <tr>
+                <th>PID</th>
+                <th>Gruppo</th>
+                <th className="num">Ultimo</th>
+                <th className="num">Min/Max</th>
+                <th>Trace</th>
               </tr>
             </thead>
             <tbody>
@@ -653,27 +715,22 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
                 const series = trip.pidSeriesFull?.[p.slug];
                 const isSel = p.slug === selected;
                 return (
-                  <tr key={p.slug}
-                      onClick={() => setSelected(p.slug)}
-                      style={{
-                        borderTop: "1px solid var(--line-soft)",
-                        background: isSel ? "var(--accent-soft)" : "transparent",
-                        cursor: "pointer",
-                      }}>
-                    <td style={{ padding: "6px 12px", color: isSel ? "var(--accent-strong)" : "var(--fg-0)" }}>
+                  <tr key={p.slug} onClick={() => setSelected(p.slug)}
+                      className={isSel ? "selected" : ""}>
+                    <td style={{ color: isSel ? "var(--accent-strong)" : "var(--fg-0)" }}>
                       <div style={{ fontWeight: 500 }}>{p.name.replace(/^\[(ECM|TCU)\]\s*/i, "")}</div>
                       <div className="muted mono" style={{ fontSize: 10 }}>{p.slug}</div>
                     </td>
-                    <td style={{ padding: "6px 8px", color: "var(--fg-2)" }}>{p.group}</td>
-                    <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", textAlign: "right", color: "var(--fg-0)" }}>
+                    <td style={{ color: "var(--fg-2)" }}>{p.group}</td>
+                    <td className="num mono" style={{ color: "var(--fg-0)" }}>
                       {typeof s.last === "number" ? s.last : "—"}
                       <span style={{ color: "var(--fg-3)", marginLeft: 3, fontSize: 10 }}>{p.unit}</span>
                     </td>
-                    <td style={{ padding: "6px 8px", fontFamily: "var(--font-mono)", textAlign: "right", color: "var(--fg-2)", fontSize: 11 }}>
+                    <td className="num mono" style={{ color: "var(--fg-2)", fontSize: 11 }}>
                       {s.min}/{s.max}
                     </td>
-                    <td style={{ padding: "6px 8px", width: 100 }}>
-                      <Sparkline data={series} height={20} color={isSel ? "var(--accent-strong)" : "var(--fg-3)"} showFill={false} />
+                    <td style={{ width: 100 }}>
+                      <Sparkline data={series} height={20} color={isSel ? "var(--accent-strong)" : "var(--fg-3)"} showFill={false} animate={false} />
                     </td>
                   </tr>
                 );
@@ -695,8 +752,7 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
               {selPid.group} · {selPid.kind}
             </div>
             <div style={{ fontSize: 16, color: "var(--fg-0)", fontWeight: 600, marginTop: 4 }}>{selPid.name.replace(/^\[(ECM|TCU)\]\s*/i, "")}</div>
-            <div className="muted mono" style={{ fontSize: 11, marginTop: 2 }}>{selPid.name}</div>
-            <div className="muted mono" style={{ fontSize: 11 }}>slug: <span style={{ color: "var(--fg-1)" }}>{selPid.slug}</span></div>
+            <div className="muted mono" style={{ fontSize: 11, marginTop: 2 }}>{selPid.slug}{selPid.unit ? ` · ${selPid.unit}` : ""}</div>
 
             <div style={{ margin: "16px 0" }}>
               <LineChart data={selSeries} height={140} color="var(--accent)" yLabel={selPid.unit} />
@@ -773,9 +829,11 @@ const MapView = () => {
             ? <div className="empty-state"><Icon name="map" size={40} className="icon" /><div>Carico tracciati GPS…</div></div>
             : <TripMap trip={trip} allTrips={obdTrips} height={"100%"} />}
           <div className="map-overlay">
-            <div className="lbl">Provincia di Salerno</div>
-            <div className="v">{trip?.distanceKm ?? "—"} km · {trip?.track?.length ?? 0} punti</div>
-            <div className="v" style={{ color: "var(--fg-3)" }}>bbox 40.45–40.70°N · 14.71–15.00°E</div>
+            <div className="lbl">Viaggio selezionato</div>
+            <div className="v">
+              {trip ? new Date(trip.start).toLocaleString("it-IT", { dateStyle: "short", timeStyle: "short" }) : "—"}
+            </div>
+            <div className="v" style={{ color: "var(--fg-3)" }}>{trip?.distanceKm ?? "—"} km · {trip?.track?.length ?? 0} punti</div>
           </div>
           <div className="map-legend">
             <div className="row"><span className="sw" style={{background:"oklch(0.86 0.16 200)"}}></span>traccia selezionata</div>
@@ -789,19 +847,16 @@ const MapView = () => {
 
 /* ============== DPF / FAP view ============== */
 const DpfView = () => {
-  const obdTrips = TRIPS.filter(t => t.sources.includes("obd")).sort((a, b) => a.start.localeCompare(b.start));
+  const obdTrips = TRIPS.filter(t => t.sources.includes("obd")).sort((a, b) => (a.start || "").localeCompare(b.start || ""));
   const sootSeries = obdTrips.map(t => t.dpfClosedSoot);
-  const regenDistSeries = obdTrips.map(t => t.dpfSinceRegenKm);
   const egtSeries = obdTrips.map(t => t.exhaustAfterCatC);
-
-  // Last regen event
-  const lastRegen = obdTrips.filter(t => t.dpfRegenState === "completed").slice(-1)[0];
+  const egtMax = Math.max(...egtSeries.filter(v => v != null && isFinite(v)), 0);
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16 }}>
         <div className="dpf-block">
-          <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" />
+          <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" decimals={1} />
           <div className="dpf-meta">
             <div><div className="lbl">Stato attuale</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState || "idle"} /></div></div>
             <div><div className="lbl">Closed soot</div><div className="v">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</div></div>
@@ -819,7 +874,7 @@ const DpfView = () => {
 
         <div className="trend-card">
           <div className="section-head"><span className="section-title">EGT post-cat</span><span className="section-sub">picchi per viaggio</span></div>
-          <div className="big-num">{Math.max(...egtSeries)}<span className="unit">°C</span></div>
+          <div className="big-num">{egtMax > 0 ? egtMax.toFixed(0) : "—"}<span className="unit">°C</span></div>
           <Sparkline data={egtSeries} color="var(--crit)" height={70} />
           <div className="muted mono" style={{ fontSize: 11 }}>soglia regen attiva: 550 °C</div>
         </div>
@@ -876,10 +931,13 @@ const MyOpelView = () => {
     ? fuelPriced.reduce((a, t) => a + t.priceFuel, 0) / fuelPriced.length
     : null;
 
+  const lastSync = myop[0]?.start;
+
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div className="stat-grid" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
-        <StatCard label="Viaggi MyOpel" value={myop.length} sub="ultima sincronizzazione email: oggi 11:02" />
+        <StatCard label="Viaggi MyOpel" value={myop.length}
+                  sub={lastSync ? `ultimo viaggio: ${new Date(lastSync).toLocaleDateString("it-IT", { day: "2-digit", month: "short" })}` : undefined} />
         <StatCard label="Spesa totale" value={`€${totalCost.toFixed(2)}`} sub={`${totalFuel.toFixed(2)} L · €${avgPrice?.toFixed(3) ?? "—"}/L`} />
         <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" />
         <StatCard label="Alerts MyOpel" value={allAlerts.length} sub={`${new Set(allAlerts.map(a => a.code)).size} unici`} />
@@ -891,34 +949,34 @@ const MyOpelView = () => {
             <span className="section-title">Cronologia viaggi</span>
             <span className="section-sub">canale Stellantis · TCU</span>
           </div>
-          <div className="table-wrap" style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+          <div className="table-wrap card-flat">
+            <table className="data-table">
               <thead>
-                <tr style={{ textAlign: "left", color: "var(--fg-3)", background: "var(--bg-2)" }}>
-                  <th style={{ padding: "10px 12px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>ID</th>
-                  <th style={{ padding: "10px 12px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>Data</th>
-                  <th style={{ padding: "10px 12px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", textAlign: "right" }}>Distanza</th>
-                  <th style={{ padding: "10px 12px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", textAlign: "right" }}>Durata</th>
-                  <th style={{ padding: "10px 12px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", textAlign: "right" }}>Consumo</th>
-                  <th style={{ padding: "10px 12px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", textAlign: "right" }}>Costo</th>
-                  <th style={{ padding: "10px 12px", fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>Alerts</th>
+                <tr>
+                  <th>ID</th>
+                  <th>Data</th>
+                  <th className="num">Distanza</th>
+                  <th className="num">Durata</th>
+                  <th className="num">Consumo</th>
+                  <th className="num">Costo</th>
+                  <th>Alerts</th>
                 </tr>
               </thead>
               <tbody>
                 {myop.map(t => (
-                  <tr key={t.id} style={{ borderTop: "1px solid var(--line-soft)" }}>
-                    <td style={{ padding: "10px 12px", fontFamily: "var(--font-mono)", color: "var(--fg-2)" }}>#{t.myopId}</td>
-                    <td style={{ padding: "10px 12px" }}>
+                  <tr key={t.id}>
+                    <td className="mono muted">#{t.myopId}</td>
+                    <td>
                       {new Date(t.start).toLocaleDateString("it-IT", { day: "2-digit", month: "short" })}{" "}
                       <span className="muted mono" style={{ fontSize: 11 }}>
                         {new Date(t.start).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
                       </span>
                     </td>
-                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.distanceKm?.toFixed(1) ?? "—"} <span className="muted">km</span></td>
-                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.durationMin?.toFixed(0) ?? "—"} <span className="muted">min</span></td>
-                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.consumptionKmL?.toFixed(1) ?? "—"} <span className="muted">km/L</span></td>
-                    <td style={{ padding: "10px 12px", textAlign: "right", fontFamily: "var(--font-mono)" }}>{t.costEur ? `€${t.costEur.toFixed(2)}` : "—"}</td>
-                    <td style={{ padding: "10px 12px" }}>
+                    <td className="num mono">{t.distanceKm?.toFixed(1) ?? "—"} <span className="muted">km</span></td>
+                    <td className="num mono">{t.durationMin?.toFixed(0) ?? "—"} <span className="muted">min</span></td>
+                    <td className="num mono">{t.consumptionKmL?.toFixed(1) ?? "—"} <span className="muted">km/L</span></td>
+                    <td className="num mono">{t.costEur ? `€${t.costEur.toFixed(2)}` : "—"}</td>
+                    <td>
                       {t.alerts?.length > 0 ? (
                         <div className="row" style={{ gap: 4, flexWrap: "wrap" }}>
                           {t.alerts.map(c => <AlertChip key={c} code={c} />)}
@@ -1012,7 +1070,7 @@ const TrendsView = () => {
         </div>
         <div className="trend-card">
           <div className="section-head"><span className="section-title">Autonomia AdBlue</span><span className="section-sub">km residui</span></div>
-          <div className="big-num">{adblueTrend[adblueTrend.length - 1]}<span className="unit">km</span></div>
+          <div className="big-num">{adblueTrend[adblueTrend.length - 1]?.toFixed(0) ?? "—"}<span className="unit">km</span></div>
           <LineChart data={adblueTrend} color="var(--warn)" height={90} yLabel="km" />
         </div>
         <div className="trend-card">
@@ -1124,6 +1182,28 @@ const AdminView = () => {
         <div className="insight-card critical"><b>Errore:</b> {data.error}</div>
       )}
 
+      {data?.suspects?.length > 0 && (
+        <div style={{ marginBottom: 20 }}>
+          <div className="section-head">
+            <span className="section-title">Correlazioni da verificare</span>
+            <span className="section-sub">copertura km MyOpel / km OBD fuori norma</span>
+          </div>
+          {data.suspects.map((s, i) => (
+            <div key={i} className="card" style={{ marginBottom: 8, borderLeft: "3px solid var(--warn)" }}>
+              <div className="row" style={{ gap: 14, flexWrap: "wrap" }}>
+                <span className="mono" style={{ fontSize: 12 }}>{s.id}</span>
+                <span className="muted" style={{ fontSize: 12 }}>{fmt(s.start)}</span>
+                <span className="mono" style={{ fontSize: 12 }}>
+                  OBD {s.obd_km} km · MyOpel {s.myop_km} km · copertura {(s.coverage * 100).toFixed(0)}%
+                </span>
+                <span className="mono muted" style={{ fontSize: 11 }}>tratte {s.leg_ids.join(", ")}</span>
+              </div>
+              <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>{s.reason}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {data?.candidates?.length === 0 && (
         <div className="card" style={{ color: "var(--ok)", padding: 16 }}>
           Nessun trip sovrapposto non correlato trovato.
@@ -1221,10 +1301,6 @@ const App = () => {
   // keyboard nav
   useEffect(() => {
     const fn = (e) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-        e.preventDefault();
-        document.querySelector(".topbar .search input")?.focus();
-      }
       if (e.key === "Escape") setDrawerOpen(false);
     };
     window.addEventListener("keydown", fn);

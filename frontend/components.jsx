@@ -178,7 +178,7 @@ const LineChart = ({ data, height = 200, color = "var(--accent)", yLabel, accent
 };
 
 /* ============== Radial gauge ============== */
-const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accent)", duration = 900 }) => {
+const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accent)", duration = 900, decimals = 0 }) => {
   // Animate from 0 to value on mount
   const [shown, setShown] = useState(0);
   useEffect(() => {
@@ -218,7 +218,7 @@ const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accen
                 strokeDasharray={`${dash} ${circ - dash}`} />
       </svg>
       <div className="gauge-value">
-        <div className="v">{Math.round(shown)}</div>
+        <div className="v">{shown.toFixed(decimals)}</div>
         <div className="l">{label}</div>
       </div>
     </div>

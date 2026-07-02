@@ -350,6 +350,33 @@ button { font-family: inherit; }
 }
 
 .table-wrap { overflow: hidden; border-radius: var(--r); }
+.card-flat { background: var(--bg-1); border: 1px solid var(--line-soft); border-radius: var(--r); }
+
+/* ===== Shared data table ===== */
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table thead { position: sticky; top: 0; z-index: 2; }
+.data-table thead tr { background: var(--bg-2); }
+.data-table th {
+  padding: 10px 12px; text-align: left; color: var(--fg-3);
+  font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+.data-table td { padding: 9px 12px; }
+.data-table tbody tr { border-top: 1px solid var(--line-soft); transition: background var(--anim-fast) var(--ease); }
+.data-table tbody tr:hover { background: oklch(0.6 0.03 256 / 0.06); }
+.data-table th.num, .data-table td.num { text-align: right; }
+.data-table td.num { font-family: var(--font-mono); }
+.data-table.pid-table { font-size: 12px; table-layout: fixed; }
+.data-table.pid-table td { padding: 6px 12px; }
+.data-table.pid-table tbody tr { cursor: pointer; }
+.data-table.pid-table tbody tr.selected { background: var(--accent-soft); }
+.pid-table th:nth-child(1) { width: 36%; }
+.pid-table th:nth-child(2) { width: 15%; }
+.pid-table th:nth-child(3) { width: 17%; }
+.pid-table th:nth-child(4) { width: 16%; }
+.pid-table th:nth-child(5) { width: 16%; }
+.pid-table td > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pid-table td.num { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .map-fullpage { height: calc(100vh - 132px); height: calc(100dvh - 132px); min-height: 280px; }
 
@@ -365,6 +392,8 @@ button { font-family: inherit; }
 
 /* ===== Trip list ===== */
 .trip-list { display: flex; flex-direction: column; gap: 10px; }
+/* in a fixed-height flex column the cards must scroll, never compress */
+.trip-list > * { flex-shrink: 0; }
 
 .filter-bar { display: flex; flex-direction: column; gap: 12px; padding-bottom: 12px; }
 .filter-row { display: flex; gap: 7px; flex-wrap: wrap; }
@@ -456,7 +485,8 @@ button { font-family: inherit; }
 }
 .map-wrap .leaflet-container { background: var(--bg-1); height: 100%; }
 .map-overlay {
-  position: absolute; left: 12px; top: 12px; z-index: 500;
+  /* top-right: the Leaflet zoom control lives top-left */
+  position: absolute; right: 12px; top: 12px; z-index: 500;
   background: var(--glass-strong); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
   border: 1px solid var(--hairline); border-radius: var(--r-sm);
   padding: 9px 13px; font-size: 12px; color: var(--fg-1);
@@ -485,6 +515,15 @@ button { font-family: inherit; }
 .stat-card .delta { font-size: 11px; color: var(--fg-2); font-family: var(--font-mono); display: flex; align-items: center; gap: 4px; margin-top: 4px; }
 .stat-card .delta.up { color: var(--warn); }
 .stat-card .delta.down { color: var(--ok); }
+
+/* Dashboard layout helpers */
+.kpi-grid { grid-template-columns: repeat(5, 1fr); }
+.dash-health { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap-grid); }
+.tank-tile { width: 120px; display: flex; flex-direction: column; gap: 8px; align-items: center; }
+.tank-tile .lbl { font-size: 11px; color: var(--fg-3); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+.tank-tile .big { font-family: var(--font-mono); font-size: 28px; color: var(--fg-0); font-weight: 700; letter-spacing: -0.02em; }
+.tank-tile .big .pct { font-size: 13px; color: var(--fg-3); margin-left: 2px; font-weight: 400; }
+.topbar-meta { font-size: 12px; white-space: nowrap; }
 
 /* Section heads */
 .section-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
@@ -637,6 +676,8 @@ button { font-family: inherit; }
   .stat-grid { grid-template-columns: repeat(2, 1fr) !important; }
   .hero-grid { grid-template-columns: 1fr !important; }
   .page-grid { grid-template-columns: 360px 1fr; }
+  .dash-health { grid-template-columns: 1fr; }
+  .topbar-meta { display: none; }
 }
 
 @media (max-width: 760px) {
@@ -703,7 +744,7 @@ button { font-family: inherit; }
   .insight { padding: 11px 13px; gap: 11px; }
   .insight-cat { flex: 0 0 56px; font-size: 9px; }
   .insight-text { font-size: 12.5px; }
-  .dpf-block > div[style*="width: 120"] { width: 100% !important; }
+  .dpf-block .tank-tile { width: 100%; }
 
   /* Bottom tab bar — app-like primary nav */
   .content { padding-bottom: calc(72px + env(safe-area-inset-bottom)); }

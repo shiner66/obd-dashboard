@@ -112,8 +112,11 @@ curl -F "file=@trips-2026-05.myop" \
 | GET  | `/api/v1/data.js`       | JavaScript con `window.TRIPS`, `window.VEHICLE`, `window.PID_CATALOG`, ecc. |
 | GET  | `/api/v1/trips`         | JSON di tutti i viaggi (lista completa) |
 | GET  | `/api/v1/trips/{id}`    | Dettaglio singolo viaggio (include `pidSeriesFull`, `track`, `pidValues`) |
+| GET  | `/api/v1/tracks`        | Tutti i tracciati GPS, `{trip_id: [[lat,lon],…]}` (vista Mappa) |
 | POST | `/api/v1/upload/obd`    | Upload `.csv` / `.brc` (multipart) |
 | POST | `/api/v1/upload/myop`   | Upload `.myop` (multipart) |
+| POST | `/api/v1/admin/correlate` | Forza un passaggio di correlazione autonoma |
+| GET  | `/api/v1/admin/uncorrelated` | Diagnostica: coppie candidate non correlate + correlazioni sospette (copertura km fuori norma) |
 | GET  | `/api/v1/health`        | Healthcheck |
 
 ---
@@ -130,7 +133,7 @@ backend/
 ├── requirements.txt
 └── app/
     ├── main.py               FastAPI + routing + correlazione viaggi
-    ├── database.py           SQLite (1 tabella + blob JSON)
+    ├── database.py           SQLite (trips + pid_catalog globale, blob JSON compattati)
     ├── parsers/
     │   ├── csv_parser.py     CarScanner CSV → trip dict (RBS, DPF, PID stats)
     │   └── myop_parser.py    MyOpel .myop → trip list
@@ -196,8 +199,9 @@ EOF
 - **fuelConsumption MyOpel**: valore grezzo `/1_000_000` per ottenere i litri.
 - **Slug PID**: il backend mappa i nomi lunghi dei PID (es. `[ECM] Crankshaft speed`) a slug brevi (`rpm`, `egt_a`, `soot`, ecc.) tramite `CURATED_SLUG` in `csv_parser.py`, in modo che combaciaino con quelli hardcoded nel frontend.
 - **Curatela PID**: dei ~180 PID registrati dal profilo MD1CS003, ognuno è marcato `useful` se ha uno slug curato **oppure** se porta un'unità fisica reale e varia nel viaggio. I ~110 PID-rumore (flag interni ECU, segnali grezzi `MP_*`, contatori, valori costanti) restano accessibili tramite il toggle "Tutti" nel PID Explorer ma sono nascosti di default.
+- **Spazio su disco**: il catalogo PID vive in una tabella globale `pid_catalog` (una riga per slug) invece di essere duplicato in ogni viaggio; le serie downsampled sono arrotondate a 2 decimali e le serie costanti non vengono salvate; le coordinate GPS sono arrotondate a 5 decimali (≈1 m). La migrazione v6 compatta i database esistenti e fa `VACUUM` (nel corpus reale: ~20 MB → ~10 MB).
 - **Distanza OBD**: calcolata dal contatore di tratta `Distanza percorsa:` se presente, altrimenti dal delta dell'odometro `[ECM] Total mileage` (affidabile ≥2 km), e solo come ultima risorsa dall'integrale della velocità GPS (rumoroso). Questo era la causa principale delle correlazioni mancate.
-- **Correlazione OBD↔MyOpel**: ogni tratta MyOpel viene assegnata alla sessione OBD (motore acceso) la cui finestra temporale la contiene. Una singola sessione OBD può assorbire più tratte MyOpel (Stellantis spezza un viaggio alle soste brevi): distanza/carburante/costo vengono sommati, gli alert uniti, il countdown tagliando preso dall'ultima tratta. Mantengono lo stesso `id` OBD.
+- **Correlazione OBD↔MyOpel** (3 passaggi): ① ogni tratta MyOpel viene assegnata alla sessione OBD la cui finestra temporale ne contiene l'inizio, usando **solo il timestamp grezzo**; ② le tratte rimaste orfane riprovano con il timestamp corretto di −1 h (bug DST "gruppo B" Stellantis); ③ le ultime orfane usano un punteggio pesato (tempo ±60 min + distanza ±30 % + durata) contro le sessioni OBD ancora libere — recupera le tratte gruppo B ai margini della finestra e le registrazioni partite ad adattatore già in marcia. In ogni passaggio vale un **budget di distanza**: né una singola tratta né la somma delle tratte può superare i km della sessione OBD oltre la tolleranza, così una guida estranea non viene più assorbita per caso. La somma dei km MyOpel viene salvata (`myop_distance_km`): se copre <60 % della sessione il consumo non viene derivato dal carburante Stellantis e la coppia compare tra le "correlazioni da verificare" nella vista Admin.
 
 ---
 

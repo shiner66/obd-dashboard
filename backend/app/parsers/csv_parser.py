@@ -246,13 +246,14 @@ def _mode(values: list[float]) -> float:
 
 
 def _downsample(series: list[tuple[float, float]], n: int = 60) -> list[float]:
-    """Return n evenly-spaced values from a (ts, value) series."""
+    """Return n evenly-spaced values from a (ts, value) series, rounded to 2
+    decimals — full float precision only bloats the stored JSON."""
     if not series:
         return []
     if len(series) <= n:
-        return [v for _, v in series]
+        return [round(v, 2) for _, v in series]
     step = (len(series) - 1) / (n - 1)
-    return [series[round(i * step)][1] for i in range(n)]
+    return [round(series[round(i * step)][1], 2) for i in range(n)]
 
 
 def _r(v: float | None, d: int = 2) -> float | None:
@@ -397,8 +398,9 @@ def parse_file(path: str | Path) -> list[dict]:
             windowed = [(t, rbs_svc.correct(pid_name, v)) for t, v in windowed]
         pid_window[pid_name] = windowed
 
-    # ── GPS track (engine window, deduplicated) ───────────────────────────────
-    gps_window = [(lat, lon) for ts, lat, lon in gps_all if t_start <= ts <= t_end]
+    # ── GPS track (engine window, 5-decimal ≈1.1 m precision, deduplicated) ──
+    gps_window = [(round(lat, 5), round(lon, 5)) for ts, lat, lon in gps_all
+                  if t_start <= ts <= t_end]
     gps_deduped: list[list[float]] = []
     for p in gps_window:
         if not gps_deduped or (p[0] != gps_deduped[-1][0] or p[1] != gps_deduped[-1][1]):
@@ -508,7 +510,10 @@ def parse_file(path: str | Path) -> list[dict]:
             "sample_rate_hz":     _r(len(vals) / max(span, 1), 3),
             "is_stale":           (t_end - times[-1]) > 60,
         }
-        pid_series[slug] = _downsample(series, 60)
+        # Constant series draw as a flat line and the stats row already says
+        # min == max — storing 60 identical points per PID is pure waste.
+        if min(vals) != max(vals):
+            pid_series[slug] = _downsample(series, 60)
 
         # Build PID catalog entry
         _name_clean = pid_name
