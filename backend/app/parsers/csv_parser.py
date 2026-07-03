@@ -350,9 +350,9 @@ def parse_file(path: str | Path) -> list[dict]:
     filename = path.name
 
     # ── Timestamp from filename (local Italian time → strip timezone info) ──
-    stem = source_stem(path)  # "2026-05-20_19-57-16" or "2026-05-20 19-57-16"
+    stem = source_stem(path)  # "2026-05-20_19-57-16", "2026-05-20 19-57-16" or "20260520_195716"
     start_local = start_utc = ""
-    for fmt in ("%Y-%m-%d_%H-%M-%S", "%Y-%m-%d %H-%M-%S"):
+    for fmt in ("%Y-%m-%d_%H-%M-%S", "%Y-%m-%d %H-%M-%S", "%Y%m%d_%H%M%S", "%Y%m%d %H%M%S"):
         try:
             dt_local = datetime.strptime(stem, fmt)
             start_local = dt_local.isoformat()

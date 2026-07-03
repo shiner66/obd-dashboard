@@ -80,6 +80,11 @@ def _run_data_migrations() -> None:
         with _conn() as con:
             con.execute("PRAGMA user_version = 7")
 
+    if version < 8:
+        _migrate_v8_fix_empty_starts()
+        with _conn() as con:
+            con.execute("PRAGMA user_version = 8")
+
 
 def _migrate_v1_fix_myop_dst() -> None:
     """Migration 1: fix myop timestamps in CEST — standalone myop entries only.
@@ -348,6 +353,40 @@ def _migrate_v7_compress_blobs() -> None:
     if before:
         log.info("migrate_v7: JSON blobs %0.1f MB → %0.1f MB (−%d%%)",
                  before / 1e6, after / 1e6, round((1 - after / before) * 100))
+
+
+_OBD_ID_COMPACT_RE = re.compile(r"^obd-(\d{4})(\d{2})(\d{2})[_ ](\d{2})(\d{2})(\d{2})$")
+
+
+def _migrate_v8_fix_empty_starts() -> None:
+    """Migration 8: recover start/end for OBD trips saved with an empty start.
+
+    CarScanner's newer export names files ``YYYYMMDD_HHMMSS.csv``; the old
+    parser didn't recognise that pattern and stored start_local="", which
+    breaks chronological sorting and every trend rule. The timestamp is
+    recoverable from the trip id.
+    """
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT id, duration_min FROM trips "
+            "WHERE source='obd_csv' AND (start_local IS NULL OR start_local='')"
+        ).fetchall()
+    fixed = 0
+    for row in rows:
+        m = _OBD_ID_COMPACT_RE.match(row["id"])
+        if not m:
+            continue
+        try:
+            start = datetime(int(m[1]), int(m[2]), int(m[3]), int(m[4]), int(m[5]), int(m[6]))
+        except ValueError:
+            continue
+        end = start + timedelta(minutes=row["duration_min"] or 0)
+        with _conn() as con:
+            con.execute("UPDATE trips SET start_local=?, end_local=? WHERE id=?",
+                        (start.isoformat(), end.isoformat(), row["id"]))
+        fixed += 1
+    if fixed:
+        log.info("migrate_v8: recovered timestamps for %d trips with empty start", fixed)
 
 
 # ── Compressed JSON helpers ───────────────────────────────────────────────────

@@ -399,6 +399,15 @@ const TripsView = ({ selectedId, setSelectedId }) => {
 
   const trip = TRIPS.find(t => t.id === selectedId) || filtered[0];
 
+  // On phones the list sits above the detail: bring the detail into view on tap.
+  const selectTrip = (id) => {
+    setSelectedId(id);
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      setTimeout(() => document.querySelector(".page-grid .detail")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" }), 80);
+    }
+  };
+
   return (
     <div className="page-grid">
       <div className="trip-list">
@@ -421,9 +430,9 @@ const TripsView = ({ selectedId, setSelectedId }) => {
             ))}
           </div>
         </div>
-        <div className="stagger" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <div className="trip-scroller stagger">
           {filtered.map(t => (
-            <TripCard key={t.id} trip={t} active={trip && t.id === trip.id} onClick={() => setSelectedId(t.id)} />
+            <TripCard key={t.id} trip={t} active={trip && t.id === trip.id} onClick={() => selectTrip(t.id)} />
           ))}
         </div>
         {filtered.length === 0 && (
@@ -456,7 +465,7 @@ const TripDetail = ({ trip: summaryTrip }) => {
             </span>
           </h2>
           <div className="detail-sub">
-            {trip.filename && <span>📄 {trip.filename}</span>}
+            {trip.filename && <span>📄 {trip.filename.replace(/\.gz$/i, "")}</span>}
             {trip.myopId && (
               <span>MyOpel #{trip.myopId}
                 {trip.myopLegIds && trip.myopLegIds.length > 1 && ` +${trip.myopLegIds.length - 1} tratte`}
@@ -919,9 +928,11 @@ const MapView = () => {
           <span className="section-title">Tracciati GPS</span>
           <span className="section-sub">{trackTrips.length} con GPS{tracks === null ? " · carico…" : ""}</span>
         </div>
-        {(obdTrips.length ? obdTrips : trackTrips).map(t => (
-          <TripCard key={t.id} trip={t} active={t.id === selected} onClick={() => setSelected(t.id)} />
-        ))}
+        <div className="trip-scroller">
+          {(obdTrips.length ? obdTrips : trackTrips).map(t => (
+            <TripCard key={t.id} trip={t} active={t.id === selected} onClick={() => setSelected(t.id)} />
+          ))}
+        </div>
       </div>
       <div className="detail">
         <div className="map-wrap map-fullpage">
@@ -1140,70 +1151,55 @@ const MyOpelView = () => {
   );
 };
 
-/* ============== Trends & AI view ============== */
+/* ============== Trends & AI view (predictive diagnosis) ============== */
+const SEV_LABEL = { critical: "critici", warning: "avvisi", info: "sotto controllo" };
 const TrendsView = () => {
-  const obd = TRIPS.filter(t => t.sources.includes("obd")).sort((a, b) => a.start.localeCompare(b.start));
-  const batteryTrend = obd.map(t => t.batteryStartupV);
-  const consTrend = TRIPS.filter(t => t.consumptionKmL).map(t => t.consumptionKmL);
-  const distTrend = TRIPS.map(t => t.distanceKm);
-  const adblueTrend = obd.map(t => t.adblueRangeKm);
-  const sootTrend = obd.map(t => t.dpfClosedSoot);
-  const dilTrend = obd.filter(t => t.oilDilutionPct != null).map(t => ({ start: t.start, v: t.oilDilutionPct }));
+  const [filter, setFilter] = useState("all");
+  const counts = { critical: 0, warning: 0, info: 0 };
+  TREND_INSIGHTS.forEach(i => { counts[i.level] = (counts[i.level] || 0) + 1; });
+  const shown = TREND_INSIGHTS.filter(i => filter === "all" || i.level === filter);
+  const healthy = counts.critical === 0 && counts.warning === 0;
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      <div className="trend-grid stagger">
-        <div className="trend-card">
-          <div className="section-head"><span className="section-title">Tensione batteria</span><span className="section-sub">all'avviamento, ultimi {batteryTrend.length} viaggi OBD</span></div>
-          <div className="big-num">{batteryTrend[batteryTrend.length - 1]?.toFixed(2)}<span className="unit">V</span></div>
-          <LineChart data={batteryTrend} color="var(--accent)" height={90} yLabel="V" />
+      <div className={`diag-banner ${healthy ? "ok" : counts.critical ? "critical" : "warning"}`}>
+        <div className="diag-ico">
+          <Icon name={healthy ? "trend" : "warn"} size={22} />
         </div>
-        <div className="trend-card">
-          <div className="section-head"><span className="section-title">Consumo</span><span className="section-sub">km/L · tutti i viaggi</span></div>
-          <div className="big-num">{consTrend[consTrend.length - 1]?.toFixed(1)}<span className="unit">km/L</span></div>
-          <LineChart data={consTrend} color="var(--ok)" height={90} yLabel="km/L" />
-        </div>
-        <div className="trend-card">
-          <div className="section-head"><span className="section-title">Distanza per viaggio</span><span className="section-sub">km</span></div>
-          <div className="big-num">{distTrend[distTrend.length - 1]?.toFixed(1)}<span className="unit">km</span></div>
-          <LineChart data={distTrend} color="var(--info)" height={90} yLabel="km" />
-        </div>
-        <div className="trend-card">
-          <div className="section-head"><span className="section-title">Autonomia AdBlue</span><span className="section-sub">km residui</span></div>
-          <div className="big-num">{adblueTrend[adblueTrend.length - 1]?.toFixed(0) ?? "—"}<span className="unit">km</span></div>
-          <LineChart data={adblueTrend} color="var(--warn)" height={90} yLabel="km" />
-        </div>
-        <div className="trend-card">
-          <div className="section-head"><span className="section-title">Closed soot DPF</span><span className="section-sub">g/L — ciclo vita FAP</span></div>
-          <div className="big-num">{sootTrend.filter(v => v != null).slice(-1)[0] ?? "—"}<span className="unit"> g/L</span></div>
-          <LineChart data={sootTrend} color="var(--warn)" height={90} yLabel="g/L" />
-        </div>
-        {dilTrend.length >= 2 && (
-          <div className="trend-card">
-            <div className="section-head"><span className="section-title">Diluizione olio</span><span className="section-sub">% nel tempo — attenzione ai trend crescenti</span></div>
-            <div className="big-num">{dilTrend[dilTrend.length - 1]?.v?.toFixed(1)}<span className="unit">%</span></div>
-            <LineChart data={dilTrend.map(d => d.v)} color="var(--crit)" height={90} yLabel="%" />
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <div className="diag-title">
+            {healthy ? "Nessun problema in vista"
+             : counts.critical ? "Interventi consigliati"
+             : "Qualcosa da tenere d'occhio"}
           </div>
-        )}
+          <div className="diag-sub">
+            {TREND_INSIGHTS.length} controlli predittivi sul tuo storico: diluizione olio,
+            rigenerazioni, batteria, rail, turbo, minimo, AdBlue, tagliando.
+          </div>
+        </div>
+        <div className="filter-row">
+          {[["all", `Tutti ${TREND_INSIGHTS.length}`],
+            ...(counts.critical ? [["critical", `Critici ${counts.critical}`]] : []),
+            ...(counts.warning ? [["warning", `Avvisi ${counts.warning}`]] : []),
+            ["info", `OK ${counts.info}`]].map(([id, lbl]) => (
+            <button key={id} className={`chip ${filter === id ? "active" : ""}`}
+                    onClick={() => setFilter(id)}>{lbl}</button>
+          ))}
+        </div>
       </div>
 
-      <div>
-        <div className="section-head">
-          <span className="section-title">Insights AI</span>
-          <span className="section-sub">motore a regole — §11 del briefing</span>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 12 }}>
-          {TREND_INSIGHTS.map((ins, i) => <InsightCard key={i} insight={ins} />)}
-        </div>
+      <div className="stagger" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(330px, 1fr))", gap: 12 }}>
+        {shown.map((ins, i) => <InsightCard key={i} insight={ins} />)}
+        {shown.length === 0 && <div className="muted" style={{ padding: 20 }}>Nessun controllo in questa categoria.</div>}
       </div>
 
       <div>
         <div className="section-head">
           <span className="section-title">Insights per viaggio</span>
-          <span className="section-sub">raggruppati cronologicamente</span>
+          <span className="section-sub">solo viaggi con note</span>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          {TRIPS.filter(t => t.insights && t.insights.length > 0).map(t => (
+          {TRIPS.filter(t => t.insights && t.insights.length > 0).slice(0, 20).map(t => (
             <div key={t.id}>
               <div className="row" style={{ marginBottom: 6, color: "var(--fg-2)", fontSize: 12 }}>
                 <span className="mono">{new Date(t.start).toLocaleString("it-IT", { dateStyle: "short", timeStyle: "short" })}</span>
@@ -1211,7 +1207,7 @@ const TrendsView = () => {
                 <span>{t.distanceKm} km · {t.durationMin} min</span>
                 {t.dpfRegenState && <DpfPill state={t.dpfRegenState} />}
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 10 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 10 }}>
                 {t.insights.map((i, idx) => <InsightCard key={idx} insight={i} />)}
               </div>
             </div>
@@ -1391,10 +1387,10 @@ const BottomNav = ({ active, setActive, onMenu }) => {
   const items = [
     { id: "dashboard", icon: "gauge", label: "Home" },
     { id: "trips",     icon: "list",  label: "Viaggi" },
+    { id: "trends",    icon: "trend", label: "Trend" },
     { id: "map",       icon: "map",   label: "Mappa" },
-    { id: "dpf",       icon: "chart", label: "DPF" },
   ];
-  const secondary = ["pids", "myopel", "trends", "admin"];
+  const secondary = ["pids", "myopel", "dpf", "admin"];
   return (
     <nav className="bottom-nav">
       {items.map(it => (

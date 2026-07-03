@@ -499,6 +499,9 @@ const INSIGHT_CAT_LABEL = {
   dpf: "DPF / FAP", fuel: "Carburante", engine: "Motore", battery: "Batteria",
   adblue: "AdBlue", service: "Tagliando",
 };
+const INSIGHT_COLOR = {
+  critical: "var(--crit)", warning: "var(--warn)", info: "var(--accent)",
+};
 const InsightCard = ({ insight }) => {
   const icon = INSIGHT_ICON[insight.category]
             || (insight.level === "critical" || insight.level === "warning" ? "warn" : "info");
@@ -509,6 +512,13 @@ const InsightCard = ({ insight }) => {
         <div className="insight-cat">{INSIGHT_CAT_LABEL[insight.category] || insight.category}</div>
         <div className="insight-title">{insight.title}</div>
         <div className="insight-text">{insight.body}</div>
+        {insight.series && insight.series.length >= 3 && (
+          <div className="insight-spark">
+            <Sparkline data={insight.series} height={34}
+                       color={INSIGHT_COLOR[insight.level] || "var(--accent)"} animate={false} />
+            {insight.unit && <span className="insight-unit mono">{insight.unit}</span>}
+          </div>
+        )}
       </div>
     </div>
   );
