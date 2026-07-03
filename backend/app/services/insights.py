@@ -496,26 +496,82 @@ def cross_trip(trips: list[dict]) -> list[dict]:
              + (" Pianifica il rabbocco per evitare il blocco avviamento." if lvl != "info" else "")),
             [r for _, r in ad_pts], "km"))
 
-    # ── 11. Fuel economy vs history ───────────────────────────────────────────
-    kml_series = [(t.get("start"), k) for t in chrono if (k := _km_l(t)) and 2 < k < 60]
-    if len(kml_series) >= 3:
-        vals = [v for _, v in kml_series]
+    # ── 11. Fuel economy — normalized by route type, traffic-aware ────────────
+    # Raw km/L depends mostly on the *kind* of trip (distance bucket + average
+    # speed). Comparing recent trips only against historical peers of the same
+    # kind separates "more traffic / more urban" (info, not the car's fault)
+    # from "worse at equal conditions" (warning: tyres, air filter, brakes…).
+    def _bucket(km: float):
+        for lo, hi in ((0, 4), (4, 8), (8, 15), (15, 40), (40, 1e9)):
+            if lo <= km < hi:
+                return (lo, hi)
+        return None
+
+    recs = [{"kml": k, "km": t.get("distanceKm") or 0,
+             "spd": t.get("avgSpeedKmh"), "temp": t.get("airTempC"),
+             "start": t.get("start")}
+            for t in chrono if (k := _km_l(t)) and 2 < k < 60]
+    if len(recs) >= 8:
+        vals = [r["kml"] for r in recs]
+        n_recent = 8 if len(recs) >= 25 else 5
+        recent, hist = recs[-n_recent:], recs[:-n_recent]
+        raw_drift = (statistics.median([r["kml"] for r in recent])
+                     / statistics.median([r["kml"] for r in hist]) - 1)
+
+        # normalized drift: each recent trip vs historical peers of the same
+        # distance bucket and comparable average speed (±25 %, min ±6 km/h)
+        deltas = []
+        for r in recent:
+            if not r["spd"]:
+                continue
+            tol = max(6.0, r["spd"] * 0.25)
+            peers = [h["kml"] for h in hist
+                     if h["spd"] and _bucket(h["km"]) == _bucket(r["km"])
+                     and abs(h["spd"] - r["spd"]) <= tol]
+            if len(peers) >= 5:
+                deltas.append(r["kml"] / statistics.median(peers) - 1)
+        norm_drift = statistics.median(deltas) if len(deltas) >= 3 else None
+
+        # context shifts, for the explanation
+        rec_buckets = {_bucket(r["km"]) for r in recent}
+        spd_hist = statistics.median([h["spd"] for h in hist
+                                      if h["spd"] and _bucket(h["km"]) in rec_buckets] or [0])
+        spd_rec = statistics.median([r["spd"] for r in recent if r["spd"]] or [0])
+        t_hist = [h["temp"] for h in hist if h["temp"] is not None]
+        t_rec = [r["temp"] for r in recent if r["temp"] is not None]
+        temp_up = (statistics.median(t_rec) - statistics.median(t_hist)
+                   if t_hist and t_rec else 0)
+
         med = statistics.median(vals)
-        best_v, best_s = max(((v, s) for s, v in kml_series), key=lambda x: x[0])
-        body = (f"Media {med:.1f} km/L su {len(vals)} viaggi · "
-                f"miglior viaggio {best_v:.1f} km/L ({_fmt_date(best_s)}).")
-        level = "info"
-        if len(vals) >= 8:
-            recent = statistics.mean(vals[-5:])
-            older = statistics.mean(vals[:-5])
-            if recent < older * 0.9:
-                level = "warning"
-                body += (f" Ultimi 5 viaggi {recent:.1f} km/L, "
-                         f"{(older-recent)/older*100:.0f}% sotto lo storico ({older:.1f}): "
-                         "controlla pressione gomme, filtro aria o stile di guida.")
-            elif recent > older * 1.08:
-                body += f" In miglioramento: ultimi 5 a {recent:.1f} km/L."
-        out.append(_ins("fuel", level, "Efficienza carburante", body, vals, "km/L"))
+        if norm_drift is not None and norm_drift <= -0.12:
+            out.append(_ins("fuel", "warning", "Consumo alto a parità di percorso",
+                f"Sugli ultimi {n_recent} viaggi il motore rende il {abs(norm_drift)*100:.0f}% in meno "
+                "(km/L) rispetto a viaggi storici dello stesso tipo — stessa distanza e velocità "
+                "media, quindi non è il traffico. Cause tipiche: pressione gomme (controlla a freddo), "
+                "filtro aria, freno che rimane appoggiato, carburante diverso.", vals, "km/L"))
+        elif raw_drift <= -0.10:
+            body = (f"Ultimi {n_recent} viaggi al {abs(raw_drift)*100:.0f}% sotto la tua media "
+                    f"({med:.1f} km/L), ma il percorso spiega la differenza")
+            if norm_drift is not None:
+                body += f": a parità di condizioni il motore è in linea ({norm_drift*100:+.0f}%)"
+            body += "."
+            if spd_hist and spd_rec and spd_rec <= spd_hist * 0.85:
+                body += (f" Velocità media scesa da {spd_hist:.0f} a {spd_rec:.0f} km/h "
+                         "— più traffico o tragitti più urbani.")
+            if temp_up >= 3:
+                body += f" Fa anche più caldo (+{temp_up:.0f}°C): il clima incide in città."
+            out.append(_ins("fuel", "info", "Consumi su, ma è il percorso", body, vals, "km/L"))
+        else:
+            best = max(recs, key=lambda r: r["kml"])
+            body = (f"Media {med:.1f} km/L su {len(vals)} viaggi · "
+                    f"miglior viaggio {best['kml']:.1f} km/L ({_fmt_date(best['start'])}).")
+            if raw_drift >= 0.08:
+                body += f" In miglioramento: ultimi {n_recent} viaggi {raw_drift*100:+.0f}%."
+            out.append(_ins("fuel", "info", "Efficienza carburante", body, vals, "km/L"))
+    elif len(recs) >= 3:
+        vals = [r["kml"] for r in recs]
+        out.append(_ins("fuel", "info", "Efficienza carburante",
+            f"Media {statistics.median(vals):.1f} km/L su {len(vals)} viaggi.", vals, "km/L"))
 
     # ── 12. Fuel cost ─────────────────────────────────────────────────────────
     costed = [t for t in chrono if t.get("costEur") and t.get("distanceKm")]
