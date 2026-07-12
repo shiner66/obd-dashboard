@@ -493,11 +493,11 @@ const TripCard = ({ trip, active, onClick }) => {
 /* ============== Insight card ============== */
 const INSIGHT_ICON = {
   dpf: "filter", fuel: "fuel", engine: "engine", battery: "battery",
-  adblue: "droplet", service: "wrench",
+  adblue: "droplet", service: "wrench", tyres: "gauge",
 };
 const INSIGHT_CAT_LABEL = {
   dpf: "DPF / FAP", fuel: "Carburante", engine: "Motore", battery: "Batteria",
-  adblue: "AdBlue", service: "Tagliando",
+  adblue: "AdBlue", service: "Tagliando", tyres: "Gomme",
 };
 const INSIGHT_COLOR = {
   critical: "var(--crit)", warning: "var(--warn)", info: "var(--accent)",

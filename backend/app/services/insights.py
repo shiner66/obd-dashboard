@@ -238,6 +238,23 @@ def per_trip(trip: dict, ctx: dict | None = None) -> list[dict]:
         out.append(_ins("engine", "warning", "Stop&Start — guasto",
             "Il sistema Stop&Start ha riportato un guasto. Diagnostica consigliata."))
 
+    # ── Idle share (OBD-derived, §3) ─────────────────────────────────────────
+    idle_share = trip.get("idleSharePct")
+    idle_s = trip.get("idleSeconds") or 0
+    if idle_share is not None and idle_share >= 20 and idle_s >= 120:
+        gtxt = f", ~{trip['idleFuelG']:.0f} g bruciati fermo" if trip.get("idleFuelG") else ""
+        out.append(_ins("fuel", "info", f"Molto tempo al minimo · {idle_share:.0f}%",
+            f"{idle_s/60:.0f} min a motore acceso e fermo{gtxt}. In città il minimo pesa "
+            "sul consumo: spegnere il motore alle soste lunghe aiuta."))
+
+    # ── A/C usage (compressor solenoid current, §2) ──────────────────────────
+    ac_share = trip.get("acActivePct")
+    if ac_share is not None and ac_share >= 40:
+        out.append(_ins("fuel", "info", f"Clima attivo · {ac_share:.0f}% del viaggio",
+            f"Compressore inserito per gran parte del tragitto (corrente media "
+            f"{trip.get('acCurrentMa') or 0:.0f} mA). Il pacchetto clima costa ~0,1 L/h: "
+            "in coda o in città incide sui consumi più che in autostrada."))
+
     return out
 
 
@@ -609,6 +626,57 @@ def cross_trip(trips: list[dict]) -> list[dict]:
                 f"Prossimo tra {km_svc:,.0f} km".replace(",", ".")
                 + (f" / {days_svc} giorni" if days_svc else "")
                 + (f" — al tuo ritmo {eta}" if eta else "") + "."))
+
+    # ── 14. Fuel economy in mass (g/km) — density-independent, OBD-only ───────
+    # km/L and L/100 assume diesel density; with HVO (~780 g/L) they mislead.
+    # g/km comes straight from the injector-mass integral (§2) and is immune to
+    # the fuel blend — the honest cross-fuel economy number, no MyOpel needed.
+    gkm_pts = [(d, t["gPerKm"]) for t in obd
+               if t.get("gPerKm") and 20 < t["gPerKm"] < 200
+               and (d := _parse_dt(t.get("start")))]
+    if len(gkm_pts) >= 8:
+        vals = [g for _, g in gkm_pts]
+        med = statistics.median(vals)
+        recent = statistics.median(vals[-8:])
+        drift = (recent / med - 1) if med else 0
+        l100_b7  = med / 835.0 * 100
+        l100_hvo = med / 780.0 * 100
+        body = (f"Consumo in massa {med:.0f} g/km (mediana su {len(vals)} viaggi) — "
+                f"indipendente dalla densità. Equivale a {l100_b7:.1f} L/100 km con gasolio B7 "
+                f"o {l100_hvo:.1f} L/100 km con HVO. La pompa resta il riferimento volumetrico.")
+        if drift >= 0.12:
+            out.append(_ins("fuel", "warning", f"Consumo in massa in aumento · {recent:.0f} g/km",
+                body + f" Ultimi 8 viaggi +{drift*100:.0f}% sulla mediana.", vals, "g/km"))
+        else:
+            out.append(_ins("fuel", "info", f"Consumo in massa · {med:.0f} g/km", body, vals, "g/km"))
+
+    # ── 15. Tyre-pressure monitor via wheel/GPS speed ratio (§3) ──────────────
+    # ratio_wg = wheel speed / GPS speed. Deflation shrinks the rolling radius →
+    # the wheel turns faster for the same ground speed → the ratio drifts up.
+    # Alert on a > +0.3% rise over ~4 weeks (≈ −0.4/0.5 bar). Only per-trip
+    # ratios with ≥ 60 samples reach here, so a short log can't fake a spike.
+    ratio_pts = [(d, t["ratioWg"]) for t in obd
+                 if t.get("ratioWg") and 0.95 < t["ratioWg"] < 1.05
+                 and (d := _parse_dt(t.get("start")))]
+    if len(ratio_pts) >= 8 and (ratio_pts[-1][0] - ratio_pts[0][0]).days >= 21:
+        t0 = ratio_pts[0][0]
+        xs = [(d - t0).days for d, _ in ratio_pts]
+        ys = [r for _, r in ratio_pts]
+        fit = _linreg(xs, ys)
+        series = [r * 1000 for r in ys]   # ×1000 so the sparkline shows the sub-% drift
+        if fit:
+            drift_4w = fit[0] * 28 / statistics.median(ys) * 100   # % change over 28 days
+            if drift_4w >= 0.30:
+                out.append(_ins("tyres", "warning", "Possibile calo pressione gomme",
+                    f"Il rapporto ruota/GPS sale di +{drift_4w:.2f}% su 4 settimane: compatibile "
+                    "con uno sgonfiamento gomme (≈ −0,4/0,5 bar). Controlla la pressione a freddo "
+                    "col manometro — questo monitor rileva le variazioni, non una pressione bassa costante.",
+                    series, "‰"))
+            else:
+                out.append(_ins("tyres", "info", "Gomme · pressione stabile",
+                    f"Rapporto ruota/GPS senza deriva significativa ({drift_4w:+.2f}%/4 settimane "
+                    f"su {len(ys)} viaggi). Nessun segnale di sgonfiamento; il manometro resta "
+                    "l'unico test assoluto.", series, "‰"))
 
     out.sort(key=lambda i: _LEVEL_RANK.get(i.get("level"), 3))
     return out

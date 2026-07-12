@@ -1,6 +1,7 @@
 /* global React, Icon, Sparkline, LineChart, RadialGauge, TripMap,
           DpfPill, AlertChip, StatCard, TripCard, InsightCard,
           VEHICLE, TRIPS, ALERTS, TREND_INSIGHTS, PID_CATALOG, PID_GROUPS,
+          SETTINGS, FUEL, AnimatedBar,
           TweaksPanel, useTweaks, TweakSection, TweakRadio, TweakColor,
           TweakToggle, TweakSlider, TweakSelect */
 const { useState, useMemo, useEffect, useRef } = React;
@@ -59,6 +60,11 @@ const pickSeries = (trip, slugs) => slugs.map(s => trip?.pidSeriesFull?.[s]).fin
 
 const fmtInt = (n) => n?.toLocaleString?.("it-IT") ?? "—";
 
+/* Where the current fuel level came from — MyOpel, the OBD sender, or the
+   refuel ledger − OBD consumption estimate. */
+const FUEL_SOURCE_LABEL = { myopel: "MyOpel", obd: "sonda OBD", ledger: "ledger − consumi" };
+const fuelSourceLabel = (src) => FUEL_SOURCE_LABEL[src] || null;
+
 /* ============== Top bar ============== */
 const exportTrips = async () => {
   try {
@@ -101,15 +107,17 @@ const TopBar = ({ view, onMenu }) => {
 /* ============== Sidebar ============== */
 const Sidebar = ({ active, setActive }) => {
   const usefulPids = PID_CATALOG.filter(p => p.useful !== false).length;
+  const myopOn = VEHICLE.myopEnabled !== false;
   const items = [
     { id: "dashboard", icon: "gauge",    label: "Dashboard" },
     { id: "trips",     icon: "list",     label: "Viaggi",       badge: TRIPS.length },
     { id: "map",       icon: "map",      label: "Mappa" },
+    { id: "fuel",      icon: "droplet",  label: "Carburante" },
     { id: "pids",      icon: "pid",      label: "PID Explorer", badge: usefulPids },
     { id: "dpf",       icon: "chart",    label: "DPF / FAP" },
-    { id: "myopel",    icon: "fuel",     label: "MyOpel" },
+    { id: "myopel",    icon: "fuel",     label: myopOn ? "MyOpel" : "MyOpel · off" },
     { id: "trends",    icon: "trend",    label: "Trend & AI" },
-    { id: "admin",     icon: "gauge",    label: "Admin" },
+    { id: "admin",     icon: "settings", label: "Admin" },
   ];
 
   // Trip counts
@@ -247,8 +255,10 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
         <div className="hero-gauges">
           <div className="hg">
             <RadialGauge value={VEHICLE.fuelLevel ?? 0} max={100} label="%" thresholds={false} />
-            <div className="hg-lbl">Serbatoio</div>
-            <div className="hg-sub mono">{fmtInt(VEHICLE.fuelAutonomy)} km</div>
+            <div className="hg-lbl">Serbatoio{fuelSourceLabel(VEHICLE.fuelSource) ? ` · ${fuelSourceLabel(VEHICLE.fuelSource)}` : ""}</div>
+            <div className="hg-sub mono">
+              {VEHICLE.fuelLiters != null ? `${VEHICLE.fuelLiters} L · ` : ""}{fmtInt(VEHICLE.fuelAutonomy)} km
+            </div>
           </div>
           <div className="hg">
             <RadialGauge value={VEHICLE.dpfClosedSoot ?? 0} max={10} label="g/L" strokeColor="var(--warn)" decimals={1} />
@@ -1030,6 +1040,245 @@ const DpfView = () => {
   );
 };
 
+/* ============== Carburante (Fuel) view ============== */
+/* Refuel ledger + fuel-level-by-subtraction — works with the MyOpel feed off.
+   The level is reconstructed from the last full-tank refuel minus OBD-measured
+   consumption ("soluzione estrema"); tank-to-tank economy is pump litres over
+   odometer km, refuel-to-refuel only (briefing §1). */
+const FUEL_TYPES = ["B7", "HVO"];
+
+const RefuelForm = ({ onAdd }) => {
+  const lastOdo = VEHICLE.odometer || "";
+  const [f, setF] = useState({
+    ts: new Date().toISOString().slice(0, 16),
+    odometerKm: lastOdo, liters: "", pricePerL: "", fuelType: "B7",
+    fullTank: true, note: "",
+  });
+  const [busy, setBusy] = useState(false);
+  const set = (k, v) => setF(s => ({ ...s, [k]: v }));
+
+  const submit = async () => {
+    if (!f.liters) { alert("Inserisci i litri erogati."); return; }
+    setBusy(true);
+    try {
+      const body = {
+        ts: f.ts ? f.ts.replace("T", " ") + ":00" : null,
+        odometerKm: f.odometerKm === "" ? null : parseFloat(f.odometerKm),
+        liters: parseFloat(f.liters),
+        pricePerL: f.pricePerL === "" ? null : parseFloat(f.pricePerL),
+        fuelType: f.fuelType, fullTank: f.fullTank, note: f.note || null,
+      };
+      const r = await fetch("/api/v1/refuels", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+      set("liters", ""); set("pricePerL", ""); set("note", "");
+      onAdd();
+    } catch (e) { alert("Errore: " + e.message); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="card fuel-form">
+      <div className="section-head" style={{ marginBottom: 10 }}>
+        <span className="section-title">Registra rifornimento</span>
+        <span className="section-sub">ancora il modello del serbatoio</span>
+      </div>
+      <div className="form-grid">
+        <label className="form-field"><span>Data / ora</span>
+          <input type="datetime-local" value={f.ts} onChange={e => set("ts", e.target.value)} /></label>
+        <label className="form-field"><span>Odometro (km)</span>
+          <input type="number" inputMode="decimal" value={f.odometerKm}
+                 onChange={e => set("odometerKm", e.target.value)} placeholder="es. 50210" /></label>
+        <label className="form-field"><span>Litri erogati *</span>
+          <input type="number" inputMode="decimal" step="0.01" value={f.liters}
+                 onChange={e => set("liters", e.target.value)} placeholder="es. 32.14" /></label>
+        <label className="form-field"><span>Prezzo €/L</span>
+          <input type="number" inputMode="decimal" step="0.001" value={f.pricePerL}
+                 onChange={e => set("pricePerL", e.target.value)} placeholder="es. 1.899" /></label>
+        <label className="form-field"><span>Carburante</span>
+          <select value={f.fuelType} onChange={e => set("fuelType", e.target.value)}>
+            {FUEL_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+          </select></label>
+        <label className="form-field"><span>Note</span>
+          <input type="text" value={f.note} onChange={e => set("note", e.target.value)} placeholder="opzionale" /></label>
+      </div>
+      <div className="row" style={{ gap: 14, marginTop: 12, flexWrap: "wrap" }}>
+        <label className="check-inline">
+          <input type="checkbox" checked={f.fullTank} onChange={e => set("fullTank", e.target.checked)} />
+          <span>Pieno completo <span className="muted">(necessario per la resa tank-to-tank)</span></span>
+        </label>
+        <span style={{ flex: 1 }} />
+        <button className="btn-primary" onClick={submit} disabled={busy}>
+          {busy ? "…" : "Aggiungi rifornimento"}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const FuelView = () => {
+  const [data, setData] = useState(null);
+  const load = () => fetch("/api/v1/fuel").then(r => r.ok ? r.json() : null).then(setData).catch(() => {});
+  useEffect(() => { load(); }, []);
+
+  const level = data?.level || {};
+  const refuels = data?.refuels || [];
+  const t2t = data?.tankToTank || [];
+  const suspects = data?.fcSuspects || [];
+  const cap = data?.capacityL || 43.5;
+  const pct = level.pct;
+  const since = level.sinceRefuel;
+
+  const del = async (id) => {
+    if (!confirm("Eliminare questo rifornimento?")) return;
+    await fetch(`/api/v1/refuels/${id}`, { method: "DELETE" });
+    load();
+  };
+
+  const avgKmL = t2t.length ? (t2t.reduce((a, x) => a + x.kmL, 0) / t2t.length) : null;
+
+  return (
+    <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {/* ── Current level (OBD-native, no MyOpel needed) ── */}
+      <div style={{ display: "grid", gridTemplateColumns: "260px 1fr", gap: 16, alignItems: "stretch" }}
+           className="fuel-hero">
+        <div className="card" style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, justifyContent: "center" }}>
+          <RadialGauge value={pct ?? 0} max={100} label="%" thresholds={false} />
+          <div className="hg-lbl">Livello stimato</div>
+          <div className="hg-sub mono">
+            {level.liters != null ? `${level.liters} / ${cap} L` : "—"}
+          </div>
+          <div className="src-chip">
+            {level.source === "ledger" ? "ledger − consumi OBD" :
+             level.source === "obd" ? "sonda OBD" :
+             level.source === "myopel" ? "MyOpel" : "nessuna sorgente"}
+          </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div className="stat-grid" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
+            <StatCard icon="droplet" label="Litri stimati nel serbatoio"
+                      value={level.liters != null ? level.liters : "—"} unit="L"
+                      sub={`capacità utile ${cap} L`} />
+            <StatCard icon="road" label="Dall'ultimo pieno"
+                      value={since?.km != null ? since.km.toFixed(0) : "—"} unit="km"
+                      sub={since?.litersBurned != null ? `${since.litersBurned} L bruciati (OBD)` : "—"} />
+            <StatCard icon="fuel" label="Consumo dall'ultimo pieno"
+                      value={since?.kmL != null ? since.kmL.toFixed(1) : "—"} unit="km/L"
+                      sub={since?.l100 != null ? `≈ ${since.l100.toFixed(1)} L/100 km` : undefined} />
+          </div>
+          {level.source !== "myopel" && level.obdPct != null && (
+            <div className="muted" style={{ fontSize: 12 }}>
+              Sonda OBD (<span className="mono">[ECM] Fuel tank level</span>): <b>{level.obdPct}%</b>
+              {pct != null && ` · stima ledger: ${pct}% — usa la sonda come controllo incrociato.`}
+            </div>
+          )}
+          <div className="muted" style={{ fontSize: 12, lineHeight: 1.5 }}>
+            Il livello è ricostruito dall'ultimo <b>pieno completo</b> meno il carburante
+            misurato dall'OBD su ogni viaggio successivo. Registra i pieni qui sotto: bastano
+            due pieni completi consecutivi per avere anche la resa reale tank-to-tank.
+          </div>
+        </div>
+      </div>
+
+      <RefuelForm onAdd={load} />
+
+      {/* ── Tank-to-tank economy ── */}
+      {t2t.length > 0 && (
+        <div>
+          <div className="section-head">
+            <span className="section-title">Resa tank-to-tank</span>
+            <span className="section-sub">litri pompa ÷ km odometro · pieno-a-pieno (briefing §1)</span>
+            {avgKmL != null && (
+              <><span style={{ flex: 1 }} />
+                <span className="big-num" style={{ fontSize: 22 }}>{avgKmL.toFixed(1)}<span className="unit">km/L medi</span></span></>
+            )}
+          </div>
+          <div className="table-wrap card-flat">
+            <table className="data-table">
+              <thead><tr>
+                <th>Periodo</th><th className="num">km</th><th className="num">Litri</th>
+                <th className="num">km/L</th><th className="num">L/100</th>
+                <th>Carburante</th><th className="num">€/km</th>
+              </tr></thead>
+              <tbody>
+                {t2t.map((x, i) => (
+                  <tr key={i}>
+                    <td className="mono muted" style={{ fontSize: 12 }}>{fmtInt(x.fromOdo)} → {fmtInt(x.toOdo)}</td>
+                    <td className="num mono">{x.km.toFixed(1)}</td>
+                    <td className="num mono">{x.liters.toFixed(2)}</td>
+                    <td className="num mono" style={{ fontWeight: 600 }}>{x.kmL.toFixed(2)}</td>
+                    <td className="num mono">{x.l100.toFixed(2)}</td>
+                    <td><span className="src-tag" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{x.fuelType || "—"}</span></td>
+                    <td className="num mono">{x.eurKm != null ? `€${x.eurKm.toFixed(3)}` : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+            La resa è attribuita al carburante che era <i>nel</i> serbatoio (immesso al pieno
+            precedente): con HVO (~780 g/L) il contatore volumetrico ECU sottostima ~4-6%, la pompa resta il riferimento.
+          </div>
+        </div>
+      )}
+
+      {/* ── Refuel ledger ── */}
+      <div>
+        <div className="section-head">
+          <span className="section-title">Rifornimenti registrati</span>
+          <span className="section-sub">{refuels.length} · ordinati per odometro</span>
+        </div>
+        {refuels.length === 0 ? (
+          <div className="card muted" style={{ padding: 16 }}>
+            Nessun rifornimento. Aggiungi almeno un <b>pieno completo</b> per iniziare a stimare il livello.
+          </div>
+        ) : (
+          <div className="table-wrap card-flat">
+            <table className="data-table">
+              <thead><tr>
+                <th>Data</th><th className="num">Odometro</th><th className="num">Litri</th>
+                <th className="num">€/L</th><th>Tipo</th><th>Pieno</th><th>Note</th><th></th>
+              </tr></thead>
+              <tbody>
+                {[...refuels].reverse().map(r => (
+                  <tr key={r.id}>
+                    <td className="mono" style={{ fontSize: 12 }}>{r.ts ? r.ts.slice(0, 16).replace("T", " ") : "—"}</td>
+                    <td className="num mono">{r.odometerKm != null ? fmtInt(Math.round(r.odometerKm)) : "—"}</td>
+                    <td className="num mono">{r.liters?.toFixed(2) ?? "—"}</td>
+                    <td className="num mono">{r.pricePerL != null ? `€${r.pricePerL}` : "—"}</td>
+                    <td>{r.fuelType || "—"}</td>
+                    <td>{r.fullTank ? "✓" : "parziale"}</td>
+                    <td className="muted" style={{ fontSize: 12 }}>{r.note || ""}</td>
+                    <td className="num"><button className="link-del" onClick={() => del(r.id)}>elimina</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ── Stale fuelConsumption suspects (§1 API bug) ── */}
+      {suspects.length > 0 && (
+        <div className="card" style={{ borderLeft: "3px solid var(--warn)" }}>
+          <div className="section-title" style={{ marginBottom: 6 }}>Valori MyOpel sospetti (§1)</div>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+            {suspects.length} viaggi con fuelConsumption quasi identico al precedente su &gt;5 km —
+            l'API Stellantis a volte restituisce il valore in cache. Da validare con l'integrale OBD.
+          </div>
+          {suspects.slice(0, 8).map((s, i) => (
+            <div key={i} className="mono" style={{ fontSize: 12 }}>
+              {s.start?.slice(0, 16).replace("T", " ")} · {s.km} km · Δ {s.deltaUl} µL
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 /* ============== MyOpel view ============== */
 const MyOpelView = () => {
   const myop = TRIPS.filter(t => t.sources.includes("myopel")).sort((a, b) => b.start.localeCompare(a.start));
@@ -1262,6 +1511,77 @@ const StoragePanel = () => {
   );
 };
 
+/* ============== Settings panel (MyOpel toggle, tank capacity) ============== */
+const SettingsPanel = () => {
+  const s = typeof SETTINGS !== "undefined" ? SETTINGS : {};
+  const [myopOn, setMyopOn] = useState(s.myop_enabled !== false);
+  const [cap, setCap] = useState(s.tank_capacity_l ?? 43.5);
+  const [busy, setBusy] = useState(false);
+
+  const save = async (patch, reload) => {
+    setBusy(true);
+    try {
+      const r = await fetch("/api/v1/settings", {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      if (!r.ok) throw new Error(r.statusText);
+      if (reload) location.reload();
+    } catch (e) { alert("Errore: " + e.message); }
+    finally { setBusy(false); }
+  };
+
+  const toggleMyop = () => {
+    const next = !myopOn;
+    setMyopOn(next);
+    // Full reload: the toggle changes the whole dashboard's data source.
+    save({ myop_enabled: next }, true);
+  };
+
+  return (
+    <div style={{ marginBottom: 24 }}>
+      <div className="section-head">
+        <span className="section-title">Impostazioni piattaforma</span>
+        <span className="section-sub">sorgente dati &amp; serbatoio</span>
+      </div>
+      <div className="card" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+        <div className="row" style={{ gap: 14, alignItems: "flex-start" }}>
+          <button className={`switch ${myopOn ? "on" : ""}`} onClick={toggleMyop} disabled={busy}
+                  role="switch" aria-checked={myopOn} title="Attiva/disattiva la sorgente MyOpel">
+            <span className="knob" />
+          </button>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 600 }}>Sorgente MyOpel (.myop)</div>
+            <div className="muted" style={{ fontSize: 12, lineHeight: 1.5, marginTop: 2 }}>
+              {myopOn
+                ? "Attiva: i file .myop vengono importati e usati per livello carburante, costi e service."
+                : "Disattivata: la piattaforma gira in modalità solo-OBD. Livello carburante da sonda OBD + ledger rifornimenti, service dalla distanza al cambio olio."}
+              {" "}I viaggi .myop già importati restano consultabili.
+            </div>
+          </div>
+          <span className={`state-tag ${myopOn ? "ok" : "off"}`}>{myopOn ? "ON" : "OFF"}</span>
+        </div>
+
+        <div className="divider" />
+
+        <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <label className="form-field" style={{ maxWidth: 180 }}>
+            <span>Capacità utile serbatoio (L)</span>
+            <input type="number" step="0.1" value={cap} onChange={e => setCap(e.target.value)} />
+          </label>
+          <button className="icon-btn" disabled={busy}
+                  onClick={() => save({ tank_capacity_l: parseFloat(cap) }, true)}>
+            Salva capacità
+          </button>
+          <span className="muted" style={{ fontSize: 12, alignSelf: "center" }}>
+            Riferimento validato: ~43,5 L (0,435 L per punto %).
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const AdminView = () => {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -1297,6 +1617,7 @@ const AdminView = () => {
 
   return (
     <div className="page-single" style={{ maxWidth: 900 }}>
+      <SettingsPanel />
       <StoragePanel />
 
       <div className="section-head">
@@ -1390,7 +1711,7 @@ const BottomNav = ({ active, setActive, onMenu }) => {
     { id: "trends",    icon: "trend", label: "Trend" },
     { id: "map",       icon: "map",   label: "Mappa" },
   ];
-  const secondary = ["pids", "myopel", "dpf", "admin"];
+  const secondary = ["fuel", "pids", "myopel", "dpf", "admin"];
   return (
     <nav className="bottom-nav">
       {items.map(it => (
@@ -1432,11 +1753,12 @@ const App = () => {
     dashboard: "Dashboard",
     trips: "Viaggi",
     map: "Mappa GPS",
+    fuel: "Carburante · Serbatoio & Rifornimenti",
     pids: "PID Explorer",
     dpf: "DPF / FAP",
     myopel: "MyOpel · Stellantis",
     trends: "Trend & AI Insights",
-    admin: "Admin · Diagnostica",
+    admin: "Admin · Impostazioni",
   };
 
   // keyboard nav
@@ -1469,6 +1791,7 @@ const App = () => {
             {view === "dashboard" && <Dashboard setActive={setView} setSelectedTripId={setSelectedTripId} />}
             {view === "trips"     && <TripsView selectedId={selectedTripId} setSelectedId={setSelectedTripId} />}
             {view === "map"       && <MapView />}
+            {view === "fuel"      && <FuelView />}
             {view === "pids"      && <PidExplorer />}
             {view === "dpf"       && <DpfView />}
             {view === "myopel"    && <MyOpelView />}

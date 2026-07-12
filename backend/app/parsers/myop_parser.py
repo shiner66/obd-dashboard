@@ -196,8 +196,10 @@ def _parse_trip(raw: dict, vin: str) -> dict:
 
     travel_s   = raw.get("travelTime", 0) or 0
     distance   = raw.get("distance", 0.0) or 0.0
-    fuel_raw   = raw.get("fuelConsumption", 0) or 0   # divide by 1_000_000 → litres
-    fuel_l     = fuel_raw / 1_000_000
+    # fuelConsumption is per-trip microlitres (briefing §1). Keep the raw µL so no
+    # precision is lost; litres is only a display convenience derived from it.
+    fuel_ul    = int(raw.get("fuelConsumption", 0) or 0)
+    fuel_l     = fuel_ul / 1_000_000
     price_fuel = raw.get("priceFuel")
     alerts_raw = raw.get("alerts") or []
 
@@ -216,6 +218,7 @@ def _parse_trip(raw: dict, vin: str) -> dict:
         "distanceKm":        round(distance, 2),
         "avgSpeedKmh":       round(avg_speed, 1) if avg_speed else None,
         "fuelConsumedL":     round(fuel_l, 3),
+        "myopFuelUl":        fuel_ul,
         "consumptionL100km": round(l100km, 2) if l100km else None,
         "fuelLevel":         raw.get("fuelLevel"),
         "fuelAutonomy":      raw.get("fuelAutonomy"),

@@ -35,7 +35,33 @@ def init(db_path: str | Path) -> None:
             con.execute("ALTER TABLE trips ADD COLUMN myop_leg_ids TEXT DEFAULT NULL")
         if "myop_distance_km" not in existing:
             con.execute("ALTER TABLE trips ADD COLUMN myop_distance_km REAL DEFAULT NULL")
+        # OBD-native replacements for MyOpel fields + briefing §2/§3 metrics.
+        for col, decl in _EXTRA_TRIP_COLUMNS:
+            if col not in existing:
+                con.execute(f"ALTER TABLE trips ADD COLUMN {col} {decl}")
     _run_data_migrations()
+
+
+# Columns added after the original schema — OBD-native fuel/service fields and
+# the briefing's derived per-trip metrics (§2 mass-based fuel, §3 idle / speed
+# bands / wheel-vs-GPS ratio). Kept as an idempotent ALTER list so an existing
+# DB upgrades in place without a destructive migration.
+_EXTRA_TRIP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("fuel_level_obd",      "REAL"),      # [ECM] Fuel tank level, % — OBD twin of myop_fuel_level
+    ("oil_km_to_service",   "REAL"),      # [ECM] Distance until next oil change — OBD twin of kmToService
+    ("fuel_mass_g",         "REAL"),      # §2 injector-mass integral, grams
+    ("g_per_km",            "REAL"),      # §2 mass consumption, density-independent
+    ("fuel_validation_gl",  "REAL"),      # fuel_mass_g / litres → should sit near 835 g/L
+    ("ac_current_ma",       "REAL"),      # §2 mean A/C compressor solenoid current
+    ("ac_active_pct",       "REAL"),      # §2 share of samples with A/C engaged (>300 mA)
+    ("idle_seconds",        "REAL"),      # §3 seconds spent below ~2 km/h with engine on
+    ("idle_share_pct",      "REAL"),      # §3 idle share of engine-on time
+    ("idle_fuel_g",         "REAL"),      # §3 grams burned at idle
+    ("speed_bands_json",    "TEXT"),      # §3 {band: km} distance split by speed band
+    ("ratio_wg",            "REAL"),      # §3 median wheel-speed / GPS-speed (tyre monitor)
+    ("fc_suspect",          "INTEGER"),   # §1 stale MyOpel fuelConsumption flag
+    ("myop_fuel_ul",        "INTEGER"),   # §1 raw MyOpel fuelConsumption, microlitres
+)
 
 
 # ── Data migrations (tracked via PRAGMA user_version) ─────────────────────────
@@ -526,6 +552,29 @@ CREATE TABLE IF NOT EXISTS ingested_files (
     archived_as TEXT,              -- path relative to the watch dir, if archived
     ingested_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Simple key/value app settings (JSON-encoded values). Lets the user flip
+-- runtime options — e.g. disable the MyOpel source — without a restart.
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT,              -- JSON-encoded
+    updated_at  TEXT DEFAULT (datetime('now'))
+);
+
+-- Manual refuel ledger. The fuel-level-by-subtraction engine (services/fuel.py)
+-- walks these fills together with OBD-measured consumption to reconstruct the
+-- tank level and true tank-to-tank economy — no MyOpel required.
+CREATE TABLE IF NOT EXISTS refuels (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT,              -- ISO local datetime of the fill
+    odometer_km REAL,              -- odometer reading at the pump
+    liters      REAL,              -- litres dispensed (pump ground truth)
+    price_per_l REAL,              -- €/L, optional
+    fuel_type   TEXT,              -- 'B7' | 'HVO' | free text
+    full_tank   INTEGER DEFAULT 1, -- 1 = filled to full (anchors the tank model)
+    note        TEXT,
+    created_at  TEXT DEFAULT (datetime('now'))
+);
 """
 
 
@@ -556,6 +605,86 @@ def ledger_stats() -> dict:
         """).fetchone()
     return {"files": row["n"], "original_bytes": row["original_bytes"],
             "archived": row["archived"] or 0}
+
+
+# ── Settings (key/value, JSON-encoded) ────────────────────────────────────────
+
+def get_setting(key: str, default=None):
+    with _conn() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    if row is None or row["value"] is None:
+        return default
+    try:
+        return json.loads(row["value"])
+    except (ValueError, TypeError):
+        return default
+
+
+def set_setting(key: str, value) -> None:
+    with _conn() as con:
+        con.execute("""
+            INSERT INTO settings (key, value, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """, (key, json.dumps(value)))
+
+
+def get_all_settings() -> dict:
+    with _conn() as con:
+        rows = con.execute("SELECT key, value FROM settings").fetchall()
+    out: dict = {}
+    for r in rows:
+        try:
+            out[r["key"]] = json.loads(r["value"]) if r["value"] is not None else None
+        except (ValueError, TypeError):
+            out[r["key"]] = None
+    return out
+
+
+# ── Refuel ledger ─────────────────────────────────────────────────────────────
+
+def add_refuel(entry: dict) -> dict:
+    with _conn() as con:
+        cur = con.execute("""
+            INSERT INTO refuels (ts, odometer_km, liters, price_per_l, fuel_type, full_tank, note)
+            VALUES (?,?,?,?,?,?,?)
+        """, (
+            entry.get("ts"),
+            entry.get("odometerKm"),
+            entry.get("liters"),
+            entry.get("pricePerL"),
+            entry.get("fuelType"),
+            1 if entry.get("fullTank", True) else 0,
+            entry.get("note"),
+        ))
+        rid = cur.lastrowid
+        row = con.execute("SELECT * FROM refuels WHERE id=?", (rid,)).fetchone()
+    return _row_to_refuel(dict(row))
+
+
+def get_refuels() -> list[dict]:
+    with _conn() as con:
+        rows = con.execute("SELECT * FROM refuels ORDER BY odometer_km, ts").fetchall()
+    return [_row_to_refuel(dict(r)) for r in rows]
+
+
+def delete_refuel(refuel_id: int) -> None:
+    with _conn() as con:
+        con.execute("DELETE FROM refuels WHERE id=?", (refuel_id,))
+
+
+def _row_to_refuel(row: dict) -> dict:
+    return {
+        "id":         row["id"],
+        "ts":         row.get("ts"),
+        "odometerKm": row.get("odometer_km"),
+        "liters":     row.get("liters"),
+        "pricePerL":  row.get("price_per_l"),
+        "fuelType":   row.get("fuel_type"),
+        "fullTank":   bool(row.get("full_tank")),
+        "note":       row.get("note"),
+        "createdAt":  row.get("created_at"),
+    }
 
 
 def upsert_pid_catalog(entries: list[dict]) -> None:
@@ -707,6 +836,32 @@ def save_trip(trip: dict) -> None:
             _pack_json(trip.get("pidSeriesFull")),
             _j(trip.get("insights", [])),
             trip.get("vin"),
+        ))
+
+        # OBD-native + derived metrics (added after the base schema).
+        con.execute("""
+            UPDATE trips SET
+                fuel_level_obd=?, oil_km_to_service=?, fuel_mass_g=?, g_per_km=?,
+                fuel_validation_gl=?, ac_current_ma=?, ac_active_pct=?,
+                idle_seconds=?, idle_share_pct=?, idle_fuel_g=?, speed_bands_json=?,
+                ratio_wg=?, fc_suspect=?, myop_fuel_ul=?
+            WHERE id=?
+        """, (
+            trip.get("fuelLevelObd"),
+            trip.get("oilKmToService"),
+            trip.get("fuelMassG"),
+            trip.get("gPerKm"),
+            trip.get("fuelValidationGL"),
+            trip.get("acCurrentMa"),
+            trip.get("acActivePct"),
+            trip.get("idleSeconds"),
+            trip.get("idleSharePct"),
+            trip.get("idleFuelG"),
+            _j(trip.get("speedBandsKm")),
+            trip.get("ratioWg"),
+            1 if trip.get("fcSuspect") else (0 if trip.get("fcSuspect") is not None else None),
+            trip.get("myopFuelUl"),
+            trip.get("id"),
         ))
 
 
@@ -964,6 +1119,21 @@ def _row_to_trip(row: dict) -> dict:
         "fuelLevel":             row.get("myop_fuel_level"),
         "fuelAutonomy":          row.get("myop_fuel_autonomy"),
         "priceFuel":             row.get("myop_price_fuel"),
+        # OBD-native replacements for MyOpel fields + briefing §2/§3 metrics
+        "fuelLevelObd":          row.get("fuel_level_obd"),
+        "oilKmToService":        row.get("oil_km_to_service"),
+        "fuelMassG":             row.get("fuel_mass_g"),
+        "gPerKm":                row.get("g_per_km"),
+        "fuelValidationGL":      row.get("fuel_validation_gl"),
+        "acCurrentMa":           row.get("ac_current_ma"),
+        "acActivePct":           row.get("ac_active_pct"),
+        "idleSeconds":           row.get("idle_seconds"),
+        "idleSharePct":          row.get("idle_share_pct"),
+        "idleFuelG":             row.get("idle_fuel_g"),
+        "speedBandsKm":          _j("speed_bands_json"),
+        "ratioWg":               row.get("ratio_wg"),
+        "fcSuspect":             (bool(row["fc_suspect"]) if row.get("fc_suspect") is not None else None),
+        "myopFuelUl":            row.get("myop_fuel_ul"),
         "costEur":               (row["myop_fuel_consumed_l"] * row["myop_price_fuel"]
                                    if row.get("myop_fuel_consumed_l") and row.get("myop_price_fuel")
                                    else None),

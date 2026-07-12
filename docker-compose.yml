@@ -19,6 +19,11 @@ services:
       OBD_FILES_DIR:  /data/obd
       MYOP_FILES_DIR: /data/myop
       DB_PATH:        /data/db/trips.db
+      # Set MYOP_ENABLED=false to run OBD-only (fuel level from the OBD sender +
+      # refuel ledger, service from the oil-change distance). Also toggleable at
+      # runtime under Admin → Impostazioni. TANK_CAPACITY_L feeds the fuel model.
+      MYOP_ENABLED:    "true"
+      TANK_CAPACITY_L: "43.5"
     volumes:
       - obd_files:/data/obd
       - myop_files:/data/myop

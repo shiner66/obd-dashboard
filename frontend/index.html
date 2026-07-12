@@ -30,10 +30,13 @@
     if (typeof TRIPS === 'undefined') {
       var TRIPS = [], ALERTS = {}, TREND_INSIGHTS = [], PID_CATALOG = [], PID_GROUPS = {}, POINTS = {};
       var VEHICLE = {name:'OBD Trip Platform',ecu:'',adapter:'',vin:'',odometer:null,
-        fuelLevel:null,fuelAutonomy:null,adblueRange:null,
+        fuelLevel:null,fuelAutonomy:null,fuelSource:null,fuelLiters:null,fuelCapacityL:null,
+        serviceSource:null,myopEnabled:true,adblueRange:null,
         nextService:{days:null,km:null,passed:false},
         dpfSoot:null,dpfAvgRegenKm:null,dpfSinceRegenKm:null,battery:null,
         dpfReplaceKm:null,dpfRegenCapability:null,dpfRegenState:null,oilDilutionPct:null};
+      var SETTINGS = {myop_enabled:true,tank_capacity_l:43.5,fuel_density_gl:835};
+      var FUEL = {level:{},tankToTank:[],fcSuspects:[],capacityL:43.5,refuels:[]};
     }
   </script>
   <script type="text/babel" src="components.jsx"></script>

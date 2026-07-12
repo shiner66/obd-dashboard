@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import shutil
+import statistics
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from fastapi.responses import Response
 from . import database as db
 from .parsers import csv_parser, myop_parser
 from .services import correlator as corr_svc
+from .services import fuel as fuel_svc
 from .services import insights as insight_svc
 from .services.watcher import Watcher
 
@@ -30,6 +32,39 @@ DB_PATH         = Path(os.getenv("DB_PATH",         "/data/db/trips.db"))
 VEHICLE_NAME    = os.getenv("VEHICLE_NAME",    "Opel Corsa F Elegance")
 VEHICLE_ECU     = os.getenv("VEHICLE_ECU",     "MD1CS003 — 1.5d BlueHDi")
 VEHICLE_ADAPTER = os.getenv("VEHICLE_ADAPTER", "BTLE IOS-Vlink")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, "").strip())
+    except (ValueError, AttributeError):
+        return default
+
+
+# Effective settings = DB overrides (set from the UI) on top of these env defaults.
+# `myop_enabled=False` runs the platform entirely on OBD data — the MyOpel .myop
+# feed is the user's to switch off.
+DEFAULT_SETTINGS = {
+    "myop_enabled":    _env_bool("MYOP_ENABLED", True),
+    "tank_capacity_l": _env_float("TANK_CAPACITY_L", fuel_svc.DEFAULT_TANK_L),
+    "fuel_density_gl": _env_float("FUEL_DENSITY_GL", fuel_svc.DEFAULT_DENSITY),
+}
+
+
+def effective_settings() -> dict:
+    """DB-stored settings merged over the env-derived defaults."""
+    s = dict(DEFAULT_SETTINGS)
+    for k, v in db.get_all_settings().items():
+        if v is not None:
+            s[k] = v
+    return s
 
 # What to do with a source file once its content is safely in the DB:
 #   gzip   (default) — compress into <watch_dir>/archive/<name>.gz (~90 % smaller),
@@ -152,6 +187,10 @@ def _process_myop_file(path: Path) -> list[str]:
     is cumulative, and re-adding absorbed legs at startup is what lets the
     correlator rebuild its grouping after a migration reset.
     """
+    # Honour a runtime MyOpel switch-off even if a file is dropped in the watch dir.
+    if not effective_settings()["myop_enabled"]:
+        log.info("MyOpel disabled — ignoring dropped file %s", path.name)
+        return []
     sha = _content_sha256(path)
     size = _content_size(path)
     trips = myop_parser.parse_file(path)
@@ -210,10 +249,14 @@ async def lifespan(app: FastAPI):
     db.init(DB_PATH)
     log.info("Database initialised at %s", DB_PATH)
 
+    myop_on = effective_settings()["myop_enabled"]
+    log.info("MyOpel source %s", "ENABLED" if myop_on else "DISABLED (OBD-only mode)")
+
     # Bulk mode: save all files first, reconcile once at the end (avoids O(n²)).
     _bulk_loading = True
     _scan_directory(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
-    _scan_directory(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
+    if myop_on:
+        _scan_directory(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
     _bulk_loading = False
 
     # Single reconciliation pass after the initial scan — chains, overlaps,
@@ -224,7 +267,8 @@ async def lifespan(app: FastAPI):
         log.exception("Startup auto_correlate_all failed")
 
     _watcher.watch(OBD_FILES_DIR,  _process_obd_file,  (".csv", ".brc"))
-    _watcher.watch(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
+    if myop_on:
+        _watcher.watch(MYOP_FILES_DIR, _process_myop_file, (".myop", ".json"))
     _watcher.start()
 
     _recompute_all_insights()
@@ -278,8 +322,21 @@ app.add_middleware(
 
 # ── data.js endpoint ──────────────────────────────────────────────────────────
 
-def _build_vehicle(trips: list[dict]) -> dict:
-    """Build VEHICLE global from latest trip data."""
+def _recent_kml(trips: list[dict]) -> float | None:
+    """Median km/L over the most recent trips with a consumption figure."""
+    vals = [t.get("consumptionKmL") for t in
+            sorted(trips, key=lambda t: t.get("start") or "", reverse=True)[:15]
+            if t.get("consumptionKmL")]
+    return statistics.median(vals) if vals else None
+
+
+def _build_vehicle(trips: list[dict], settings: dict, fuel: dict) -> dict:
+    """Build VEHICLE global from latest trip data.
+
+    Fuel level and service countdown come from MyOpel when the source is enabled
+    and available, otherwise from OBD-native fields + the refuel ledger, so the
+    dashboard stays populated with the .myop feed switched off.
+    """
     obd_trips = [t for t in trips if "obd" in t.get("sources", [])]
     myop_trips = [t for t in trips if "myopel" in t.get("sources", [])]
 
@@ -287,12 +344,32 @@ def _build_vehicle(trips: list[dict]) -> dict:
     latest_myop = myop_trips[0] if myop_trips else {}
     latest      = trips[0]      if trips       else {}
 
-    # Prefer myop data for service/fuel; OBD for DPF/battery
-    fuel_level    = latest_myop.get("fuelLevel")    or latest_obd.get("fuelLevel")
-    fuel_autonomy = latest_myop.get("fuelAutonomy") or latest_obd.get("fuelAutonomy")
-    days_svc      = latest_myop.get("daysToService") or latest_obd.get("daysToService")
-    km_svc        = latest_myop.get("kmToService")   or latest_obd.get("kmToService")
-    maint_passed  = latest_myop.get("maintenancePassed") or latest_obd.get("maintenancePassed") or False
+    myop_on = bool(settings.get("myop_enabled"))
+    level   = fuel.get("level") or {}
+
+    # ── Fuel level & autonomy ────────────────────────────────────────────────
+    if myop_on and latest_myop.get("fuelLevel") is not None:
+        fuel_level, fuel_autonomy, fuel_source = (
+            latest_myop.get("fuelLevel"), latest_myop.get("fuelAutonomy"), "myopel")
+    else:
+        fuel_level  = level.get("pct")
+        fuel_source = level.get("source")            # "ledger" | "obd" | None
+        liters, kml = level.get("liters"), _recent_kml(trips)
+        fuel_autonomy = round(liters * kml) if (liters and kml) else None
+
+    # ── Service countdown ────────────────────────────────────────────────────
+    if myop_on and (latest_myop.get("kmToService") is not None
+                    or latest_myop.get("daysToService") is not None):
+        days_svc     = latest_myop.get("daysToService")
+        km_svc       = latest_myop.get("kmToService")
+        maint_passed = latest_myop.get("maintenancePassed") or False
+        svc_source   = "myopel"
+    else:
+        # OBD proxy: distance to the next oil change (no day countdown available).
+        km_svc = next((t.get("oilKmToService") for t in obd_trips
+                       if t.get("oilKmToService") is not None), None)
+        days_svc, maint_passed = None, False
+        svc_source = "obd" if km_svc is not None else None
 
     # VIN from any myop trip
     vin = next((t.get("vin", "") for t in myop_trips if t.get("vin")), "")
@@ -305,6 +382,11 @@ def _build_vehicle(trips: list[dict]) -> dict:
         "odometer":      latest.get("odometerKm"),
         "fuelLevel":     fuel_level,
         "fuelAutonomy":  fuel_autonomy,
+        "fuelSource":    fuel_source,
+        "fuelLiters":    level.get("liters"),
+        "fuelCapacityL": fuel.get("capacityL"),
+        "serviceSource": svc_source,
+        "myopEnabled":   myop_on,
         "adblueRange":   latest_obd.get("adblueRangeKm"),
         "nextService": {
             "days":   days_svc,
@@ -346,11 +428,13 @@ def _safe(obj):
 _EMPTY_JS = (
     "// data.js — empty fallback (backend error)\n"
     "var VEHICLE={name:'OBD Trip Platform',ecu:'',adapter:'',vin:'',"
-    "odometer:null,fuelLevel:null,fuelAutonomy:null,adblueRange:null,"
+    "odometer:null,fuelLevel:null,fuelAutonomy:null,fuelSource:null,myopEnabled:true,adblueRange:null,"
     "nextService:{days:null,km:null,passed:false},"
     "dpfSoot:null,dpfAvgRegenKm:null,dpfSinceRegenKm:null,battery:null};\n"
     "var TRIPS=[];\nvar ALERTS={};\nvar TREND_INSIGHTS=[];\n"
     "var PID_CATALOG=[];\nvar PID_GROUPS={};\nvar POINTS={};\n"
+    "var SETTINGS={myop_enabled:true,tank_capacity_l:43.5,fuel_density_gl:835};\n"
+    "var FUEL={level:{},tankToTank:[],fcSuspects:[],capacityL:43.5};\n"
 )
 
 
@@ -358,7 +442,9 @@ _EMPTY_JS = (
 def data_js():
     try:
         trips = db.get_all_trips()
-        vehicle = _safe(_build_vehicle(trips))
+        settings = effective_settings()
+        fuel = fuel_svc.fuel_summary(db.get_refuels(), trips, settings)
+        vehicle = _safe(_build_vehicle(trips, settings, fuel))
         catalog = _safe(db.get_pid_catalog())
         groups  = _safe(_build_pid_groups(catalog))
         trend_insights = _safe(getattr(app.state, "trend_insights", []))
@@ -382,6 +468,8 @@ def data_js():
             f"var TREND_INSIGHTS = {json.dumps(trend_insights, ensure_ascii=False)};\n\n"
             f"var PID_CATALOG = {json.dumps(catalog, ensure_ascii=False)};\n\n"
             f"var PID_GROUPS = {json.dumps(groups, ensure_ascii=False)};\n\n"
+            f"var SETTINGS = {json.dumps(_safe(settings), ensure_ascii=False)};\n\n"
+            f"var FUEL = {json.dumps(_safe(fuel), ensure_ascii=False)};\n\n"
             "var POINTS = {};\n"
         )
         return Response(content=js, media_type="application/javascript")
@@ -456,6 +544,80 @@ async def merge_trips(payload: dict):
 @app.get("/api/v1/health")
 def health():
     return {"status": "ok"}
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+
+_ALLOWED_SETTINGS = {
+    "myop_enabled":    bool,
+    "tank_capacity_l": float,
+    "fuel_density_gl": float,
+}
+
+
+@app.get("/api/v1/settings")
+def get_settings():
+    """Effective settings (DB overrides merged over env defaults) + their defaults."""
+    return {"settings": effective_settings(), "defaults": DEFAULT_SETTINGS}
+
+
+@app.put("/api/v1/settings")
+def put_settings(payload: dict):
+    """Update one or more settings. Only whitelisted keys are accepted."""
+    applied = {}
+    for key, caster in _ALLOWED_SETTINGS.items():
+        if key not in payload:
+            continue
+        try:
+            val = caster(payload[key])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"Invalid value for {key}")
+        db.set_setting(key, val)
+        applied[key] = val
+    # Toggling the MyOpel source changes what the watcher scans and what the
+    # vehicle summary prefers — re-run reconciliation and refresh insights.
+    _post_process()
+    return {"ok": True, "applied": applied, "settings": effective_settings()}
+
+
+# ── Refuel ledger + fuel model ────────────────────────────────────────────────
+
+@app.get("/api/v1/fuel")
+def get_fuel():
+    """Tank level (ledger − consumption or OBD sender), tank-to-tank economy,
+    the refuel ledger, and any stale-fuelConsumption suspects."""
+    trips = db.get_all_trips()
+    settings = effective_settings()
+    summary = fuel_svc.fuel_summary(db.get_refuels(), trips, settings)
+    summary["refuels"] = db.get_refuels()
+    return summary
+
+
+@app.post("/api/v1/refuels")
+def add_refuel(payload: dict):
+    """Record a refuel. Required: liters. Recommended: odometerKm (anchors the
+    fuel-level model) and ts. Optional: pricePerL, fuelType, fullTank, note."""
+    if not payload.get("liters"):
+        raise HTTPException(status_code=400, detail="liters required")
+    try:
+        entry = {
+            "ts":         payload.get("ts"),
+            "odometerKm": float(payload["odometerKm"]) if payload.get("odometerKm") is not None else None,
+            "liters":     float(payload["liters"]),
+            "pricePerL":  float(payload["pricePerL"]) if payload.get("pricePerL") is not None else None,
+            "fuelType":   payload.get("fuelType"),
+            "fullTank":   bool(payload.get("fullTank", True)),
+            "note":       payload.get("note"),
+        }
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid numeric field")
+    return {"ok": True, "refuel": db.add_refuel(entry)}
+
+
+@app.delete("/api/v1/refuels/{refuel_id}")
+def remove_refuel(refuel_id: int):
+    db.delete_refuel(refuel_id)
+    return {"ok": True}
 
 
 def _dir_bytes(d: Path, recursive: bool = False) -> int:
@@ -607,7 +769,9 @@ def debug_data_error():
 
     # Try serializing VEHICLE
     try:
-        vehicle = _build_vehicle(trips)
+        settings = effective_settings()
+        fuel = fuel_svc.fuel_summary(db.get_refuels(), trips, settings)
+        vehicle = _build_vehicle(trips, settings, fuel)
         json.dumps(vehicle)
         results.append({"section": "VEHICLE", "ok": True})
     except Exception as e:

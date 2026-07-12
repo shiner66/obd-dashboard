@@ -138,6 +138,8 @@ CURATED_SLUG: dict[str, str] = {
     "[ECM] Battery current":                                               "bat_i",
     "[ECM] Alternator load value":                                         "alt",
     "[ECM] Service battery charge status":                                 "bat_soc",
+    "Air conditioning compressor current":                                 "ac_amp",
+    "[ECM] Air conditioning compressor current":                           "ac_amp",
     "[ECM] Stop and Start function state":                                 "ss_state",
     "[ECM] Engine restart counter by Stop and Start function":             "ss_count",
     "[ECM] Engine stop time":                                              "ss_stop",
@@ -205,6 +207,10 @@ _CURATED = {
                                                                                   "agg": "last"},
     "ss_state":             {"pids": ["[ECM] Stop and Start function state"],     "agg": "last"},
     "distance_km_raw":      {"pids": ["Distanza percorsa:"],                      "agg": "last"},
+    # OBD-native twins of MyOpel fields — let the platform run without the .myop file.
+    "fuel_level_obd":       {"pids": ["[ECM] Fuel tank level"],                   "agg": "last"},
+    "oil_km_to_service":    {"pids": ["[ECM] Distance remaining until the next oil change"],
+                                                                                  "agg": "last"},
 }
 
 
@@ -259,6 +265,132 @@ def _downsample(series: list[tuple[float, float]], n: int = 60) -> list[float]:
 
 def _r(v: float | None, d: int = 2) -> float | None:
     return round(v, d) if v is not None else None
+
+
+# ── Derived-metrics helpers (briefing §2 mass fuel, §3 idle / bands / ratio) ──
+
+# Injector-mass fuel flow: mdot[mg/s] = inj_q[mg/stroke] × rpm / 30
+#   (4-cylinder 4-stroke → rpm/60 rev/s ÷ 2 × 4 injections/cycle = rpm/30 strokes/s)
+_INJ_STROKES_PER_MIN = 30.0
+_SPEED_BANDS = ((0, 5), (5, 30), (30, 50), (50, 70), (70, 90), (90, 1e9))
+_IDLE_SPEED_KMH   = 2.0     # below this, engine running → idling
+_AC_ACTIVE_MA     = 300.0   # solenoid current above which the A/C clutch is engaged (§2)
+_RATIO_MIN_SAMPLES = 60     # §3: below this, ratio_wg is noise — don't report it
+
+_INJ_Q         = "[ECM] Calculated fuel injection amount"
+_RPM_NAMES     = ("Giri motore", "[ECM] Crankshaft speed")
+_GPS_SPD       = "Velocità (GPS)"
+_VEH_SPD_NAMES = ("Velocità veicolo", "[ECM] Vehicle speed")
+_AC_NAMES      = ("Air conditioning compressor current",
+                  "[ECM] Air conditioning compressor current")
+
+
+def _first_series(pid_window: dict, names) -> list | None:
+    for n in names:
+        if n in pid_window:
+            return pid_window[n]
+    return None
+
+
+def _grid_ffill(series, t0: float, n: int, step: float, limit: float) -> list:
+    """Forward-fill a (ts, value) series onto a regular grid of n points.
+
+    An entry is None when the most recent real sample is older than `limit`
+    seconds, so integration never bridges an adapter dropout (briefing §2 uses
+    a ~20 s fill limit)."""
+    out = [None] * n
+    if not series:
+        return out
+    s = sorted(series)
+    j = 0
+    last_t = last_v = None
+    for i in range(n):
+        gt = t0 + i * step
+        while j < len(s) and s[j][0] <= gt:
+            last_t, last_v = s[j]
+            j += 1
+        if last_t is not None and (gt - last_t) <= limit:
+            out[i] = last_v
+    return out
+
+
+def _derive_metrics(pid_window: dict, t_start: float, t_end: float,
+                    distance_km: float | None, fuel_consumed_l: float | None) -> dict:
+    """Mass-based fuel + idle / speed-band / A/C / wheel-vs-GPS metrics.
+
+    All computed on a common forward-filled time grid so PIDs sampled at
+    different rates line up (briefing §2 method)."""
+    span = t_end - t_start
+    if span <= 0:
+        return {}
+    # 1 s grid where practical; coarsened so n stays bounded on long recordings.
+    step = max(1.0, span / 15000.0)
+    n = int(span / step) + 1
+
+    rpm_s = _first_series(pid_window, _RPM_NAMES)
+    inj_s = pid_window.get(_INJ_Q)
+    gps_s = pid_window.get(_GPS_SPD)
+    veh_s = _first_series(pid_window, _VEH_SPD_NAMES)
+    ac_s  = _first_series(pid_window, _AC_NAMES)
+
+    rpm_g = _grid_ffill(rpm_s, t_start, n, step, 25.0)
+    inj_g = _grid_ffill(inj_s, t_start, n, step, 25.0)
+    spd_g = _grid_ffill(gps_s or veh_s, t_start, n, step, 25.0)
+    ac_g  = _grid_ffill(ac_s, t_start, n, step, 25.0)
+
+    fuel_mg = idle_fuel_mg = idle_s = engine_on_s = 0.0
+    bands = {(f"{lo}-{hi}" if hi < 1e9 else f"{lo}+"): 0.0 for lo, hi in _SPEED_BANDS}
+    band_keys = list(bands.keys())
+    for i in range(n):
+        rpm, inj, spd = rpm_g[i], inj_g[i], spd_g[i]
+        mdot = (inj * rpm / _INJ_STROKES_PER_MIN) if (inj is not None and rpm and rpm > 0) else None
+        if rpm is not None and rpm > 0:               # engine running
+            engine_on_s += step
+            if mdot is not None:
+                fuel_mg += mdot * step
+            if spd is not None and spd < _IDLE_SPEED_KMH:
+                idle_s += step
+                if mdot is not None:
+                    idle_fuel_mg += mdot * step
+        if spd is not None and spd > 0:
+            km = spd / 3600.0 * step
+            for k, (lo, hi) in zip(band_keys, _SPEED_BANDS):
+                if lo <= spd < hi:
+                    bands[k] += km
+                    break
+
+    fuel_g   = fuel_mg / 1000.0 if fuel_mg > 0 else None
+    g_per_km = (fuel_g / distance_km) if (fuel_g and distance_km) else None
+    val_gl   = (fuel_g / fuel_consumed_l) if (fuel_g and fuel_consumed_l) else None
+    idle_fuel_g = idle_fuel_mg / 1000.0 if idle_fuel_mg > 0 else None
+    idle_share  = (idle_s / engine_on_s * 100) if engine_on_s > 0 else None
+
+    ac_vals  = [v for v in ac_g if v is not None]
+    ac_mean  = statistics.mean(ac_vals) if ac_vals else None
+    ac_active = (sum(1 for v in ac_vals if v > _AC_ACTIVE_MA) / len(ac_vals) * 100) if ac_vals else None
+
+    ratio_wg = None
+    if gps_s and veh_s:
+        gps_gg = _grid_ffill(gps_s, t_start, n, step, 10.0)
+        veh_gg = _grid_ffill(veh_s, t_start, n, step, 10.0)
+        ratios = [veh_gg[i] / gps_gg[i] for i in range(n)
+                  if gps_gg[i] and veh_gg[i] and gps_gg[i] > 40
+                  and abs(veh_gg[i] - gps_gg[i]) < 1.5]
+        if len(ratios) >= _RATIO_MIN_SAMPLES:
+            ratio_wg = statistics.median(ratios)
+
+    return {
+        "fuelMassG":        _r(fuel_g, 1),
+        "gPerKm":           _r(g_per_km, 1),
+        "fuelValidationGL": _r(val_gl, 0),
+        "acCurrentMa":      _r(ac_mean, 0),
+        "acActivePct":      _r(ac_active, 1),
+        "idleSeconds":      _r(idle_s, 0),
+        "idleSharePct":     _r(idle_share, 1),
+        "idleFuelG":        _r(idle_fuel_g, 1),
+        "speedBandsKm":     {k: round(v, 2) for k, v in bands.items()} if any(bands.values()) else None,
+        "ratioWg":          _r(ratio_wg, 4),
+    }
 
 
 # ── Main parse function ───────────────────────────────────────────────────────
@@ -487,6 +619,20 @@ def parse_file(path: str | Path) -> list[dict]:
         log.info("Skipping %s: trip too short (%.2f km)", filename, distance_km or 0)
         return []
 
+    # ── Derived metrics (briefing §2 mass fuel, §3 idle / bands / A/C / ratio) ─
+    metrics = _derive_metrics(pid_window, t_start, t_end, distance_km, fuel_consumed_l)
+
+    # ── Sanity filters (briefing §4) ──────────────────────────────────────────
+    # Out-of-range decodes have polluted the aggregates before (soot 474 %,
+    # dilution 419 %, coolant > 240 °C). Reject the impossible values here so a
+    # single glitched sample can never move a median or fire an alert.
+    def _clamp(v, lo, hi):
+        return v if (v is not None and lo <= v <= hi) else None
+
+    soot_pct    = _clamp(fields.get("dpf_soot_pct"), 0.0, 100.0)
+    oil_dil_pct = _clamp(fields.get("oil_dilution_pct"), 0.0, 20.0)
+    coolant_max = _clamp(fields.get("coolant_max_c"), -40.0, 130.0)
+
     # ── DPF state machine ─────────────────────────────────────────────────────
     dpf_regen_state, dpf_regen_active = dpf_state(pid_window)
 
@@ -559,13 +705,13 @@ def parse_file(path: str | Path) -> list[dict]:
         "maxSpeedKmh":           _r(fields.get("max_speed_kmh"), 1),
         "avgRpm":                int(fields["avg_rpm"]) if fields.get("avg_rpm") else None,
         "maxRpm":                int(fields["max_rpm"]) if fields.get("max_rpm") else None,
-        "coolantMaxC":           _r(fields.get("coolant_max_c"), 1),
+        "coolantMaxC":           _r(coolant_max, 1),
         "oilMaxC":               _r(fields.get("oil_temp_max_c"), 1),
         "odometerKm":            round(fields["odometer_km"]) if fields.get("odometer_km") else None,
         "airTempC":              _r(fields.get("air_temp_c"), 1),
         "fuelConsumedL":         fuel_consumed_l,
         "consumptionL100km":     consumption_l100km,
-        "dpfSootPct":            _r(fields.get("dpf_soot_pct"), 1),
+        "dpfSootPct":            _r(soot_pct, 1),
         "dpfClosedSoot":         _r(fields.get("dpf_closed_soot"), 2),
         "dpfRegenActive":        dpf_regen_active,
         "dpfRegenState":         dpf_regen_state,
@@ -580,13 +726,17 @@ def parse_file(path: str | Path) -> list[dict]:
         "exhaustAfterCatC":      _r(fields.get("exhaust_after_cat_c"), 1),
         "noxCatTempMaxC":        _r(fields.get("nox_cat_temp_max_c"), 1),
         "batteryStartupV":       _r(fields.get("battery_startup_v"), 2),
-        "oilDilutionPct":        _r(fields.get("oil_dilution_pct"), 2),
+        "oilDilutionPct":        _r(oil_dil_pct, 2),
         "ssState":               int(fields["ss_state"]) if fields.get("ss_state") else None,
+        # OBD-native twins of MyOpel fields (fuel level %, service countdown km)
+        "fuelLevelObd":          _r(fields.get("fuel_level_obd"), 1),
+        "oilKmToService":        round(fields["oil_km_to_service"]) if fields.get("oil_km_to_service") else None,
         "alerts":                [],  # OBD CSV has no alert codes; myop provides them
         "track":                 gps_deduped,
         "pidValues":             pid_values,
         "pidSeriesFull":         pid_series,
         "pidCatalog":            pid_catalog,
+        **metrics,
     }]
 
 

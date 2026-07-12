@@ -105,6 +105,54 @@ curl -F "file=@trips-2026-05.myop" \
 
 ---
 
+## Modalità solo-OBD (senza MyOpel)
+
+Il file `.myop` **non è più necessario** per i consumi e lo stato veicolo. Puoi
+disattivare la sorgente MyOpel da **Admin → Impostazioni** (o con
+`MYOP_ENABLED=false`): la piattaforma passa in modalità solo-OBD e ricava ogni
+campo dal log CarScanner, con questi equivalenti nativi.
+
+| Campo MyOpel | Equivalente OBD | Come |
+|---|---|---|
+| `fuelLevel` (%) | `[ECM] Fuel tank level` (sonda) **+ ledger − consumi** | stessa sonda lineare che legge MyOpel; oppure ricostruito dai rifornimenti |
+| `fuelAutonomy` (km) | litri stimati × km/L recente | calcolato |
+| `fuelConsumption` | integrale portata **+ metodo iniettori** `mdot = inj_q·rpm/30` | validato a ~834 g/L contro il contatore |
+| `priceFuel` / `costEur` | ledger rifornimenti (€/L manuale) | vista **Carburante** |
+| `distanceToNextMaintenance` | `[ECM] Distance remaining until the next oil change` | proxy tagliando |
+| `odometer` | `[ECM] Total mileage` | già nativo |
+| `distance` | contatore tratta / delta odometro | già nativo |
+| `alerts` | — (il CSV CarScanner non espone i DTC) | resta esclusivo MyOpel |
+
+### Livello carburante & rifornimenti (la "soluzione estrema")
+
+La vista **Carburante** ricostruisce il livello del serbatoio dall'ultimo
+**pieno completo** meno il carburante misurato dall'OBD su ogni viaggio
+successivo. Registra i pieni (litri, prezzo, tipo, odometro): con due pieni
+completi consecutivi ottieni anche la **resa reale tank-to-tank** (litri pompa ÷
+km odometro, mai i delta livello per-viaggio — briefing §1), attribuita al
+carburante che era *nel* serbatoio (off-by-one delle app rifornimenti corretto).
+HVO e B7 sono distinti per densità (780 / 835 g/L); i confronti nel tempo usano
+i **g/km** (immuni alla densità).
+
+### Altri controlli derivati dall'OBD (briefing §2–§4)
+
+- **Consumo in massa** `g/km` e validazione densità `g/L` per viaggio (flag fuori 750–950).
+- **Minimo (idle)**: secondi, grammi e quota su tempo/carburante.
+- **Ripartizione km per fasce di velocità** (0-5 / 5-30 / … / 90+ km/h).
+- **Clima**: corrente media compressore e quota tempo attivo (soglia 300 mA).
+- **Monitor gomme** via rapporto ruota/GPS (`ratio_wg`, min 60 campioni): alert su deriva > +0,3% in 4 settimane.
+- **Filtri sanità**: `soot ∈ [0,100]`, `oil_dilution ∈ [0,20]`, coolant `> 130 °C` scartato (decode inaffidabile).
+
+### Variabili d'ambiente aggiuntive
+
+| Variabile | Default | Descrizione |
+|---|---|---|
+| `MYOP_ENABLED` | `true` | `false` → modalità solo-OBD (sovrascrivibile a runtime dalle Impostazioni) |
+| `TANK_CAPACITY_L` | `43.5` | capacità utile serbatoio per il modello carburante |
+| `FUEL_DENSITY_GL` | `835` | densità di riferimento per la conversione massa→volume |
+
+---
+
 ## Endpoint API
 
 | Metodo | Path | Descrizione |
@@ -115,6 +163,11 @@ curl -F "file=@trips-2026-05.myop" \
 | GET  | `/api/v1/tracks`        | Tutti i tracciati GPS, `{trip_id: [[lat,lon],…]}` (vista Mappa) |
 | POST | `/api/v1/upload/obd`    | Upload `.csv` / `.brc` (multipart) |
 | POST | `/api/v1/upload/myop`   | Upload `.myop` (multipart) |
+| GET  | `/api/v1/settings`      | Impostazioni effettive (override DB su default env) + default |
+| PUT  | `/api/v1/settings`      | Aggiorna `myop_enabled`, `tank_capacity_l`, `fuel_density_gl` |
+| GET  | `/api/v1/fuel`          | Livello serbatoio (ledger − consumi / sonda OBD), resa tank-to-tank, ledger rifornimenti, valori MyOpel sospetti |
+| POST | `/api/v1/refuels`       | Registra un rifornimento (`liters` obbligatorio; `odometerKm`, `pricePerL`, `fuelType`, `fullTank`, `ts`, `note`) |
+| DELETE | `/api/v1/refuels/{id}` | Elimina un rifornimento dal ledger |
 | POST | `/api/v1/admin/correlate` | Forza un passaggio di correlazione autonoma |
 | GET  | `/api/v1/admin/uncorrelated` | Diagnostica: coppie candidate non correlate + correlazioni sospette (copertura km fuori norma) |
 | GET  | `/api/v1/health`        | Healthcheck |
@@ -140,6 +193,8 @@ backend/
     └── services/
         ├── rbs.py            Correzione byte-swap MD1CS003 (§7)
         ├── dpf.py            DPF state machine (§8)
+        ├── fuel.py           Ledger rifornimenti + livello per sottrazione, tank-to-tank (§1)
+        ├── correlator.py     Correlazione/merge OBD↔MyOpel autonoma
         ├── insights.py       Regole insight in italiano
         └── watcher.py        Watchdog file-system
 
