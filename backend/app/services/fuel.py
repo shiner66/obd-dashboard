@@ -28,6 +28,7 @@ FC_SUSPECT_MIN_KM   = 5.0      # … on a trip longer than this is statistically
 
 
 def density_for(fuel_type: str | None) -> float:
+    """Fuel density in g/L for a fuel-type label (B7/HVO/…), defaulting to diesel."""
     if not fuel_type:
         return DEFAULT_DENSITY
     return DENSITY_GL.get(fuel_type.strip().upper(), DEFAULT_DENSITY)

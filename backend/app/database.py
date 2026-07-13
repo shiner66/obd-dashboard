@@ -610,6 +610,7 @@ def ledger_stats() -> dict:
 # ── Settings (key/value, JSON-encoded) ────────────────────────────────────────
 
 def get_setting(key: str, default=None):
+    """Return a JSON-decoded setting value, or `default` if unset/unparseable."""
     with _conn() as con:
         row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     if row is None or row["value"] is None:
@@ -621,6 +622,7 @@ def get_setting(key: str, default=None):
 
 
 def set_setting(key: str, value) -> None:
+    """Store a setting as a JSON-encoded value (upsert)."""
     with _conn() as con:
         con.execute("""
             INSERT INTO settings (key, value, updated_at)
@@ -630,6 +632,7 @@ def set_setting(key: str, value) -> None:
 
 
 def get_all_settings() -> dict:
+    """All stored settings as a {key: decoded_value} dict."""
     with _conn() as con:
         rows = con.execute("SELECT key, value FROM settings").fetchall()
     out: dict = {}
@@ -644,6 +647,7 @@ def get_all_settings() -> dict:
 # ── Refuel ledger ─────────────────────────────────────────────────────────────
 
 def add_refuel(entry: dict) -> dict:
+    """Insert a refuel (camelCase dict from the API) and return the stored row."""
     with _conn() as con:
         cur = con.execute("""
             INSERT INTO refuels (ts, odometer_km, liters, price_per_l, fuel_type, full_tank, note)
@@ -663,12 +667,14 @@ def add_refuel(entry: dict) -> dict:
 
 
 def get_refuels() -> list[dict]:
+    """All refuels ordered by odometer (then time) — the order the fuel model walks."""
     with _conn() as con:
         rows = con.execute("SELECT * FROM refuels ORDER BY odometer_km, ts").fetchall()
     return [_row_to_refuel(dict(r)) for r in rows]
 
 
 def delete_refuel(refuel_id: int) -> None:
+    """Remove a refuel from the ledger by id."""
     with _conn() as con:
         con.execute("DELETE FROM refuels WHERE id=?", (refuel_id,))
 
