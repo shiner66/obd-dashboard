@@ -41,7 +41,7 @@ jobs:
           node-version: '22'
       - run: npm install --no-save --package-lock=false @babel/standalone@7.29.0
       - run: node scripts/check-frontend.cjs
-      - run: node --test tests/frontend.test.cjs
+      - run: node --test tests/*.test.cjs
 
   build-and-push:
     needs: verify

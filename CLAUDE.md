@@ -43,7 +43,7 @@ La suite di regressione è in `tests/`; installare `backend/requirements-dev.txt
 in una venv Python 3.12. Prima di committare:
 
 - `PYTHONPATH=backend python -m pytest -q`.
-- `node --test tests/frontend.test.cjs`.
+- `node --test tests/*.test.cjs`.
 - `npm install --no-save --package-lock=false @babel/standalone@7.29.0`,
   quindi `node scripts/check-frontend.cjs`.
 

@@ -4,6 +4,9 @@ import gzip
 import json
 import logging
 import math
+import re
+from datetime import date
+from copy import deepcopy
 import os
 import statistics
 import tempfile
@@ -33,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(messa
 OBD_FILES_DIR   = Path(os.getenv("OBD_FILES_DIR",   "/data/obd"))
 MYOP_FILES_DIR  = Path(os.getenv("MYOP_FILES_DIR",  "/data/myop"))
 DB_PATH         = Path(os.getenv("DB_PATH",         "/data/db/trips.db"))
-APP_VERSION    = os.getenv("APP_VERSION", "0.8.0")
+APP_VERSION    = os.getenv("APP_VERSION", "0.9.0")
 APP_REVISION   = os.getenv("APP_REVISION", "unknown")
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 VEHICLE_NAME    = os.getenv("VEHICLE_NAME",    "Opel Corsa F Elegance")
@@ -82,6 +85,10 @@ _watcher = Watcher()
 _bulk_loading = False
 _scan_errors: dict[str, str] = {}
 _legacy_rebuild_needed: set[str] = set()
+_dashboard_cache: dict = {}
+_global_cache: dict = {}
+_cache_revision = None
+_SOURCE_PARSER_VERSION = {"obd": 2, "myop": 1}
 
 
 def _content_sha256(path: Path) -> str:
@@ -138,11 +145,16 @@ def _process_obd_file(path: Path) -> list[str]:
     path = Path(path)
     if path.name.lower().removesuffix(".gz").endswith(".brc"):
         raise ValueError("Formato BRC binario non supportato: esporta il viaggio in CSV da CarScanner")
+    with ingest.LOCK:
+        if db.source_parse_cached(str(path.resolve()), ingest.signature(path), _SOURCE_PARSER_VERSION["obd"], _content_sha256(path)):
+            _scan_errors.pop(str(path), None)
+            return []
     with ingest.LOCK, _source_snapshot(path, OBD_FILES_DIR) as (snapshot, archived):
         sha = _content_sha256(snapshot)
         expected_id = csv_parser.trip_id_for_file(snapshot)
         if _legacy_trip_known(expected_id):
             db.record_ingested_file(sha, path.name, "obd", _content_size(snapshot), [expected_id], archived)
+            db.record_source_parse(str(path.resolve()), ingest.signature(path), sha, _SOURCE_PARSER_VERSION["obd"], [expected_id])
             return []
         trips = csv_parser.parse_file(snapshot)
         changed_ids: list[str] = []
@@ -153,6 +165,7 @@ def _process_obd_file(path: Path) -> list[str]:
                 changed_ids.append(trip["id"])
         db.record_ingested_file(sha, path.name, "obd", _content_size(snapshot),
                                 [trip["id"] for trip in trips], archived)
+        db.record_source_parse(str(path.resolve()), ingest.signature(path), sha, _SOURCE_PARSER_VERSION["obd"], [trip["id"] for trip in trips])
         _scan_errors.pop(str(path), None)
         if changed_ids and not _bulk_loading:
             _post_process()
@@ -164,6 +177,9 @@ def _process_myop_file(path: Path) -> list[str]:
     path = Path(path)
     with ingest.LOCK:
         if not effective_settings()["myop_enabled"]:
+            return []
+        if db.source_parse_cached(str(path.resolve()), ingest.signature(path), _SOURCE_PARSER_VERSION["myop"], _content_sha256(path)):
+            _scan_errors.pop(str(path), None)
             return []
         with _source_snapshot(path, MYOP_FILES_DIR) as (snapshot, archived):
             sha = _content_sha256(snapshot)
@@ -178,6 +194,7 @@ def _process_myop_file(path: Path) -> list[str]:
                     changed_ids.append(trip["id"])
             db.record_ingested_file(sha, path.name, "myop", _content_size(snapshot),
                                     [trip["id"] for trip in trips], archived)
+            db.record_source_parse(str(path.resolve()), ingest.signature(path), sha, _SOURCE_PARSER_VERSION["myop"], [trip["id"] for trip in trips])
             _scan_errors.pop(str(path), None)
             if changed_ids and not _bulk_loading:
                 _post_process()
@@ -215,6 +232,10 @@ def _scan_directory(directory: Path, process_fn, extensions: tuple[str, ...]) ->
     seen: set[tuple[str, str]] = set()
     for source in sorted(candidates, key=lambda p: (p.stat().st_mtime_ns, str(p))):
         try:
+            kind = "obd" if process_fn is _process_obd_file else "myop"
+            if db.source_parse_cached(str(source.resolve()), ingest.signature(source), _SOURCE_PARSER_VERSION[kind], _content_sha256(source)):
+                process_fn(source)
+                continue
             key = (csv_parser.source_stem(source), _content_sha256(source))
             if key in seen:
                 continue
@@ -259,7 +280,7 @@ async def lifespan(app: FastAPI):
 
 def _recompute_all_insights() -> None:
     try:
-        trips = db.get_all_trips()
+        trips = _effective_trip_metrics(db.get_trip_summaries(include_insight_features=True))
         ctx = insight_svc.build_context(trips)
         updated = 0
         for trip in trips:
@@ -275,7 +296,7 @@ def _recompute_all_insights() -> None:
 
 def _refresh_cross_trip_insights() -> None:
     try:
-        trips = db.get_all_trips()
+        trips = _effective_trip_metrics(db.get_trip_summaries(include_insight_features=True))
         if trips:
             ct = insight_svc.cross_trip(trips)
             log.info("Generated %d cross-trip insights", len(ct))
@@ -354,6 +375,9 @@ def _build_vehicle(trips: list[dict], settings: dict, fuel: dict) -> dict:
     vin = next((t.get("vin", "") for t in myop_trips if t.get("vin")), "")
 
     return {
+        "observedAt":    latest.get("start"),
+        "obdObservedAt": latest_obd.get("start"),
+        "myopObservedAt": latest_myop.get("start"),
         "name":          VEHICLE_NAME,
         "ecu":           VEHICLE_ECU,
         "adapter":       VEHICLE_ADAPTER,
@@ -409,36 +433,125 @@ def _platform_meta() -> dict:
     status = _watcher.status()
     status["errors"] += [{"file": Path(path).name, "error": error}
                          for path, error in _scan_errors.items()]
+    legacy = sorted(set(db.legacy_rebuild_ids()) | _legacy_rebuild_needed)
     return {"version": APP_VERSION, "revision": APP_REVISION, "ingestion": status,
-            "legacyRebuildNeeded": len(_legacy_rebuild_needed),
-            "legacyRebuildIds": sorted(_legacy_rebuild_needed)}
+            "legacyRebuildNeeded": len(legacy), "legacyRebuildIds": legacy,
+            "legacyRebuildReason": "Sorgenti mancanti o insufficienti: storico preservato, escluso dai confronti" if legacy else None}
 
 
-def _dashboard_payload() -> dict:
-    """Build one consistent JSON snapshot for refresh and legacy JS bootstrap."""
+def _validate_period(from_date: str | None, to_date: str | None) -> tuple[str | None, str | None]:
+    """Validate exact inclusive local-calendar dates before any data is read."""
+    for value in (from_date, to_date):
+        if value is not None:
+            try:
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                    raise ValueError()
+                date.fromisoformat(value)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Date richieste nel formato YYYY-MM-DD")
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(status_code=422, detail="La data iniziale deve precedere o coincidere con quella finale")
+    return from_date, to_date
+
+
+def _in_period(timestamp: str | None, from_date: str | None, to_date: str | None) -> bool:
+    """Match a local date, excluding undated observations only when filtering."""
+    if not from_date and not to_date:
+        return True
+    if not timestamp:
+        return False
+    day = timestamp[:10]
+    return (not from_date or day >= from_date) and (not to_date or day <= to_date)
+
+
+def _period_aggregates(trips: list[dict]) -> dict:
+    """Aggregate whole-period activity and comparable measured consumption separately."""
+    valid = [t for t in trips if insight_svc.usable_for_analysis(t)]
+    consumed = [t for t in valid if t.get("fuelConsumedL") is not None and t.get("fuelDistanceKm")]
+    liters = sum(t["fuelConsumedL"] for t in consumed)
+    fuel_km = sum(t["fuelDistanceKm"] for t in consumed)
+    costed = [t for t in valid if t.get("costEur") is not None and t.get("costDistanceKm")]
+    observed = [t for t in valid if t.get("durationMin") is not None]
+    return {"tripCount": len(trips), "obdTripCount": sum("obd" in t.get("sources", []) for t in trips),
+            "myopTripCount": sum("myopel" in t.get("sources", []) for t in trips),
+            "totalKm": round(sum(t.get("distanceKm") or 0 for t in trips), 2),
+            "observedMinutes": round(sum(t["durationMin"] for t in observed), 1),
+            "observedTripCount": len(observed), "costTripCount": len(costed),
+            "fuelLiters": round(liters, 3), "fuelDistanceKm": round(fuel_km, 2),
+            "fuelTripCount": len(consumed),
+            "consumptionKmL": round(fuel_km / liters, 2) if liters else None,
+            "consumptionL100km": round(liters / fuel_km * 100, 2) if fuel_km else None,
+            "costEur": round(sum(t["costEur"] for t in costed), 2),
+            "costDistanceKm": round(sum(t["costDistanceKm"] for t in costed), 2),
+            "excludedFromComparisons": len(trips) - len(valid)}
+
+
+def _effective_trip_metrics(trips: list[dict], settings: dict | None = None) -> list[dict]:
+    """Apply the selected fuel density consistently across summaries, details and exports."""
+    density = (settings or effective_settings())["fuel_density_gl"]
+    return [{**t, **fuel_svc.select_consumption(t, density)} for t in trips]
+
+
+def _dashboard_payload(from_date: str | None = None, to_date: str | None = None) -> dict:
+    """Serve cached lightweight period data while keeping vehicle/tank state global."""
+    global _cache_revision
+    _validate_period(from_date, to_date)
     with ingest.LOCK:
-        trips = db.get_all_trips()
-        settings = effective_settings()
-        # Also reject invalid legacy DB overrides instead of silently coercing them.
-        SettingsUpdate.model_validate({key: settings[key] for key in DEFAULT_SETTINGS})
-        fuel = fuel_svc.fuel_summary(db.get_refuels(), trips, settings, db.get_raw_trips("myopel"))
-        catalog = db.get_pid_catalog()
-        heavy = {"pidValues", "pidSeriesFull", "pidSeriesTimes", "track"}
-        slim = [{**{key: value for key, value in trip.items() if key not in heavy},
-                 "hasTrack": bool(trip.get("track")),
-                 "pidCount": len(trip.get("pidValues") or {})} for trip in trips]
-        return _safe({"vehicle": _build_vehicle(trips, settings, fuel), "trips": slim,
-                      "alerts": myop_parser.ALERT_DICT,
-                      "trendInsights": getattr(app.state, "trend_insights", []),
-                      "pidCatalog": catalog, "pidGroups": _build_pid_groups(catalog),
-                      "settings": settings, "fuel": fuel, "meta": _platform_meta()})
+        token = db.data_revision()
+        if token != _cache_revision:
+            _dashboard_cache.clear()
+            _global_cache.clear()
+        if not _global_cache:
+            settings = effective_settings()
+            trips = _effective_trip_metrics(db.get_trip_summaries(include_insight_features=True), settings)
+            SettingsUpdate.model_validate({key: settings[key] for key in DEFAULT_SETTINGS})
+            refuels = db.get_refuels()
+            fuel = fuel_svc.fuel_summary(refuels, trips, settings, db.get_raw_trips("myopel"))
+            _global_cache.update(trips=trips, settings=settings, refuels=refuels, fuel=fuel,
+                                 catalog=db.get_pid_catalog(), vehicle=_build_vehicle(trips, settings, fuel))
+            _cache_revision = db.data_revision()
+        key = (from_date, to_date)
+        if key not in _dashboard_cache:
+            all_trips = _global_cache["trips"]
+            trips = [t for t in all_trips if _in_period(t.get("start"), from_date, to_date)]
+            ctx = insight_svc.build_context(trips)
+            slim = [{**{k: v for k, v in t.items() if k != "pidValues"},
+                     "insights": insight_svc.per_trip(t, ctx)} for t in trips]
+            refuels = [r for r in _global_cache["refuels"] if _in_period(r.get("ts"), from_date, to_date)]
+            fuel = deepcopy(_global_cache["fuel"])
+            # Full-to-full intervals were computed over the entire ledger first.
+            fuel["tankToTank"] = [interval for interval in fuel["tankToTank"] if _in_period(interval.get("date"), from_date, to_date)]
+            fuel["refuels"] = refuels
+            fuel["period"] = {"refuelCount": len(refuels), "liters": round(sum(r.get("liters") or 0 for r in refuels), 3),
+                              "costEur": round(sum((r.get("liters") or 0) * (r.get("pricePerL") or 0) for r in refuels), 2),
+                              "undatedRefuels": sum(not r.get("ts") for r in _global_cache["refuels"])}
+            fuel["fcSuspects"] = [t for t in fuel["fcSuspects"] if _in_period(t.get("start"), from_date, to_date)]
+            catalog = _global_cache["catalog"]
+            scope = {"fromDate": from_date, "toDate": to_date,
+                     "trips": "selected_period" if from_date or to_date else "all",
+                     "trendInsights": "selected_period" if from_date or to_date else "all",
+                     "vehicle": "latest_global", "fuelLevel": "latest_global",
+                     "tankToTank": "interval_end_in_period", "refuels": "refuel_date_in_period"}
+            payload = {"vehicle": _global_cache["vehicle"], "trips": slim,
+                       "alerts": myop_parser.ALERT_DICT, "trendInsights": insight_svc.cross_trip(trips),
+                       "pidCatalog": catalog, "pidGroups": _build_pid_groups(catalog),
+                       "settings": _global_cache["settings"], "fuel": fuel,
+                       "aggregates": _period_aggregates(trips), "scope": scope}
+            if len(_dashboard_cache) >= 16:
+                _dashboard_cache.pop(next(iter(_dashboard_cache)))
+            _dashboard_cache[key] = _safe(payload)
+        # Worker errors/status may change without a database mutation.
+        payload = _dashboard_cache[key]
+        return {**payload, "meta": {**_platform_meta(), "scope": payload["scope"]}}
 
 
 @app.get("/api/v1/dashboard")
-def dashboard():
-    """Return dashboard summaries, or an explicit retryable loading error."""
+def dashboard(from_date: str | None = None, to_date: str | None = None):
+    """Return date-scoped summaries and explicit global state, with retryable failures."""
     try:
-        return JSONResponse(_dashboard_payload(), headers={"Cache-Control": "no-store"})
+        return JSONResponse(_dashboard_payload(from_date, to_date), headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
     except Exception:
         log.exception("Dashboard data generation failed")
         raise HTTPException(status_code=503, detail="Dati temporaneamente non disponibili. Riprova o consulta lo stato importazioni.")
@@ -467,8 +580,10 @@ def data_js():
 # ── REST endpoints ────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/trips")
-def list_trips():
-    return db.get_all_trips()
+def list_trips(from_date: str | None = None, to_date: str | None = None, summary: bool = False):
+    """Export full trips or light summaries using the dashboard's local-day bounds."""
+    _validate_period(from_date, to_date)
+    return _effective_trip_metrics(db.get_trip_summaries(from_date, to_date) if summary else db.get_all_trips(from_date, to_date))
 
 
 @app.get("/api/v1/trips/{trip_id}")
@@ -476,13 +591,14 @@ def get_trip(trip_id: str):
     trip = db.get_trip(trip_id)
     if trip is None:
         raise HTTPException(status_code=404, detail="Trip not found")
-    return trip
+    return _effective_trip_metrics([trip])[0]
 
 
 @app.get("/api/v1/tracks")
-def all_tracks():
-    """All GPS tracks keyed by trip id — loaded once when the map view opens."""
-    return db.get_all_tracks()
+def all_tracks(from_date: str | None = None, to_date: str | None = None):
+    """GPS tracks in the selected local-date range, loaded when the map opens."""
+    _validate_period(from_date, to_date)
+    return db.get_all_tracks(from_date, to_date)
 
 
 def _upload_name(filename: str | None, extensions: tuple[str, ...]) -> str:
@@ -582,7 +698,8 @@ async def merge_trips(payload: dict):
 def health():
     """Check usable dashboard data and the worker, with release identity for deploys."""
     try:
-        _dashboard_payload()
+        db.check_readiness()
+        SettingsUpdate.model_validate({key: effective_settings()[key] for key in DEFAULT_SETTINGS})
         if not getattr(app.state, "ready", False) or not _watcher.status()["running"]:
             raise RuntimeError("Avvio o arresto in corso")
         return {"status": "ok", **_platform_meta()}
@@ -631,14 +748,9 @@ def put_settings(payload: SettingsUpdate):
 # ── Refuel ledger + fuel model ────────────────────────────────────────────────
 
 @app.get("/api/v1/fuel")
-def get_fuel():
-    """Tank level (ledger − consumption or OBD sender), tank-to-tank economy,
-    the refuel ledger, and any stale-fuelConsumption suspects."""
-    trips = db.get_all_trips()
-    settings = effective_settings()
-    summary = fuel_svc.fuel_summary(db.get_refuels(), trips, settings, db.get_raw_trips("myopel"))
-    summary["refuels"] = db.get_refuels()
-    return summary
+def get_fuel(from_date: str | None = None, to_date: str | None = None):
+    """Date-scoped refuels and intervals, keeping the current tank estimate global."""
+    return _dashboard_payload(from_date, to_date)["fuel"]
 
 
 @app.post("/api/v1/refuels")
@@ -646,6 +758,16 @@ def add_refuel(payload: RefuelCreate):
     """Record a validated refuel atomically, preserving local timestamp semantics."""
     with ingest.LOCK:
         return {"ok": True, "refuel": db.add_refuel(payload.model_dump())}
+
+
+@app.put("/api/v1/refuels/{refuel_id}")
+def edit_refuel(refuel_id: int, payload: RefuelCreate):
+    """Replace one validated ledger entry atomically; a missing ID remains a 404."""
+    with ingest.LOCK:
+        result = db.update_refuel(refuel_id, payload.model_dump())
+        if result is None:
+            raise HTTPException(status_code=404, detail="Rifornimento non trovato")
+        return {"ok": True, "refuel": result}
 
 
 @app.delete("/api/v1/refuels/{refuel_id}")

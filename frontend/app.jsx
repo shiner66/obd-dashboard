@@ -10,7 +10,7 @@ const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "theme": "midnight",
   "accent": "cyan",
   "density": "regular",
-  "anim": "playful",
+  "anim": "subtle",
   "sidebar": "auto",
   "showSpeakerSparks": true,
   "mapTiles": "dark"
@@ -33,6 +33,13 @@ let _snapshotText = null;
 let _refreshPending = null;
 let _dataVersion = 0;
 let _dashboardMeta = null;
+let _dashboardAggregates = null;
+let _periodQuery = null;
+let _appliedPeriodQuery = null;
+let _periodLabel = "";
+let _requestedRange = null;
+const _periodGate = OBD.requestGate();
+const PeriodScope = React.createContext({ label: "", query: "", fromDate: null, toDate: null });
 
 /** Read an API response with a finite timeout and a useful user-facing error. */
 async function apiJson(url, options = {}) {
@@ -42,7 +49,7 @@ async function apiJson(url, options = {}) {
     const response = await fetch(url, { ...options, cache: "no-store", signal: controller.signal });
     if (!response.ok) {
       const error = await response.json().catch(() => ({}));
-      throw new Error(typeof error.detail === "string" ? error.detail : `Servizio non disponibile (HTTP ${response.status})`);
+      throw new Error(OBD.apiError(error.detail, `Servizio non disponibile (HTTP ${response.status})`));
     }
     return await response.json();
   } catch (error) {
@@ -51,32 +58,80 @@ async function apiJson(url, options = {}) {
   } finally { clearTimeout(timeout); }
 }
 
-/** Replace a complete snapshot atomically, preserving the last data on failures. */
+/** Select a global period before starting any refresh for that selection. */
+function selectDashboardPeriod(range) {
+  _periodGate.select(range.query);
+  _periodQuery = range.query; _periodLabel = range.label; _requestedRange = range;
+  return refreshDashboard();
+}
+
+/** Commit only the snapshot matching the latest selected period. */
 function refreshDashboard(force = false) {
-  if (_refreshPending) return force
-    ? _refreshPending.catch(() => {}).then(() => refreshDashboard())
-    : _refreshPending;
-  window.dispatchEvent(new CustomEvent("dashboard-status", { detail: { loading: true } }));
-  _refreshPending = apiJson("/api/v1/dashboard").then(raw => {
+  if (_periodQuery === null) return Promise.resolve(null);
+  const ticket = _periodGate.ticket(), query = _periodQuery, label = _periodLabel, range = _requestedRange;
+  if (_refreshPending?.ticket === ticket) return force
+    ? _refreshPending.promise.catch(() => {}).then(() => refreshDashboard())
+    : _refreshPending.promise;
+  window.dispatchEvent(new CustomEvent("dashboard-status", { detail: { loading: true, periodPending: _appliedPeriodQuery !== query } }));
+  const promise = apiJson("/api/v1/dashboard" + query).then(raw => {
+    if (!_periodGate.current(ticket)) return refreshDashboard();
     const data = OBD.validateSnapshot(raw), serialized = JSON.stringify(data);
-    const changed = serialized !== _snapshotText;
+    const changed = serialized !== _snapshotText || _appliedPeriodQuery !== query;
     if (changed) {
       VEHICLE = data.vehicle; TRIPS = data.trips; ALERTS = data.alerts;
       PID_CATALOG = data.pidCatalog; PID_GROUPS = data.pidGroups; TREND_INSIGHTS = data.trendInsights;
-      SETTINGS = data.settings; FUEL = data.fuel;
-      _dashboardMeta = data.meta || null;
+      SETTINGS = data.settings; FUEL = data.fuel; _dashboardMeta = data.meta || null;
+      _dashboardAggregates = data.aggregates || null;
       Object.keys(_tripCache).forEach(key => delete _tripCache[key]);
       _snapshotText = serialized; _dataVersion += 1;
       window.DASHBOARD_BOOTSTRAP_ERROR = false;
     }
-    window.dispatchEvent(new CustomEvent("dashboard-status", { detail: { loading: false, error: null, checked: new Date(), changed } }));
+    _appliedPeriodQuery = query;
+    window.dispatchEvent(new CustomEvent("dashboard-status", { detail: { loading: false, periodPending: false, error: null, checked: new Date(), changed, query, label, range } }));
     return data;
   }).catch(error => {
-    window.dispatchEvent(new CustomEvent("dashboard-status", { detail: { loading: false, error: error.message } }));
+    if (!_periodGate.current(ticket)) return refreshDashboard();
+    window.dispatchEvent(new CustomEvent("dashboard-status", { detail: { loading: false, periodPending: _appliedPeriodQuery !== query, error: error.message } }));
     throw error;
-  }).finally(() => { _refreshPending = null; });
-  return _refreshPending;
+  }).finally(() => { if (_refreshPending?.promise === promise) _refreshPending = null; });
+  _refreshPending = { ticket, promise };
+  return promise;
 }
+window.OBD_API = { json: apiJson };
+
+/** Keep list rendering bounded while preserving pages across background refreshes. */
+function usePagination(items, resetKey, size = 20) {
+  const [page, setPage] = useState(1);
+  useEffect(() => setPage(1), [resetKey]);
+  return { ...OBD.pageItems(items, page, size), setPage };
+}
+
+/** Readable page controls shared by long lists and tables. */
+const Pagination = ({ page, pages, start, end, total, setPage }) => total > 0 ? (
+  <nav className="pagination" aria-label="Pagine dei risultati">
+    <span>{start}–{end} di {OBD.measurement(total, 0)}</span>
+    <div><button className="icon-btn" disabled={page <= 1} onClick={() => setPage(page - 1)} aria-label="Pagina precedente">←</button>
+      <span>{page} / {pages}</span>
+      <button className="icon-btn" disabled={page >= pages} onClick={() => setPage(page + 1)} aria-label="Pagina successiva">→</button></div>
+  </nav>
+) : null;
+
+/** Select one inclusive calendar period used by every analytical view and export. */
+const PeriodToolbar = ({ selection, onChange, range, loading }) => (
+  <section className="period-toolbar" aria-label="Periodo dei dati">
+    <span className="period-title">Periodo</span>
+    <div className="period-presets">
+      {[["7d", "7 giorni"], ["30d", "30 giorni"], ["month", "Questo mese"], ["custom", "Personalizzato"], ["all", "Tutto"]].map(([preset, label]) =>
+        <button key={preset} className={`chip ${selection.preset === preset ? "active" : ""}`} aria-pressed={selection.preset === preset}
+          onClick={() => onChange(preset === "custom" ? { preset, fromDate: range.fromDate || OBD.localDateTime().slice(0, 10), toDate: range.toDate || OBD.localDateTime().slice(0, 10) } : { preset })}>{label}</button>)}
+    </div>
+    {selection.preset === "custom" && <div className="period-dates">
+      <label>Dal <input type="date" value={selection.fromDate || ""} onChange={e => onChange({ ...selection, fromDate: e.target.value })} /></label>
+      <label>Al <input type="date" value={selection.toDate || ""} onChange={e => onChange({ ...selection, toDate: e.target.value })} /></label>
+    </div>}
+    <span className={`period-caption ${range.error ? "error" : ""}`} role={range.error ? "alert" : undefined}>{range.error || `${range.label}${loading ? " · aggiornamento…" : ""}`}</span>
+  </section>
+);
 
 /** Hydrate one trip, exposing loading/errors separately from genuinely absent data. */
 function useHydratedTrip(tripId) {
@@ -129,20 +184,20 @@ const myopDistance = trip => trip.sources.includes("obd") ? trip.myopDistanceKm 
 /* ============== Top bar ============== */
 const exportTrips = async () => {
   try {
-    const r = await fetch("/api/v1/trips");
+    const r = await fetch("/api/v1/trips" + (_appliedPeriodQuery || ""));
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `obd-trips-${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `obd-viaggi-${OBD.localDateTime().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
   } catch (e) { alert("Export fallito: " + e.message); }
 };
 
 const TopBar = ({ view, onMenu, status, onRefresh, onAppearance }) => {
-  const last = TRIPS[0];
+  const scope = React.useContext(PeriodScope);
   return (
     <div className="topbar">
       <button className="menu-btn" onClick={onMenu} aria-label="Apri menu">
@@ -153,17 +208,12 @@ const TopBar = ({ view, onMenu, status, onRefresh, onAppearance }) => {
         <h1>{view}</h1>
       </div>
       <div className="topbar-spacer" />
-      {last && (
-        <span className="topbar-meta mono muted">
-          ultimo viaggio {new Date(last.start).toLocaleDateString("it-IT", { day: "2-digit", month: "short" })}
-          {" · "}{last.distanceKm?.toFixed(1)} km
-        </span>
-      )}
+      <span className="topbar-meta muted">{TRIPS.length} viaggi nel periodo</span>
       <button className="icon-btn" onClick={onRefresh} disabled={status.loading} aria-label="Aggiorna i dati" title="Aggiorna i dati">
         <Icon name="trend" size={14} /><span>{status.loading ? "Aggiorno…" : "Aggiorna"}</span>
       </button>
       <button className="icon-btn" onClick={onAppearance} aria-label="Aspetto e preferenze" title="Aspetto e preferenze"><Icon name="settings" size={14} /></button>
-      <button className="icon-btn" onClick={exportTrips} title="Scarica tutti i viaggi in JSON">
+      <button className="icon-btn" onClick={exportTrips} disabled={status.periodPending} title={`Esporta i viaggi del periodo: ${scope.label}`}>
         <Icon name="download" size={14} /><span>Esporta</span>
       </button>
     </div>
@@ -178,6 +228,7 @@ const Sidebar = ({ active, setActive }) => {
     { id: "dashboard", icon: "gauge",    label: "Dashboard" },
     { id: "trips",     icon: "list",     label: "Viaggi",       badge: TRIPS.length },
     { id: "map",       icon: "map",      label: "Mappa" },
+    { id: "compare",   icon: "chart",    label: "Confronta viaggi" },
     { id: "fuel",      icon: "droplet",  label: "Carburante" },
     { id: "pids",      icon: "pid",      label: "PID Explorer", badge: usefulPids },
     { id: "dpf",       icon: "chart",    label: "DPF / FAP" },
@@ -196,7 +247,7 @@ const Sidebar = ({ active, setActive }) => {
         <div className="brand-mark"></div>
         <div>
           <div className="brand-name">OBD Cockpit</div>
-          <div className="brand-sub"><span className="live-dot"></span>v0.8 · ultimo dato registrato</div>
+          <div className="brand-sub"><span className="live-dot"></span>v0.9 · dati registrati</div>
         </div>
       </div>
 
@@ -211,7 +262,7 @@ const Sidebar = ({ active, setActive }) => {
         </button>
       ))}
 
-      <div className="nav-section">Sorgenti</div>
+      <div className="nav-section">Sorgenti nel periodo</div>
       <div className="nav-item" style={{ cursor: "default" }}>
         <span className="src-tag obd">OBD</span>
         <span style={{ fontSize: 12, color: "var(--fg-2)" }}>CarScanner CSV</span>
@@ -236,11 +287,12 @@ const Sidebar = ({ active, setActive }) => {
           />
         )}
         <div className="veh-name">{VEHICLE.name}</div>
+        <div className="global-scope-label">Stato veicolo · ultimo dato globale</div>
         <div className="muted mono" style={{ fontSize: 11, marginBottom: 8 }}>{VEHICLE.ecu}</div>
         <div className="veh-row"><span>Odometro</span><span className="v">{VEHICLE.odometer?.toLocaleString("it-IT") ?? "—"} km</span></div>
         <div className="veh-row"><span>Carburante</span><span className="v">{VEHICLE.fuelLevel ?? "—"}% · {VEHICLE.fuelAutonomy ?? "—"} km</span></div>
         <div className="veh-row"><span>AdBlue</span><span className="v">{VEHICLE.adblueRange?.toLocaleString("it-IT") ?? "—"} km</span></div>
-        <div className="veh-row"><span>Batteria</span><span className="v">{VEHICLE.battery?.toFixed(2) ?? "—"} V</span></div>
+        <div className="veh-row"><span>Batteria</span><span className="v">{VEHICLE.battery?.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? "—"} V</span></div>
         <div className="veh-row"><span>Service</span><span className="v">{VEHICLE.nextService?.days ?? "—"} g · {VEHICLE.nextService?.km?.toLocaleString("it-IT") ?? "—"} km</span></div>
       </div>
     </aside>
@@ -248,212 +300,70 @@ const Sidebar = ({ active, setActive }) => {
 };
 
 /* ============== Dashboard view ============== */
+/** Compact overview: selected-period totals alongside explicitly global vehicle status. */
 const Dashboard = ({ setActive, setSelectedTripId }) => {
-  const recent = TRIPS.slice(0, 5);
-  const obd = TRIPS.filter(t => t.sources.includes("obd"));
-  const myop = TRIPS.filter(t => t.sources.includes("myopel"));
-  const totalKm = TRIPS.reduce((a, t) => a + (t.distanceKm || 0), 0);
-  const totalMin = TRIPS.reduce((a, t) => a + (t.durationMin || 0), 0);
-  // Average consumption over trips that have BOTH km and fuel — mixing all-trip
-  // km with fuel from a subset produced absurd averages.
-  const fueled = TRIPS.filter(t => t.fuelConsumedL > 0 && t.distanceKm > 0 && t.consumptionKmL > 0);
-  const totalFuel = fueled.reduce((a, t) => a + t.fuelConsumedL, 0);
-  const fueledKm  = fueled.reduce((a, t) => a + (OBD.tripEconomyDistance(t) || 0), 0);
-  const avgCons = OBD.weightedEconomy(fueled.map(t => ({ km: OBD.tripEconomyDistance(t), liters: t.fuelConsumedL })));
-  const cost = TRIPS.reduce((a, t) => a + (t.costEur || 0), 0);
-  const fuelPriced = myop.filter(t => t.priceFuel);
-  const avgFuelPrice = fuelPriced.length > 0
-    ? fuelPriced.reduce((a, t) => a + t.priceFuel, 0) / fuelPriced.length
-    : null;
-
-  // km/L per trip, chronological (last 30 trips with data)
-  const consSeries = [...TRIPS]
-    .sort((a, b) => (a.start || "").localeCompare(b.start || ""))
-    .filter(t => t.consumptionKmL)
-    .slice(-30);
-
-  // km per calendar day, last 3 weeks (gaps kept as zero — honest activity view)
-  const kmByDay = useMemo(() => {
-    const per = {};
-    TRIPS.forEach(t => {
-      const d = (t.start || "").slice(0, 10);
-      if (d) per[d] = (per[d] || 0) + (t.distanceKm || 0);
-    });
-    const days = Object.keys(per).sort();
-    if (!days.length) return [];
-    const last = new Date(days[days.length - 1]);
-    const out = [];
-    for (let i = 20; i >= 0; i--) {
-      const d = new Date(last); d.setDate(last.getDate() - i);
-      const key = d.toISOString().slice(0, 10);
-      out.push({
-        label: d.toLocaleDateString("it-IT", { day: "2-digit", month: "short" }),
-        value: per[key] || 0,
-      });
-    }
-    return out;
-  }, [TRIPS]);
-
-  const regenPct = (VEHICLE.dpfSinceRegenKm != null && VEHICLE.dpfAvgRegenKm > 0)
-    ? VEHICLE.dpfSinceRegenKm / VEHICLE.dpfAvgRegenKm * 100 : null;
-
+  const scope = React.useContext(PeriodScope);
+  const metrics = OBD.periodMetrics(TRIPS, _dashboardAggregates);
+  const fueled = TRIPS.filter(trip => OBD.usableForAnalysis(trip) && trip.fuelConsumedL > 0 && trip.fuelDistanceKm > 0);
+  const activity = useMemo(() => OBD.activitySeries(TRIPS, scope), [TRIPS, scope.fromDate, scope.toDate]);
+  const consumption = [...fueled].sort((a, b) => a.start.localeCompare(b.start));
+  const attention = TREND_INSIGHTS.filter(insight => ["critical", "warning"].includes(insight.level))
+    .sort((a, b) => (a.level === "critical" ? 0 : 1) - (b.level === "critical" ? 0 : 1));
+  const recent = TRIPS.slice(0, 4);
   return (
-    <div className="page" style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-      {/* ── Hero cockpit ─────────────────────────────────────────── */}
-      <section className="hero-band">
-        {VEHICLE.vin && (
-          <img className="hero-car" alt=""
-               src={`https://visual3d-secure.opel-vauxhall.com/V3DImage.ashx?client=MyMarque&vin=${encodeURIComponent(VEHICLE.vin)}&format=png&width=560&view=001`}
-               onError={e => { e.target.style.display = "none"; }} />
-        )}
-        <div className="hero-info">
-          <div className="hero-kicker">{VEHICLE.ecu} · {VEHICLE.adapter}</div>
-          <h2 className="hero-title">{VEHICLE.name}</h2>
-          <div className="hero-odo">
-            {VEHICLE.odometer != null ? <AnimatedNumber value={VEHICLE.odometer} /> : "—"} <span className="u">km</span>
-          </div>
-          <div className="hero-chips">
-            <DpfPill state={VEHICLE.dpfRegenState} />
-            {VEHICLE.vin && <span className="chip-static mono">VIN ···{VEHICLE.vin.slice(-6)}</span>}
-            {VEHICLE.battery != null && <span className="chip-static mono">{VEHICLE.battery.toFixed(2)} V allo spunto</span>}
-          </div>
-        </div>
-        <div className="hero-gauges">
-          <div className="hg">
-            <RadialGauge value={VEHICLE.fuelLevel} max={100} label="%" thresholds={false} />
-            <div className="hg-lbl">Serbatoio{fuelSourceLabel(VEHICLE.fuelSource) ? ` · ${fuelSourceLabel(VEHICLE.fuelSource)}` : ""}</div>
-            <div className="hg-sub mono">
-              {VEHICLE.fuelLiters != null ? `${VEHICLE.fuelLiters} L · ` : ""}{fmtInt(VEHICLE.fuelAutonomy)} km
-            </div>
-          </div>
-          <div className="hg">
-            <RadialGauge value={VEHICLE.dpfClosedSoot} max={10} label="g/L" strokeColor="var(--warn)" decimals={1} />
-            <div className="hg-lbl">Soot DPF</div>
-            <div className="hg-sub mono">carico stimato dai sensori</div>
-          </div>
-          {regenPct != null && (
-            <div className="hg">
-              <RadialGauge value={regenPct} max={100} label="% media" strokeColor="var(--info)" thresholds={false} />
-              <div className="hg-lbl">Intervallo rispetto alla media</div>
-              <div className="hg-sub mono">{VEHICLE.dpfSinceRegenKm?.toFixed(0)} / {VEHICLE.dpfAvgRegenKm?.toFixed(0)} km</div>
-            </div>
-          )}
-        </div>
+    <div className="page dashboard-compact">
+      <section className="vehicle-strip" aria-label="Ultimo stato globale del veicolo">
+        <div className="vehicle-strip-title"><span className="eyebrow">Stato veicolo · ultimo dato globale</span>
+          <h2>{VEHICLE.name}</h2><span className="mono">{OBD.measurement(VEHICLE.odometer, 0)} km</span></div>
+        <div className="vehicle-reading"><span>Carburante</span><strong>{OBD.measurement(VEHICLE.fuelLevel, 0)} <small>%</small></strong><small>{fuelSourceLabel(VEHICLE.fuelSource) || "fonte non disponibile"}</small></div>
+        <div className="vehicle-reading"><span>Carico DPF</span><strong>{OBD.measurement(VEHICLE.dpfClosedSoot, 2)} <small>g/L</small></strong><DpfPill state={VEHICLE.dpfRegenState} /></div>
+        <div className="vehicle-reading"><span>Batteria all'avvio</span><strong>{OBD.measurement(VEHICLE.battery, 2)} <small>V</small></strong><small>ultima osservazione OBD</small></div>
+        <div className="vehicle-reading"><span>Tagliando tra</span><strong>{OBD.measurement(VEHICLE.nextService?.km, 0)} <small>km</small></strong><small>{OBD.measurement(VEHICLE.nextService?.days, 0)} giorni</small></div>
       </section>
 
-      <div className="stat-grid kpi-grid stagger">
-        <StatCard icon="list"  label="Viaggi totali" value={TRIPS.length} sub={`${obd.length} OBD · ${myop.length} MyOpel`} />
-        <StatCard icon="road"  label="Distanza" value={totalKm.toFixed(0)} unit="km" sub="tutti i viaggi" />
-        <StatCard icon="clock" label="Tempo osservato" value={(totalMin / 60).toFixed(1)} unit="h" sub="tempo coperto dai dati dei viaggi" />
-        <StatCard icon="fuel"  label="Consumo medio" value={OBD.measurement(avgCons)} unit="km/L" sub={`${fueled.length}/${TRIPS.length} viaggi con consumo valido · ${fueledKm.toFixed(0)} km coperti`} />
-        <StatCard icon="euro"  label="Spesa carburante" value={`€${cost.toFixed(0)}`} sub={`${myop.length} viaggi · €${avgFuelPrice?.toFixed(3) ?? "—"}/L`} />
+      <section aria-label="Riepilogo del periodo">
+        <div className="section-head"><h2 className="section-title">Nel periodo</h2><span className="section-sub">{scope.label}</span></div>
+        <div className="kpi-grid stat-grid compact-kpis">
+          <StatCard label="Viaggi" icon="list" value={OBD.measurement(TRIPS.length, 0)} sub={`${TRIPS.filter(t => t.sources.includes("obd")).length} con OBD`} />
+          <StatCard label="Distanza registrata" icon="road" value={OBD.measurement(metrics.totalKm, 1)} unit="km" sub={metrics.excludedFromComparisons ? "include lo storico non ricalcolato" : "viaggi registrati"} />
+          <StatCard label="Tempo osservato" icon="clock" value={OBD.measurement(metrics.observedTripCount ? metrics.observedMinutes / 60 : null, 1)} unit="h" sub="escluse lacune e storico non ricalcolato" />
+          <StatCard label="Consumo medio" icon="fuel" value={OBD.measurement(metrics.consumptionKmL, 1)} unit="km/L" sub={`${metrics.fuelTripCount}/${TRIPS.length} viaggi · ${OBD.measurement(metrics.fuelDistanceKm, 0)} km coperti`} />
+          <StatCard label="Costo viaggi stimato" icon="euro" value={OBD.measurement(metrics.costTripCount ? metrics.costEur : null, 2)} unit="€" sub={`${metrics.costTripCount}/${TRIPS.length} viaggi valorizzati`} />
+        </div>
+        {metrics.excludedFromComparisons > 0 && <div className="data-notice">{metrics.excludedFromComparisons} viaggi storici nel periodo non sono ricalcolabili in modo attendibile: restano nel conteggio e nella distanza registrata, ma sono esclusi da tempi, consumi, costi e confronti diagnostici.</div>}
+      </section>
+
+      <div className="overview-columns">
+        <section className="overview-attention">
+          <div className="section-head"><h2 className="section-title">Da tenere d'occhio</h2><button className="text-action" onClick={() => setActive("trends")}>Tutti i controlli →</button></div>
+          {attention.length ? <div className="attention-stack">{attention.slice(0, 3).map((insight, i) => <InsightCard key={i} insight={insight} />)}
+            {attention.length > 3 && <button className="text-action" onClick={() => setActive("trends")}>Altri {attention.length - 3} avvisi</button>}</div>
+            : <div className="card attention-empty"><Icon name="info" size={20} /><div>{TREND_INSIGHTS.length ? "Nessuna anomalia nei controlli disponibili per questo periodo." : "Dati insufficienti per valutare questo periodo."}<small>I controlli dipendono dai sensori e dalla copertura dei viaggi registrati.</small></div></div>}
+        </section>
+        <section>
+          <div className="section-head"><h2 className="section-title">Ultimi viaggi del periodo</h2><button className="text-action" onClick={() => setActive("trips")}>Vedi tutti →</button></div>
+          <div className="recent-rows">{recent.map(trip => <button key={trip.id} className="recent-row" onClick={() => { setSelectedTripId(trip.id); setActive("trips"); }}>
+            <span><strong>{new Date(trip.start).toLocaleDateString("it-IT", { day: "2-digit", month: "short" })}</strong><small>{new Date(trip.start).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}</small></span>
+            <span>{OBD.measurement(trip.distanceKm)} <small>km</small></span><span>{OBD.measurement(trip.consumptionKmL)} <small>km/L</small></span><Icon name="chevron" size={14} />
+          </button>)}{!recent.length && <div className="card muted">Nessun viaggio nel periodo selezionato.</div>}</div>
+        </section>
       </div>
 
-      <div className="charts-row">
-        {kmByDay.length > 0 && (
-          <div className="trend-card">
-            <div className="section-head" style={{ marginBottom: 4 }}>
-              <span className="section-title">Attività · km per giorno</span>
-              <span className="section-sub">ultime 3 settimane</span>
-            </div>
-            <BarChart data={kmByDay} color="var(--accent)" height={130} yLabel="km" />
-          </div>
-        )}
-        {consSeries.length >= 3 && (
-          <div className="trend-card">
-            <div className="section-head" style={{ marginBottom: 4 }}>
-              <span className="section-title">Consumo per viaggio</span>
-              <span className="section-sub">km/L · ultimi {consSeries.length}</span>
-              <span style={{ flex: 1 }} />
-              <span className="big-num" style={{ fontSize: 22 }}>
-                {consSeries[consSeries.length - 1].consumptionKmL.toFixed(1)}<span className="unit">km/L</span>
-              </span>
-            </div>
-            <LineChart data={consSeries.map(t => t.consumptionKmL)} labels={consSeries.map(t => new Date(t.start).toLocaleString("it-IT", { dateStyle: "short", timeStyle: "short" }))} color="var(--ok)" height={130} yLabel="km/L" />
-          </div>
-        )}
-      </div>
-
-      <div className="dash-health">
-        <div className="health-card">
-          <div className="section-head" style={{ marginBottom: 10 }}>
-            <span className="section-title">DPF / FAP</span>
-            <span style={{ flex: 1 }} />
-            <DpfPill state={VEHICLE.dpfRegenState} />
-          </div>
-          <div className="health-row">
-            <span>Km dall'ultima regen</span>
-            <span className="v mono">{VEHICLE.dpfSinceRegenKm?.toFixed(0) ?? "—"} <span className="muted">/ {VEHICLE.dpfAvgRegenKm?.toFixed(0) ?? "—"}</span></span>
-          </div>
-          {regenPct != null && <AnimatedBar value={regenPct} max={100} color="var(--info)" height={5} />}
-          <div className="health-row">
-            <span>Soot (closed loop)</span>
-            <span className="v mono">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</span>
-          </div>
-          {VEHICLE.dpfClosedSoot != null && (
-            <AnimatedBar value={VEHICLE.dpfClosedSoot} max={10} height={5}
-                         color={VEHICLE.dpfClosedSoot >= 7 ? "var(--crit)" : VEHICLE.dpfClosedSoot >= 5 ? "var(--warn)" : "var(--accent)"} />
-          )}
-          <div className="health-row">
-            <span>Vita residua filtro</span>
-            <span className="v mono">{VEHICLE.dpfReplaceKm ? fmtInt(Math.round(VEHICLE.dpfReplaceKm)) + " km" : "—"}</span>
-          </div>
+      <section>
+        <div className="section-head"><h2 className="section-title">Andamento</h2><span className="section-sub">tutti i dati del periodo selezionato</span></div>
+        <div className="overview-charts">
+          <div className="card"><h3>Distanza registrata per {activity.unit}</h3><BarChart data={activity.data} color="var(--accent)" height={145} yLabel="km" /></div>
+          <div className="card"><h3>Consumo per viaggio</h3><LineChart title="Resa per viaggio" data={consumption.map(trip => trip.consumptionKmL)}
+            labels={consumption.map(trip => new Date(trip.start).toLocaleString("it-IT", { dateStyle: "short", timeStyle: "short" }))} color="var(--ok)" height={145} yLabel="km/L" /></div>
         </div>
-
-        <div className="health-card">
-          <div className="section-head" style={{ marginBottom: 10 }}>
-            <span className="section-title">Livelli & servizio</span>
-          </div>
-          <div className="health-row">
-            <span>AdBlue</span>
-            <span className="v mono">{fmtInt(VEHICLE.adblueRange)} <span className="muted">km</span></span>
-          </div>
-          {VEHICLE.adblueRange != null && <AnimatedBar value={Math.min(VEHICLE.adblueRange, 6000)} max={6000} color="var(--accent)" height={5} />}
-          <div className="health-row">
-            <span>Prossimo tagliando</span>
-            <span className="v mono">{VEHICLE.nextService?.days ?? "—"} <span className="muted">g · {fmtInt(VEHICLE.nextService?.km)} km</span></span>
-          </div>
-          {VEHICLE.nextService?.km != null && <AnimatedBar value={Math.min(VEHICLE.nextService.km, 30000)} max={30000} color="var(--ok)" height={5} />}
-          <div className="health-row">
-            <span>Diluizione olio</span>
-            <span className="v mono">{VEHICLE.oilDilutionPct != null ? VEHICLE.oilDilutionPct + " %" : "—"}</span>
-          </div>
-          {VEHICLE.oilDilutionPct != null && (
-            <AnimatedBar value={VEHICLE.oilDilutionPct} max={10} height={5}
-                         color={VEHICLE.oilDilutionPct > 5 ? "var(--crit)" : VEHICLE.oilDilutionPct > 3.5 ? "var(--warn)" : "var(--ok)"} />
-          )}
-        </div>
-      </div>
-
-      <div>
-        <div className="section-head">
-          <span className="section-title">Viaggi recenti</span>
-          <span className="section-sub">{recent.length} di {TRIPS.length}</span>
-          <span style={{ flex: 1 }} />
-          <button className="icon-btn" onClick={() => setActive("trips")}>Vedi tutti <Icon name="chevron" size={12} /></button>
-        </div>
-        <div className="stagger" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 12 }}>
-          {recent.map(t => (
-            <TripCard key={t.id} trip={t} onClick={() => { setSelectedTripId(t.id); setActive("trips"); }} />
-          ))}
-        </div>
-      </div>
-
-      <div>
-        <div className="section-head">
-          <span className="section-title">Insights trasversali</span>
-          <span className="section-sub">{TREND_INSIGHTS.length} regole attive</span>
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 12 }}>
-          {TREND_INSIGHTS.map((ins, i) => <InsightCard key={i} insight={ins} />)}
-        </div>
-      </div>
+      </section>
     </div>
   );
 };
 
 /* ============== Trips view (list + detail) ============== */
-const TripsView = ({ selectedId, setSelectedId }) => {
+const TripsView = ({ selectedId, setSelectedId, evidence }) => {
+  const scope = React.useContext(PeriodScope);
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
 
@@ -473,7 +383,9 @@ const TripsView = ({ selectedId, setSelectedId }) => {
     });
   }, [filter, search, TRIPS]);
 
+  const page = usePagination(filtered, scope.query + filter + search, 20);
   const trip = OBD.selectedTrip(filtered, selectedId);
+  useEffect(() => { const index = filtered.findIndex(t => t.id === selectedId); if (index >= 0) page.setPage(Math.floor(index / 20) + 1); }, [selectedId]);
   useEffect(() => { if (trip?.id !== selectedId) setSelectedId(trip?.id || null); }, [trip?.id, selectedId]);
 
   // On phones the list sits above the detail: bring the detail into view on tap.
@@ -508,26 +420,28 @@ const TripsView = ({ selectedId, setSelectedId }) => {
           </div>
         </div>
         <div className="trip-scroller stagger">
-          {filtered.map(t => (
+          {page.items.map(t => (
             <TripCard key={t.id} trip={t} active={trip && t.id === trip.id} onClick={() => selectTrip(t.id)} />
           ))}
         </div>
+        <Pagination {...page} setPage={number => { page.setPage(number); setSelectedId(filtered[(number - 1) * 20]?.id || null); }} />
         {filtered.length === 0 && (
           <div className="muted" style={{ padding: 20, textAlign: "center" }}>Nessun viaggio corrisponde ai filtri.</div>
         )}
       </div>
 
-      {trip ? <TripDetail trip={trip} /> : <div className="empty-state">Seleziona un viaggio</div>}
+      {trip ? <TripDetail trip={trip} evidence={evidence?.tripId === trip.id ? evidence : null} /> : <div className="empty-state">Seleziona un viaggio</div>}
     </div>
   );
 };
 
 /* ============== Trip detail panel ============== */
-const TripDetail = ({ trip: summaryTrip }) => {
+const TripDetail = ({ trip: summaryTrip, evidence }) => {
   const [requestedTab, setTab] = useState("overview");
   const trip = useHydratedTrip(summaryTrip.id);
   const tab = OBD.tripTab(requestedTab, trip);
   useEffect(() => setTab(current => OBD.tripTab(current, trip)), [trip.id, trip.sources.join(",")]);
+  useEffect(() => { if (evidence?.tripId === trip.id) setTab(evidence.pidSlug ? "analysis" : "overview"); }, [evidence]);
   const isObd = trip.sources.includes("obd");
   const startDate = new Date(trip.start);
 
@@ -559,8 +473,8 @@ const TripDetail = ({ trip: summaryTrip }) => {
       <div className="tabs">
         {[
           ["overview", "Panoramica"],
-          ...(isObd ? [["dpf", "DPF / FAP"], ["pids", "PID Explorer"]] : []),
-          ["insights", `Insights${trip.insights?.length ? " · " + trip.insights.length : ""}`],
+          ...(isObd ? [["analysis", "Analisi segnali"], ["dpf", "DPF / FAP"], ["pids", "Catalogo PID"]] : []),
+          ["insights", `Osservazioni${trip.insights?.length ? " · " + trip.insights.length : ""}`],
         ].map(([id, lbl]) => (
           <button type="button" key={id} className={`tab ${tab === id ? "active" : ""}`} aria-pressed={tab === id} onClick={() => setTab(id)}>{lbl}</button>
         ))}
@@ -569,6 +483,7 @@ const TripDetail = ({ trip: summaryTrip }) => {
       <DetailStatus trip={trip} />
       {[...(trip.qualityWarnings || []), ...(trip.dpfQualityWarnings || [])].length > 0 && <div className="data-notice">Qualità dati: {[...(trip.qualityWarnings || []), ...(trip.dpfQualityWarnings || [])].join(" · ")}</div>}
       {tab === "overview" && <TripOverview trip={trip} />}
+      {tab === "analysis" && <TripExploration trip={trip} initialPid={evidence?.pidSlug} />}
       {tab === "dpf" && <TripDpf trip={trip} />}
       {tab === "pids" && <TripPids trip={trip} />}
       {tab === "insights" && <TripInsights trip={trip} />}
@@ -610,13 +525,13 @@ const TripOverview = ({ trip }) => {
         </div>
 
         <div className="stat-grid">
-          <StatCard label="Distanza"   value={trip.distanceKm?.toFixed(1) ?? "—"} unit="km" sub={trip.distanceSource ? `Fonte: ${DISTANCE_SOURCE_LABEL[trip.distanceSource] || trip.distanceSource}` : "Fonte non documentata"} />
-          <StatCard label="Tempo osservato" value={trip.durationMin?.toFixed(1) ?? "—"} unit="min" sub={trip.recordingGapSeconds > 0 ? `${OBD.measurement(trip.recordingGapSeconds / 60)} min senza campioni · intervallo ${OBD.measurement(trip.elapsedDurationMin)} min` : "durata coperta dai dati"} />
-          <StatCard label="Velocità media osservata" value={trip.avgSpeedKmh?.toFixed(0) ?? "—"} unit="km/h" />
-          <StatCard label="Vel. max"   value={trip.maxSpeedKmh?.toFixed(0) ?? "—"} unit="km/h" />
-          <StatCard label="Consumo"    value={trip.consumptionKmL?.toFixed(1) ?? "—"} unit="km/L"
-                    sub={trip.consumptionL100km ? `${trip.consumptionL100km.toFixed(1)} L/100km` : undefined} />
-          <StatCard label="Carburante" value={trip.fuelConsumedL?.toFixed(2) ?? "—"} unit="L" sub={`${fuelSourceLabel(trip.fuelSource) || "Fonte non disponibile"} · copertura ${trip.fuelCoveragePct != null ? OBD.measurement(trip.fuelCoveragePct) + "%" : "non disponibile"}${trip.fuelDensityGL != null ? " · conversione " + trip.fuelDensityGL + " g/L" : ""}`} />
+          <StatCard label="Distanza"   value={trip.distanceKm?.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) ?? "—"} unit="km" sub={trip.distanceSource ? `Fonte: ${DISTANCE_SOURCE_LABEL[trip.distanceSource] || trip.distanceSource}` : "Fonte non documentata"} />
+          <StatCard label="Tempo osservato" value={trip.durationMin?.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) ?? "—"} unit="min" sub={trip.recordingGapSeconds > 0 ? `${OBD.measurement(trip.recordingGapSeconds / 60)} min senza campioni · intervallo ${OBD.measurement(trip.elapsedDurationMin)} min` : "durata coperta dai dati"} />
+          <StatCard label="Velocità media osservata" value={trip.avgSpeedKmh?.toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 }) ?? "—"} unit="km/h" />
+          <StatCard label="Vel. max"   value={trip.maxSpeedKmh?.toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 }) ?? "—"} unit="km/h" />
+          <StatCard label="Consumo"    value={trip.consumptionKmL?.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) ?? "—"} unit="km/L"
+                    sub={trip.consumptionL100km ? `${trip.consumptionL100km.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} L/100 km` : undefined} />
+          <StatCard label="Carburante" value={trip.fuelConsumedL?.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? "—"} unit="L" sub={`${fuelSourceLabel(trip.fuelSource) || "Fonte non disponibile"} · copertura ${trip.fuelCoveragePct != null ? OBD.measurement(trip.fuelCoveragePct) + "%" : "non disponibile"}${trip.fuelDensityGL != null ? " · conversione " + trip.fuelDensityGL + " g/L" : ""}`} />
         </div>
       </div>
 
@@ -631,7 +546,7 @@ const TripOverview = ({ trip }) => {
               { slugs: ["rpm"],                          name: "Giri motore",   unit: "rpm",  color: "var(--accent)", agg: "mean" },
               { slugs: ["speed", "speed_v"],             name: "Velocità",      unit: "km/h", color: "var(--accent)", agg: "mean" },
               { slugs: ["coolant", "coolant_c"],         name: "Liquido raffr.",unit: "°C",   color: "var(--warn)",   agg: "max" },
-              { slugs: ["egt_a"],                        name: "EGT post-cat",  unit: "°C",   color: "var(--crit)",   agg: "max" },
+              { slugs: ["egt_a"],                        name: "Temperatura scarico",  unit: "°C",   color: "var(--crit)",   agg: "max" },
               { slugs: ["soot_cl", "closed_soot", "soot"], name: "Soot DPF",    unit: "g/L",  color: "var(--warn)",   agg: "last" },
               { slugs: ["boost"],                        name: "Pressione turbo", unit: "bar", color: "var(--info)",  agg: "max" },
             ].map(p => {
@@ -641,7 +556,7 @@ const TripOverview = ({ trip }) => {
               const series = pickSeries(trip, p.slugs);
               const shown = p.agg === "max" ? stats.max : p.agg === "mean" ? stats.mean : stats.last;
               const unit = (PID_CATALOG.find(c => c.slug === slug)?.unit || p.unit).replace(/_/g, "/");
-              const f = v => (typeof v === "number" ? +v.toFixed(1) : v ?? "—");
+              const f = v => typeof v === "number" ? OBD.measurement(v, 1) : v ?? "—";
               return (
                 <div className="spark-tile" key={p.name}>
                   <div className="head">
@@ -676,7 +591,7 @@ const TripOverview = ({ trip }) => {
             <StatCard label="Odometro fine" value={trip.odometerKm?.toLocaleString("it-IT") ?? "—"} unit="km" />
             {trip.fuelLevel != null && <StatCard label="Serbatoio a fine" value={trip.fuelLevel} unit="%" />}
             {trip.fuelAutonomy != null && <StatCard label="Autonomia" value={trip.fuelAutonomy} unit="km" />}
-            {trip.costEur && <StatCard label="Costo stimato" value={`€${trip.costEur.toFixed(2)}`} sub={`@ €${trip.priceFuel}/L`} />}
+            {trip.costEur && <StatCard label="Costo stimato" value={`€${trip.costEur.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`} sub={`@ €${trip.priceFuel}/L`} />}
             {trip.priceFuel && <StatCard label="Prezzo carburante" value={`€${trip.priceFuel}`} unit="/L" />}
           </div>
           {trip.sources.includes("obd") && trip.myopDistanceKm != null && trip.distanceKm > 0 &&
@@ -686,7 +601,7 @@ const TripOverview = ({ trip }) => {
               <div className="insight-body">
                 <div className="insight-title">Copertura Stellantis parziale</div>
                 <div className="insight-text">
-                  MyOpel ha registrato {trip.myopDistanceKm.toFixed(1)} km dei {trip.distanceKm.toFixed(1)} km
+                  MyOpel ha registrato {trip.myopDistanceKm.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} km dei {trip.distanceKm.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} km
                   della sessione OBD: i valori MyOpel si riferiscono alle sole tratte registrate. Il consumo principale indica la propria fonte e copertura.
                 </div>
               </div>
@@ -713,18 +628,18 @@ const TripDpf = ({ trip }) => {
         <div className="dpf-meta">
           <div><div className="lbl">Evento nel viaggio</div><div className="v"><DpfPill state={trip.dpfRegenState} /></div></div>
           <div><div className="lbl">Ultimo campione ECU</div><div className="v">{trip.dpfEndObservedActive === true ? "Rigenerazione attiva" : trip.dpfEndObservedActive === false ? "Rigenerazione non attiva" : "Non determinabile"}</div></div>
-          <div><div className="lbl">Closed soot</div><div className="v">{trip.dpfClosedSoot != null ? trip.dpfClosedSoot + " g/L" : "—"}</div></div>
+          <div><div className="lbl">Carico DPF</div><div className="v">{trip.dpfClosedSoot != null ? trip.dpfClosedSoot + " g/L" : "—"}</div></div>
           <div><div className="lbl">Km dall'ultima regen</div><div className="v">{trip.dpfSinceRegenKm} <span className="muted">/ {trip.dpfAvgRegenKm} avg</span></div></div>
-          <div><div className="lbl">EGT post-cat (peak)</div><div className="v">{trip.exhaustAfterCatC} <span className="muted">°C</span></div></div>
-          <div><div className="lbl">NOx cat (peak)</div><div className="v">{trip.noxCatTempMaxC} <span className="muted">°C</span></div></div>
-          <div><div className="lbl">Vita residua DPF</div><div className="v">{trip.dpfReplaceKm != null ? (trip.dpfReplaceKm / 1000).toFixed(1) + "k" : "—"} <span className="muted">km</span></div></div>
-          <div><div className="lbl">Olio dilution</div><div className="v">{trip.oilDilutionPct != null ? trip.oilDilutionPct + " %" : "—"}</div></div>
+          <div><div className="lbl">Temperatura scarico massima</div><div className="v">{trip.exhaustAfterCatC} <span className="muted">°C</span></div></div>
+          <div><div className="lbl">Temperatura NOx massima</div><div className="v">{trip.noxCatTempMaxC} <span className="muted">°C</span></div></div>
+          <div><div className="lbl">Vita residua DPF</div><div className="v">{trip.dpfReplaceKm != null ? (trip.dpfReplaceKm / 1000).toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "k" : "—"} <span className="muted">km</span></div></div>
+          <div><div className="lbl">Diluizione olio</div><div className="v">{trip.oilDilutionPct != null ? trip.oilDilutionPct + " %" : "—"}</div></div>
         </div>
       </div>
 
       <div>
         <div className="section-head">
-          <span className="section-title">DPF state machine</span>
+          <span className="section-title">Fasi della rigenerazione</span>
           <span className="section-sub">stato dedotto dai segnali disponibili nel viaggio</span>
         </div>
         <div className="dpf-state-row" style={{ display: "flex", gap: 0, alignItems: "center", flexWrap: "wrap" }}>
@@ -752,7 +667,7 @@ const TripDpf = ({ trip }) => {
 
       <div>
         <div className="section-head">
-          <span className="section-title">EGT post-catalizzatore</span>
+          <span className="section-title">Temperatura scaricoalizzatore</span>
           <span className="section-sub">temperatura indicativa di rigenerazione: oltre 550 °C</span>
         </div>
         <div style={{ background: "var(--bg-1)", border: "1px solid var(--line-soft)", borderRadius: "var(--r)", padding: 12 }}>
@@ -783,7 +698,7 @@ const TripInsights = ({ trip }) => {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       {ins.length === 0 && <div className="muted">Nessun insight per questo viaggio.</div>}
-      {ins.map((i, idx) => <InsightCard key={idx} insight={i} />)}
+      {ins.map((i, idx) => <InsightCard key={idx} insight={{ ...i, evidence: i.evidence || { tripIds: [trip.id], pidSlugs: [] } }} />)}
     </div>
   );
 };
@@ -880,15 +795,15 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
           <div className="filter-row">
             {["Tutti", "number", "discrete", "bool"].map(k => (
               <button key={k} className={`chip ${kind === k ? "active" : ""}`} onClick={() => setKind(k)}>
-                {k === "Tutti" ? "Ogni kind" : k}
+                {({Tutti:"Tutti i tipi",number:"Numerici",discrete:"Stati",bool:"Sì / no"})[k]}
               </button>
             ))}
             <span style={{ flex: 1 }} />
             <select className="icon-btn" style={{ background: "var(--bg-2)" }} value={sortBy} onChange={e => setSortBy(e.target.value)}>
               <option value="name">Ordina: nome</option>
               <option value="group">Ordina: gruppo</option>
-              <option value="samples">Ordina: samples</option>
-              <option value="rate">Ordina: sample rate</option>
+              <option value="samples">Ordina: campioni</option>
+              <option value="rate">Ordina: frequenza</option>
             </select>
           </div>
         </div>
@@ -901,7 +816,7 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
                 <th>Gruppo</th>
                 <th className="num">Ultimo</th>
                 <th className="num">Min/Max</th>
-                <th>Trace</th>
+                <th>Andamento</th>
               </tr>
             </thead>
             <tbody>
@@ -918,11 +833,11 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
                     </td>
                     <td style={{ color: "var(--fg-2)" }}>{p.group}</td>
                     <td className="num mono" style={{ color: "var(--fg-0)" }}>
-                      {typeof s.last === "number" ? s.last : "—"}
+                      {OBD.measurement(s.last, 2)}
                       <span style={{ color: "var(--fg-3)", marginLeft: 3, fontSize: 10 }}>{p.unit}</span>
                     </td>
                     <td className="num mono" style={{ color: "var(--fg-2)", fontSize: 11 }}>
-                      {s.min}/{s.max}
+                      {OBD.measurement(s.min, 2)} / {OBD.measurement(s.max, 2)}
                     </td>
                     <td style={{ width: 100 }}>
                       <Sparkline data={series} height={20} color={isSel ? "var(--accent-strong)" : "var(--fg-3)"} showFill={false} animate={false} />
@@ -955,35 +870,35 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 12 }}>
               {[
-                ["last", selStats.last],
-                ["first", selStats.first],
-                ["min", selStats.min],
-                ["max", selStats.max],
-                ["mean", selStats.mean],
-                ["mode", selStats.mode],
+                ["Ultimo", selStats.last],
+                ["Primo", selStats.first],
+                ["Minimo", selStats.min],
+                ["Massimo", selStats.max],
+                ["Media", selStats.mean],
+                ["Valore frequente", selStats.mode],
               ].map(([k, v]) => (
                 <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid var(--line-soft)" }}>
                   <span className="muted">{k}</span>
-                  <span className="mono" style={{ color: "var(--fg-0)" }}>{v}<span className="muted" style={{ marginLeft: 3 }}>{selPid.unit}</span></span>
+                  <span className="mono" style={{ color: "var(--fg-0)" }}>{OBD.measurement(v, 2)}<span className="muted" style={{ marginLeft: 3 }}>{selPid.unit}</span></span>
                 </div>
               ))}
             </div>
 
             <div style={{ marginTop: 12, fontSize: 11, color: "var(--fg-3)", display: "flex", flexDirection: "column", gap: 3 }}>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span>samples</span><span className="mono" style={{ color: "var(--fg-1)" }}>{selStats.samples}</span>
+                <span>Campioni</span><span className="mono" style={{ color: "var(--fg-1)" }}>{selStats.samples}</span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span>sample rate</span><span className="mono" style={{ color: "var(--fg-1)" }}>{selStats.sample_rate_hz} Hz</span>
+                <span>Frequenza</span><span className="mono" style={{ color: "var(--fg-1)" }}>{OBD.measurement(selStats.sample_rate_hz, 3)} Hz</span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span>coverage</span><span className="mono" style={{ color: "var(--fg-1)" }}>{selStats.coverage_pct}%</span>
+                <span>Copertura</span><span className="mono" style={{ color: "var(--fg-1)" }}>{OBD.measurement(selStats.coverage_pct)} %</span>
               </div>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span>first / last seen</span><span className="mono" style={{ color: "var(--fg-1)" }}>{selStats.first_seen_s}s / {selStats.last_seen_s}s</span>
+                <span>Primo / ultimo campione</span><span className="mono" style={{ color: "var(--fg-1)" }}>{selStats.first_seen_s}s / {selStats.last_seen_s}s</span>
               </div>
               {selStats.is_stale && (
-                <div style={{ marginTop: 4, color: "var(--warn)" }}>⚠ Sample stale (&gt; 60s dalla fine)</div>
+                <div style={{ marginTop: 4, color: "var(--warn)" }}>⚠ Ultimo campione distante oltre 60 s dalla fine</div>
               )}
             </div>
           </div>
@@ -995,6 +910,7 @@ const PidExplorerInner = ({ trip, catalog = PID_CATALOG }) => {
 
 /* ============== Map view (all trips) ============== */
 const MapView = () => {
+  const scope = React.useContext(PeriodScope);
   const revision = React.useContext(DataRevision);
   const trackTrips = useMemo(() => TRIPS.filter(t => t.hasTrack), [TRIPS]);
   const [selected, setSelected] = useState(trackTrips[0]?.id);
@@ -1004,7 +920,7 @@ const MapView = () => {
   useEffect(() => {
     let cancelled = false;
     setError(null); setTracks(null);
-    apiJson("/api/v1/tracks").then(data => { if (!cancelled) setTracks(data); })
+    apiJson("/api/v1/tracks" + scope.query).then(data => { if (!cancelled) setTracks(data); })
       .catch(error => { if (!cancelled) setError(error.message); });
     return () => { cancelled = true; };
   }, [revision, retry]);
@@ -1014,6 +930,7 @@ const MapView = () => {
     [trackTrips, tracks]
   );
   const trip = OBD.selectedTrip(obdTrips, selected);
+  const page = usePagination(obdTrips.length ? obdTrips : trackTrips, scope.query, 20);
   return (
     <div className="page-grid">
       <div className="trip-list">
@@ -1022,10 +939,11 @@ const MapView = () => {
           <span className="section-sub">{trackTrips.length} con GPS{tracks === null && !error ? " · carico…" : ""}</span>
         </div>
         <div className="trip-scroller">
-          {(obdTrips.length ? obdTrips : trackTrips).map(t => (
+          {page.items.map(t => (
             <TripCard key={t.id} trip={t} active={t.id === selected} onClick={() => setSelected(t.id)} />
           ))}
         </div>
+        <Pagination {...page} setPage={number => { page.setPage(number); setSelected((obdTrips.length ? obdTrips : trackTrips)[(number - 1) * 20]?.id); }} />
       </div>
       <div className="detail">
         <div className="map-wrap map-fullpage">
@@ -1051,34 +969,39 @@ const MapView = () => {
 
 /* ============== DPF / FAP view ============== */
 const DpfView = () => {
-  const obdTrips = TRIPS.filter(t => t.sources.includes("obd")).sort((a, b) => (a.start || "").localeCompare(b.start || ""));
+  const scope = React.useContext(PeriodScope);
+  const allObd = TRIPS.filter(t => t.sources.includes("obd"));
+  const obdTrips = allObd.filter(OBD.usableForAnalysis).sort((a, b) => (a.start || "").localeCompare(b.start || ""));
   const sootSeries = obdTrips.map(t => t.dpfClosedSoot);
   const egtSeries = obdTrips.map(t => t.exhaustAfterCatC);
   const egtMax = Math.max(...egtSeries.filter(v => v != null && isFinite(v)), 0);
+  const regenTrips = [...obdTrips].reverse().filter(t => ["requested", "active", "completed", "post_regen"].includes(t.dpfRegenState));
+  const page = usePagination(regenTrips, scope.query, 12);
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {allObd.length > obdTrips.length && <div className="data-notice">{allObd.length - obdTrips.length} viaggi storici non ricalcolabili sono esclusi dagli andamenti DPF. Le registrazioni restano consultabili in Viaggi.</div>}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16 }}>
         <div className="dpf-block">
           <RadialGauge value={VEHICLE.dpfClosedSoot} max={10} label="g/L" strokeColor="var(--warn)" decimals={1} />
           <div className="dpf-meta">
-            <div><div className="lbl">Ultimo stato registrato</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState} /></div></div>
-            <div><div className="lbl">Closed soot</div><div className="v">{VEHICLE.dpfClosedSoot != null ? VEHICLE.dpfClosedSoot + " g/L" : "—"}</div></div>
+            <div><div className="lbl">Ultimo stato globale</div><div className="v"><DpfPill state={VEHICLE.dpfRegenState} /></div></div>
+            <div><div className="lbl">Carico DPF</div><div className="v">{OBD.measurement(VEHICLE.dpfClosedSoot, 2)} g/L</div></div>
             <div><div className="lbl">Km da regen</div><div className="v">{VEHICLE.dpfSinceRegenKm}</div></div>
-            <div><div className="lbl">Avg interval</div><div className="v">{VEHICLE.dpfAvgRegenKm} km</div></div>
+            <div><div className="lbl">Intervallo medio</div><div className="v">{VEHICLE.dpfAvgRegenKm} km</div></div>
           </div>
         </div>
 
         <div className="trend-card">
-          <div className="section-head"><span className="section-title">Closed soot trend</span><span className="section-sub">g/L · ultimi {obdTrips.length} viaggi OBD</span></div>
-          <div className="big-num">{sootSeries.filter(v => v != null).slice(-1)[0] ?? "—"}<span className="unit"> g/L</span></div>
+          <div className="section-head"><span className="section-title">Andamento del carico DPF</span><span className="section-sub">g/L · ultimi {obdTrips.length} viaggi OBD</span></div>
+          <div className="big-num">{OBD.measurement(sootSeries.filter(v => v != null).slice(-1)[0], 2)}<span className="unit"> g/L</span></div>
           <Sparkline data={sootSeries} color="var(--warn)" height={70} />
           <div className="muted mono" style={{ fontSize: 11 }}>carico stimato · nessuna soglia universale</div>
         </div>
 
         <div className="trend-card">
-          <div className="section-head"><span className="section-title">EGT post-cat</span><span className="section-sub">picchi per viaggio</span></div>
-          <div className="big-num">{egtMax > 0 ? egtMax.toFixed(0) : "—"}<span className="unit">°C</span></div>
+          <div className="section-head"><span className="section-title">Temperatura scarico</span><span className="section-sub">picchi per viaggio</span></div>
+          <div className="big-num">{egtMax > 0 ? egtMax.toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 }) : "—"}<span className="unit">°C</span></div>
           <Sparkline data={egtSeries} color="var(--crit)" height={70} />
           <div className="muted mono" style={{ fontSize: 11 }}>soglia regen attiva: 550 °C</div>
         </div>
@@ -1090,7 +1013,7 @@ const DpfView = () => {
           <span className="section-sub">richieste ed eventi osservati nei viaggi</span>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {obdTrips.filter(t => ["requested", "active", "completed", "post_regen"].includes(t.dpfRegenState)).map(t => (
+          {page.items.map(t => (
             <div key={t.id} className="trip-card" style={{ cursor: "default" }}>
               <div className="trip-card-head">
                 <span className="trip-date">{new Date(t.start).toLocaleDateString("it-IT", { day: "2-digit", month: "short" })}</span>
@@ -1098,7 +1021,7 @@ const DpfView = () => {
                 <DpfPill state={t.dpfRegenState} />
               </div>
               <div className="trip-card-stats">
-                <div className="trip-stat"><span className="lbl">Closed soot</span>
+                <div className="trip-stat"><span className="lbl">Carico DPF</span>
                   <span className="val mono">{t.dpfClosedSoot ?? "—"}<span className="unit"> g/L</span></span>
                 </div>
                 <div className="trip-stat"><span className="lbl">EGT picco</span>
@@ -1111,13 +1034,15 @@ const DpfView = () => {
                   <span className="val mono">{t.durationMin}<span className="unit"> min</span></span>
                 </div>
                 <div className="trip-stat" style={{ flex: 1, alignItems: "stretch" }}>
-                  <span className="lbl">EGT curve</span>
+                  <span className="lbl">Andamento temperatura scarico</span>
                   <LazySeries tripId={t.id} slug="egt_a" color="var(--crit)" height={30} />
                 </div>
               </div>
             </div>
           ))}
         </div>
+        <Pagination {...page} />
+        {!regenTrips.length && <div className="muted">Nessuna rigenerazione osservata nel periodo selezionato.</div>}
       </div>
     </div>
   );
@@ -1130,78 +1055,55 @@ const DpfView = () => {
    odometer km, refuel-to-refuel only (briefing §1). */
 const FUEL_TYPES = ["B7", "HVO"];
 
-const RefuelForm = ({ onAdd }) => {
-  const lastOdo = VEHICLE.odometer || "";
-  const [f, setF] = useState({
-    ts: OBD.localDateTime(),
-    odometerKm: lastOdo, liters: "", pricePerL: "", fuelType: "B7",
-    fullTank: true, note: "",
-  });
+/** Create or edit a refuel with local timestamps and actionable inline errors. */
+const RefuelForm = ({ onSaved, editing, onCancel }) => {
+  const [form, setForm] = useState(() => OBD.refuelDraft(editing, VEHICLE.odometer));
   const [busy, setBusy] = useState(false);
-  const set = (k, v) => setF(s => ({ ...s, [k]: v }));
-
-  const submit = async () => {
-    if (!Number.isFinite(Number(f.liters)) || Number(f.liters) <= 0 || Number(f.liters) > 200) { alert("Inserisci i litri erogati, maggiori di zero e non oltre 200."); return; }
+  const [error, setError] = useState(null);
+  useEffect(() => { setForm(OBD.refuelDraft(editing, VEHICLE.odometer)); setError(null); }, [editing?.id]);
+  const set = (key, value) => setForm(previous => ({ ...previous, [key]: value }));
+  const submit = async event => {
+    event.preventDefault(); setError(null);
+    let body;
+    try { body = OBD.refuelPayload(form); } catch (error) { setError(error.message); return; }
     setBusy(true);
     try {
-      const body = {
-        ts: f.ts ? f.ts.replace("T", " ") + ":00" : null,
-        odometerKm: f.odometerKm === "" ? null : parseFloat(f.odometerKm),
-        liters: parseFloat(f.liters),
-        pricePerL: f.pricePerL === "" ? null : parseFloat(f.pricePerL),
-        fuelType: f.fuelType, fullTank: f.fullTank, note: f.note || null,
-      };
-      const r = await fetch("/api/v1/refuels", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+      await apiJson(editing ? `/api/v1/refuels/${encodeURIComponent(editing.id)}` : "/api/v1/refuels", {
+        method: editing ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
       });
-      if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
-      set("liters", ""); set("pricePerL", ""); set("note", "");
-      await onAdd();
-    } catch (e) { alert("Errore: " + e.message); }
+      if (!editing) setForm(OBD.refuelDraft(null, body.odometerKm));
+      await onSaved(editing ? "Rifornimento aggiornato." : "Rifornimento registrato.");
+    } catch (error) { setError(error.message); }
     finally { setBusy(false); }
   };
-
   return (
-    <div className="card fuel-form">
-      <div className="section-head" style={{ marginBottom: 10 }}>
-        <span className="section-title">Registra rifornimento</span>
-        <span className="section-sub">ancora il modello del serbatoio</span>
-      </div>
+    <form className="card fuel-form" id="refuel-form" onSubmit={submit} noValidate aria-label={editing ? "Modifica rifornimento" : "Registra rifornimento"}>
+      <div className="section-head"><h2 className="section-title">{editing ? "Modifica rifornimento" : "Registra rifornimento"}</h2>
+        <span className="section-sub">data e ora locali</span></div>
+      {error && <div className="data-notice error" role="alert" style={{ marginBottom: 12 }}>{error}</div>}
       <div className="form-grid">
-        <label className="form-field"><span>Data / ora</span>
-          <input type="datetime-local" value={f.ts} onChange={e => set("ts", e.target.value)} /></label>
-        <label className="form-field"><span>Odometro (km)</span>
-          <input type="number" min="0" max="2000000" inputMode="decimal" value={f.odometerKm}
-                 onChange={e => set("odometerKm", e.target.value)} placeholder="es. 50210" /></label>
-        <label className="form-field"><span>Litri erogati *</span>
-          <input type="number" min="0.01" max="200" inputMode="decimal" step="0.01" value={f.liters}
-                 onChange={e => set("liters", e.target.value)} placeholder="es. 32.14" /></label>
-        <label className="form-field"><span>Prezzo €/L</span>
-          <input type="number" min="0" max="100" inputMode="decimal" step="0.001" value={f.pricePerL}
-                 onChange={e => set("pricePerL", e.target.value)} placeholder="es. 1.899" /></label>
-        <label className="form-field"><span>Carburante</span>
-          <select value={f.fuelType} onChange={e => set("fuelType", e.target.value)}>
-            {FUEL_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
-          </select></label>
-        <label className="form-field"><span>Note</span>
-          <input type="text" value={f.note} onChange={e => set("note", e.target.value)} placeholder="opzionale" /></label>
+        <label className="form-field"><span>Data / ora *</span><input type="datetime-local" required value={form.ts} onChange={e => set("ts", e.target.value)} /></label>
+        <label className="form-field"><span>Odometro (km)</span><input type="number" min="0" max="2000000" step="0.1" inputMode="decimal" value={form.odometerKm} onChange={e => set("odometerKm", e.target.value)} placeholder="es. 21500" /></label>
+        <label className="form-field"><span>Litri erogati *</span><input type="number" min="0.01" max="200" step="0.01" inputMode="decimal" required value={form.liters} onChange={e => set("liters", e.target.value)} placeholder="es. 32,14" /></label>
+        <label className="form-field"><span>Prezzo (€/L)</span><input type="number" min="0" max="100" step="0.001" inputMode="decimal" value={form.pricePerL} onChange={e => set("pricePerL", e.target.value)} placeholder="es. 1,899" /></label>
+        <label className="form-field"><span>Carburante</span><select value={form.fuelType} onChange={e => set("fuelType", e.target.value)}>{FUEL_TYPES.map(type => <option key={type} value={type}>{type}</option>)}</select></label>
+        <label className="form-field"><span>Note</span><input value={form.note} onChange={e => set("note", e.target.value)} placeholder="opzionale" /></label>
       </div>
-      <div className="row" style={{ gap: 14, marginTop: 12, flexWrap: "wrap" }}>
-        <label className="check-inline">
-          <input type="checkbox" checked={f.fullTank} onChange={e => set("fullTank", e.target.checked)} />
-          <span>Pieno completo <span className="muted">(necessario per la resa tank-to-tank)</span></span>
-        </label>
+      <div className="row" style={{ gap: 14, marginTop: 14, flexWrap: "wrap" }}>
+        <label className="check-inline"><input type="checkbox" checked={form.fullTank} onChange={e => set("fullTank", e.target.checked)} /><span>Pieno completo <small className="muted">(per il calcolo pieno-pieno)</small></span></label>
         <span style={{ flex: 1 }} />
-        <button className="btn-primary" onClick={submit} disabled={busy}>
-          {busy ? "…" : "Aggiungi rifornimento"}
-        </button>
+        {editing && <button type="button" className="icon-btn" disabled={busy} onClick={onCancel}>Annulla modifica</button>}
+        <button className="btn-primary" type="submit" disabled={busy}>{busy ? "Salvataggio…" : editing ? "Salva modifiche" : "Aggiungi rifornimento"}</button>
       </div>
-    </div>
+    </form>
   );
 };
 
 const FuelView = () => {
+  const scope = React.useContext(PeriodScope);
+  const [editing, setEditing] = useState(null);
+  const [notice, setNotice] = useState(null);
+  const [deleting, setDeleting] = useState(null);
   const revision = React.useContext(DataRevision);
   const [data, setData] = useState(window.DASHBOARD_BOOTSTRAP_ERROR ? null : FUEL);
   const [dataError, setDataError] = useState(null);
@@ -1223,18 +1125,24 @@ const FuelView = () => {
   const since = level.sinceRefuel;
 
   const del = async (id) => {
-    if (!confirm("Eliminare questo rifornimento?")) return;
+    setDeleting(id);
     try {
       const response = await fetch(`/api/v1/refuels/${id}`, { method: "DELETE" });
       if (!response.ok) throw new Error(`Eliminazione non riuscita (HTTP ${response.status})`);
+      setNotice("Rifornimento eliminato."); setDeleting(null);
       await load();
-    } catch (error) { setDataError(error.message); }
+    } catch (error) { setDataError(error.message); setDeleting(null); }
   };
 
   const avgKmL = OBD.weightedEconomy(t2t);
+  const refuelPage = usePagination([...refuels].reverse(), scope.query, 20);
+  const t2tPage = usePagination(t2t, scope.query, 20);
+  const edit = refuel => { setEditing(refuel); setNotice(null); requestAnimationFrame(() => document.getElementById("refuel-form")?.scrollIntoView({ behavior: "smooth", block: "start" })); };
+  const saved = async message => { setEditing(null); setNotice(message); await load(); };
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      {notice && <div className="data-notice" role="status">{notice}</div>}
       {loading && <div className="data-notice" role="status">Aggiornamento rifornimenti…</div>}
       {dataError && <div className="data-notice error" role="alert">{dataError} <button className="icon-btn" onClick={load}>Riprova</button></div>}
       {level.qualityWarnings?.length > 0 && <div className="data-notice">{level.qualityWarnings.join(" · ")}</div>}
@@ -1244,32 +1152,33 @@ const FuelView = () => {
            className="fuel-hero">
         <div className="card" style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8, justifyContent: "center" }}>
           <RadialGauge value={pct} max={100} label="%" thresholds={false} />
-          <div className="hg-lbl">Livello stimato</div>
+          <div className="hg-lbl">Stima da registro / OBD · globale</div>
           <div className="hg-sub mono">
-            {level.liters != null ? `${level.liters} / ${cap} L` : "—"}
+            {level.liters != null ? `${OBD.measurement(level.liters, 2)} / ${OBD.measurement(cap, 1)} L` : "—"}
           </div>
           <div className="src-chip">
-            {level.source === "ledger" ? "ledger − consumi OBD" :
+            {level.source === "ledger" ? "registro − consumi OBD" :
              level.source === "obd" ? "sonda OBD" :
-             level.source === "myopel" ? "MyOpel" : "nessuna sorgente"}
+             level.source === "myopel" ? "MyOpel" : "stima registro / OBD non disponibile"}
           </div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
           <div className="stat-grid" style={{ gridTemplateColumns: "repeat(3, 1fr)" }}>
             <StatCard icon="droplet" label="Litri stimati nel serbatoio"
-                      value={level.liters != null ? level.liters : "—"} unit="L"
-                      sub={`capacità utile ${cap} L`} />
+                      value={OBD.measurement(level.liters, 2)} unit="L"
+                      sub={`capacità utile ${OBD.measurement(cap, 1)} L`} />
             <StatCard icon="road" label="Dall'ultimo pieno"
-                      value={since?.km != null ? since.km.toFixed(0) : "—"} unit="km"
-                      sub={since?.litersBurned != null ? `${since.litersBurned} L bruciati (OBD)` : "—"} />
+                      value={since?.km != null ? since.km.toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 }) : "—"} unit="km"
+                      sub={since?.litersBurned != null ? `${OBD.measurement(since.litersBurned, 2)} L consumati (OBD)` : "—"} />
             <StatCard icon="fuel" label="Consumo dall'ultimo pieno"
-                      value={since?.kmL != null ? since.kmL.toFixed(1) : "—"} unit="km/L"
-                      sub={since?.l100 != null ? `≈ ${since.l100.toFixed(1)} L/100 km` : undefined} />
+                      value={since?.kmL != null ? since.kmL.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) : "—"} unit="km/L"
+                      sub={since?.l100 != null ? `≈ ${since.l100.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} L/100 km` : undefined} />
           </div>
+          {VEHICLE.fuelLevel != null && <div className="data-notice">Ultimo livello registrato globale: <b>{OBD.measurement(VEHICLE.fuelLevel, 0)} %</b> · {fuelSourceLabel(VEHICLE.fuelSource) || "fonte non disponibile"}. Questo dato è distinto dalla stima del registro rifornimenti.</div>}
           {level.source !== "myopel" && level.obdPct != null && (
             <div className="muted" style={{ fontSize: 12 }}>
-              Sonda OBD (<span className="mono">[ECM] Fuel tank level</span>): <b>{level.obdPct}%</b>
-              {level.source === "ledger" && pct != null && ` · stima rifornimenti: ${pct}% · confronto con la sonda.`}
+              Sonda OBD (<span className="mono">[ECM] Fuel tank level</span>): <b>{OBD.measurement(level.obdPct, 1)} %</b>
+              {level.source === "ledger" && pct != null && ` · stima rifornimenti: ${OBD.measurement(pct, 1)} % · confronto con la sonda.`}
             </div>
           )}
           <div className="muted" style={{ fontSize: 12, lineHeight: 1.5 }}>
@@ -1279,17 +1188,22 @@ const FuelView = () => {
         </div>
       </div>
 
-      <RefuelForm onAdd={load} />
+      <div className="stat-grid fuel-period-summary">
+        <StatCard label="Rifornimenti nel periodo" value={OBD.measurement(data?.period?.refuelCount ?? refuels.length, 0)} sub={scope.label} />
+        <StatCard label="Litri erogati nel periodo" value={OBD.measurement(data?.period?.liters, 2)} unit="L" />
+        <StatCard label="Spesa registrata alla pompa" value={OBD.measurement(data?.period?.costEur, 2)} unit="€" />
+      </div>
+      <RefuelForm onSaved={saved} editing={editing} onCancel={() => setEditing(null)} />
 
       {/* ── Tank-to-tank economy ── */}
       {t2t.length > 0 && (
         <div>
           <div className="section-head">
-            <span className="section-title">Resa tank-to-tank</span>
+            <span className="section-title">Resa pieno-pieno</span>
             <span className="section-sub">km odometro ÷ litri pompa · pieno-a-pieno</span>
             {avgKmL != null && (
               <><span style={{ flex: 1 }} />
-                <span className="big-num" style={{ fontSize: 22 }}>{avgKmL.toFixed(1)}<span className="unit">km/L medi</span></span></>
+                <span className="big-num" style={{ fontSize: 22 }}>{avgKmL.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}<span className="unit">km/L complessivi</span></span></>
             )}
           </div>
           <div className="table-wrap card-flat">
@@ -1300,21 +1214,22 @@ const FuelView = () => {
                 <th>Carburante</th><th className="num">€/km</th>
               </tr></thead>
               <tbody>
-                {t2t.map((x, i) => (
+                {t2tPage.items.map((x, i) => (
                   <tr key={i}>
                     <td className="mono muted" style={{ fontSize: 12 }}>{fmtInt(x.fromOdo)} → {fmtInt(x.toOdo)}</td>
-                    <td className="num mono">{x.km.toFixed(1)}</td>
-                    <td className="num mono">{x.liters.toFixed(2)}</td>
-                    <td className="num mono" style={{ fontWeight: 600 }}>{x.kmL.toFixed(2)}</td>
-                    <td className="num mono">{x.l100.toFixed(2)}</td>
+                    <td className="num mono">{x.km.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}</td>
+                    <td className="num mono">{x.liters.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                    <td className="num mono" style={{ fontWeight: 600 }}>{x.kmL.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                    <td className="num mono">{x.l100.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
                     <td><span className="src-tag" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>{x.fuelType || "—"}</span></td>
-                    <td className="num mono">{x.eurKm != null ? `€${x.eurKm.toFixed(3)}` : "—"}</td>
+                    <td className="num mono">{x.eurKm != null ? `€${x.eurKm.toLocaleString("it-IT", { minimumFractionDigits: 3, maximumFractionDigits: 3 })}` : "—"}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
           <div className="muted" style={{ fontSize: 11, marginTop: 6 }}>
+            <Pagination {...t2tPage} />
             La resa è attribuita al carburante che era <i>nel</i> serbatoio (immesso al pieno
             precedente): con HVO (~780 g/L) il contatore volumetrico ECU sottostima ~4-6%, la pompa resta il riferimento.
           </div>
@@ -1325,11 +1240,11 @@ const FuelView = () => {
       <div>
         <div className="section-head">
           <span className="section-title">Rifornimenti registrati</span>
-          <span className="section-sub">{refuels.length} · ordinati per odometro</span>
+          <span className="section-sub">{refuels.length} nel periodo · ordinati per odometro</span>
         </div>
         {!data ? <div className="card muted">Rifornimenti non ancora caricati.</div> : refuels.length === 0 ? (
           <div className="card muted" style={{ padding: 16 }}>
-            Nessun rifornimento. Aggiungi almeno un <b>pieno completo</b> per iniziare a stimare il livello.
+            Nessun rifornimento nel periodo selezionato. Il livello globale può utilizzare pieni precedenti.
           </div>
         ) : (
           <div className="table-wrap card-flat">
@@ -1339,16 +1254,18 @@ const FuelView = () => {
                 <th className="num">€/L</th><th>Tipo</th><th>Pieno</th><th>Note</th><th></th>
               </tr></thead>
               <tbody>
-                {[...refuels].reverse().map(r => (
+                {refuelPage.items.map(r => (
                   <tr key={r.id}>
                     <td className="mono" style={{ fontSize: 12 }}>{r.ts ? r.ts.slice(0, 16).replace("T", " ") : "—"}</td>
                     <td className="num mono">{r.odometerKm != null ? fmtInt(Math.round(r.odometerKm)) : "—"}</td>
-                    <td className="num mono">{r.liters?.toFixed(2) ?? "—"}</td>
-                    <td className="num mono">{r.pricePerL != null ? `€${r.pricePerL}` : "—"}</td>
+                    <td className="num mono">{r.liters?.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) ?? "—"}</td>
+                    <td className="num mono">{r.pricePerL != null ? `€ ${OBD.measurement(r.pricePerL, 3)}` : "—"}</td>
                     <td>{r.fuelType || "—"}</td>
                     <td>{r.fullTank ? "✓" : "parziale"}</td>
                     <td className="muted" style={{ fontSize: 12 }}>{r.note || ""}</td>
-                    <td className="num"><button className="link-del" onClick={() => del(r.id)}>elimina</button></td>
+                    <td className="num"><div className="refuel-actions"><button className="text-action" onClick={() => edit(r)}>Modifica</button>
+                      {deleting === r.id ? <><span>Eliminare?</span><button className="link-del" onClick={() => del(r.id)}>Conferma</button><button className="text-action" onClick={() => setDeleting(null)}>Annulla</button></>
+                        : <button className="link-del" onClick={() => setDeleting(r.id)}>Elimina</button>}</div></td>
                   </tr>
                 ))}
               </tbody>
@@ -1357,10 +1274,12 @@ const FuelView = () => {
         )}
       </div>
 
+      <Pagination {...refuelPage} />
+
       {/* ── Stale fuelConsumption suspects (§1 API bug) ── */}
       {suspects.length > 0 && (
         <div className="card" style={{ borderLeft: "3px solid var(--warn)" }}>
-          <div className="section-title" style={{ marginBottom: 6 }}>Valori MyOpel sospetti (§1)</div>
+          <div className="section-title" style={{ marginBottom: 6 }}>Valori MyOpel da verificare</div>
           <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
             {suspects.length} viaggi con fuelConsumption quasi identico al precedente su &gt;5 km —
             l'API Stellantis a volte restituisce il valore in cache. Da validare con l'integrale OBD.
@@ -1378,27 +1297,31 @@ const FuelView = () => {
 
 /* ============== MyOpel view ============== */
 const MyOpelView = () => {
+  const scope = React.useContext(PeriodScope);
   const myop = TRIPS.filter(t => t.sources.includes("myopel")).sort((a, b) => b.start.localeCompare(a.start));
-  const totalCost = myop.reduce((a, t) => a + (t.costEur || 0), 0);
-  const totalFuel = myop.reduce((a, t) => a + (myopFuel(t) || 0), 0);
+  const comparable = myop.filter(OBD.usableForAnalysis);
+  const metrics = OBD.periodMetrics(myop);
+  const totalFuel = comparable.reduce((a, t) => a + (myopFuel(t) || 0), 0);
   const totalKm = myop.reduce((a, t) => a + (myopDistance(t) || 0), 0);
   const allAlerts = myop.flatMap(t => (t.alerts || []).map(c => ({ code: c, trip: t })));
-  const fuelPriced = myop.filter(t => t.priceFuel);
+  const fuelPriced = comparable.filter(t => t.priceFuel);
   const avgPrice = fuelPriced.length > 0
     ? fuelPriced.reduce((a, t) => a + t.priceFuel, 0) / fuelPriced.length
     : null;
 
   const lastSync = myop[0]?.start;
+  const page = usePagination(myop, scope.query, 25);
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
       <div className="stat-grid" style={{ gridTemplateColumns: "repeat(4, 1fr)" }}>
         <StatCard label="Viaggi MyOpel" value={myop.length}
                   sub={lastSync ? `ultimo viaggio: ${new Date(lastSync).toLocaleDateString("it-IT", { day: "2-digit", month: "short" })}` : undefined} />
-        <StatCard label="Spesa totale" value={`€${totalCost.toFixed(2)}`} sub={`${totalFuel.toFixed(2)} L MyOpel · prezzi delle tratte TCU`} />
-        <StatCard label="Distanza" value={totalKm.toFixed(1)} unit="km" />
+        <StatCard label="Costo viaggi stimato" value={OBD.measurement(metrics.costTripCount ? metrics.costEur : null, 2)} unit="€" sub={`${metrics.costTripCount}/${myop.length} viaggi valorizzati · ${OBD.measurement(totalFuel, 2)} L MyOpel`} />
+        <StatCard label="Distanza registrata" value={totalKm.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} unit="km" sub={metrics.excludedFromComparisons ? "include lo storico non ricalcolato" : undefined} />
         <StatCard label="Alerts MyOpel" value={allAlerts.length} sub={`${new Set(allAlerts.map(a => a.code)).size} unici`} />
       </div>
+      {metrics.excludedFromComparisons > 0 && <div className="data-notice">{metrics.excludedFromComparisons} viaggi storici nel periodo non sono ricalcolabili in modo attendibile e sono esclusi dai riepiloghi di consumo e costo.</div>}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 16 }}>
         <div>
@@ -1420,7 +1343,7 @@ const MyOpelView = () => {
                 </tr>
               </thead>
               <tbody>
-                {myop.map(t => (
+                {page.items.map(t => (
                   <tr key={t.id}>
                     <td className="mono muted">#{t.myopId}</td>
                     <td>
@@ -1430,9 +1353,9 @@ const MyOpelView = () => {
                       </span>
                     </td>
                     <td className="num mono">{OBD.measurement(myopDistance(t))} <span className="muted">km</span></td>
-                    <td className="num mono">{t.durationMin?.toFixed(0) ?? "—"} <span className="muted">min</span></td>
+                    <td className="num mono">{t.durationMin?.toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 }) ?? "—"} <span className="muted">min</span></td>
                     <td className="num mono">{OBD.measurement(OBD.weightedEconomy([{ km: myopDistance(t), liters: myopFuel(t) }]))} <span className="muted">km/L</span></td>
-                    <td className="num mono">{t.costEur ? `€${t.costEur.toFixed(2)}` : "—"}</td>
+                    <td className="num mono">{t.costEur ? `€${t.costEur.toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}</td>
                     <td>
                       {t.alerts?.length > 0 ? (
                         <div className="row" style={{ gap: 4, flexWrap: "wrap" }}>
@@ -1445,6 +1368,8 @@ const MyOpelView = () => {
               </tbody>
             </table>
           </div>
+          <Pagination {...page} />
+          {!myop.length && <div className="muted">Nessun viaggio MyOpel nel periodo.</div>}
         </div>
 
         <div>
@@ -1500,12 +1425,15 @@ const MyOpelView = () => {
 /* ============== Trends & AI view (predictive diagnosis) ============== */
 const SEV_LABEL = { critical: "critici", warning: "avvisi", info: "sotto controllo" };
 const TrendsView = () => {
+  const scope = React.useContext(PeriodScope);
   const [filter, setFilter] = useState("all");
   const counts = { critical: 0, warning: 0, info: 0 };
   TREND_INSIGHTS.forEach(i => { counts[i.level] = (counts[i.level] || 0) + 1; });
   const shown = TREND_INSIGHTS.filter(i => filter === "all" || i.level === filter);
   const assessed = TREND_INSIGHTS.length > 0;
   const healthy = assessed && counts.critical === 0 && counts.warning === 0;
+  const observationPage = usePagination(TRIPS.filter(t => t.insights?.length > 0), scope.query, 8);
+  const insightPage = usePagination(shown, scope.query + filter, 12);
 
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
@@ -1520,7 +1448,7 @@ const TrendsView = () => {
              : "Qualcosa da tenere d'occhio"}
           </div>
           <div className="diag-sub">
-            {TREND_INSIGHTS.length} risultati dei controlli disponibili sul tuo storico: diluizione olio,
+            {TREND_INSIGHTS.length} risultati dei controlli disponibili nel periodo selezionato: diluizione olio,
             rigenerazioni, batteria, rail, turbo, minimo, AdBlue, tagliando.
           </div>
         </div>
@@ -1536,17 +1464,18 @@ const TrendsView = () => {
       </div>
 
       <div className="stagger" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(330px, 1fr))", gap: 12 }}>
-        {shown.map((ins, i) => <InsightCard key={i} insight={ins} />)}
+        {insightPage.items.map((ins, i) => <InsightCard key={i} insight={ins} />)}
         {shown.length === 0 && <div className="muted" style={{ padding: 20 }}>Nessun controllo in questa categoria.</div>}
       </div>
 
+      <Pagination {...insightPage} />
       <div>
         <div className="section-head">
-          <span className="section-title">Insights per viaggio</span>
+          <span className="section-title">Osservazioni per viaggio</span>
           <span className="section-sub">solo viaggi con note</span>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-          {TRIPS.filter(t => t.insights && t.insights.length > 0).slice(0, 20).map(t => (
+          {observationPage.items.map(t => (
             <div key={t.id}>
               <div className="row" style={{ marginBottom: 6, color: "var(--fg-2)", fontSize: 12 }}>
                 <span className="mono">{new Date(t.start).toLocaleString("it-IT", { dateStyle: "short", timeStyle: "short" })}</span>
@@ -1555,11 +1484,12 @@ const TrendsView = () => {
                 {t.dpfRegenState && <DpfPill state={t.dpfRegenState} />}
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 10 }}>
-                {t.insights.map((i, idx) => <InsightCard key={idx} insight={i} />)}
+                {t.insights.map((i, idx) => <InsightCard key={idx} insight={{ ...i, evidence: i.evidence || { tripIds: [t.id], pidSlugs: [] } }} />)}
               </div>
             </div>
           ))}
         </div>
+        <Pagination {...observationPage} />
       </div>
     </div>
   );
@@ -1568,9 +1498,9 @@ const TrendsView = () => {
 /* ============== Admin view ============== */
 const fmtBytes = (n) => {
   if (n == null) return "—";
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + " GB";
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + " MB";
-  if (n >= 1e3) return (n / 1e3).toFixed(0) + " KB";
+  if (n >= 1e9) return (n / 1e9).toLocaleString("it-IT", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + " GB";
+  if (n >= 1e6) return (n / 1e6).toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + " MB";
+  if (n >= 1e3) return (n / 1e3).toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 }) + " KB";
   return n + " B";
 };
 
@@ -1605,7 +1535,7 @@ const StoragePanel = () => {
         <StatCard icon="download" label="File fuori archivio" value={fmtBytes(s.obd_pending_bytes + s.myop_pending_bytes)}
                   sub="include gli originali conservati; non indica la coda" />
         <StatCard icon="trend" label="Compressione archivio" value={fmtBytes(saved)}
-                  sub={`−${savedPct.toFixed(0)}% rispetto alle copie non compresse`} />
+                  sub={`−${savedPct.toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}% rispetto alle copie non compresse`} />
       </div>
       <div className="muted" style={{ fontSize: 12, marginTop: 8, lineHeight: 1.5 }}>
         Dopo l'elaborazione i CSV/.myop vengono compressi in <span className="mono">archive/</span> e
@@ -1710,7 +1640,7 @@ const ImportStatusPanel = () => {
         </div>}
         <div className="muted" style={{ marginTop: 10 }}>
           Viaggi legacy ancora da ricostruire: <b>{OBD.measurement(status.legacyCount, 0)}</b>.
-          {status.legacyCount > 0 && " Le sorgenti mancanti richiedono un controllo; i metadati non disponibili restano indicati come tali."}
+          {status.legacyCount > 0 && " Le sorgenti mancanti o insufficienti per un ricalcolo attendibile richiedono un controllo; i metadati non disponibili restano indicati come tali."}
         </div>
         {status.legacyIds.length > 0 && <details style={{ marginTop: 8 }}>
           <summary>Mostra gli ID dei viaggi da ricostruire</summary>
@@ -1795,7 +1725,7 @@ const AdminView = () => {
                 <span className="mono" style={{ fontSize: 12 }}>{s.id}</span>
                 <span className="muted" style={{ fontSize: 12 }}>{fmt(s.start)}</span>
                 <span className="mono" style={{ fontSize: 12 }}>
-                  OBD {s.obd_km} km · MyOpel {s.myop_km} km · copertura {(s.coverage * 100).toFixed(0)}%
+                  OBD {s.obd_km} km · MyOpel {s.myop_km} km · copertura {(s.coverage * 100).toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}%
                 </span>
                 <span className="mono muted" style={{ fontSize: 11 }}>tratte {s.leg_ids.join(", ")}</span>
               </div>
@@ -1818,17 +1748,17 @@ const AdminView = () => {
               <div className="lbl" style={{ marginBottom: 4 }}>OBD</div>
               <div className="mono" style={{ fontSize: 12 }}>{c.obd.id}</div>
               <div style={{ fontSize: 13 }}>{fmt(c.obd.start)} → {fmt(c.obd.end)}</div>
-              <div className="muted" style={{ fontSize: 12 }}>{c.obd.km?.toFixed(1) ?? "—"} km · {c.obd.min?.toFixed(0) ?? "—"} min</div>
+              <div className="muted" style={{ fontSize: 12 }}>{c.obd.km?.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) ?? "—"} km · {c.obd.min?.toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 }) ?? "—"} min</div>
             </div>
             <div style={{ flex: 1, minWidth: 200 }}>
               <div className="lbl" style={{ marginBottom: 4 }}>MyOpel</div>
               <div className="mono" style={{ fontSize: 12 }}>{c.myop.id}</div>
               <div style={{ fontSize: 13 }}>{fmt(c.myop.start)} → {fmt(c.myop.end)}</div>
-              <div className="muted" style={{ fontSize: 12 }}>{c.myop.km?.toFixed(1) ?? "—"} km · {c.myop.min?.toFixed(0) ?? "—"} min</div>
+              <div className="muted" style={{ fontSize: 12 }}>{c.myop.km?.toLocaleString("it-IT", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) ?? "—"} km · {c.myop.min?.toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 }) ?? "—"} min</div>
             </div>
             <div style={{ textAlign: "right", minWidth: 100 }}>
               <div style={{ fontSize: 22, fontWeight: 700, color: c.score >= 0.5 ? "var(--ok)" : c.score >= 0.35 ? "var(--warn)" : "var(--muted)" }}>
-                {(c.score * 100).toFixed(0)}%
+                {(c.score * 100).toLocaleString("it-IT", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}%
               </div>
               <div className="muted" style={{ fontSize: 11 }}>punteggio</div>
               <div style={{ fontSize: 11, marginTop: 4, color: c.would_correlate ? "var(--ok)" : "var(--muted)" }}>
@@ -1850,7 +1780,7 @@ const BottomNav = ({ active, setActive, onMenu }) => {
     { id: "trends",    icon: "trend", label: "Trend" },
     { id: "map",       icon: "map",   label: "Mappa" },
   ];
-  const secondary = ["fuel", "pids", "myopel", "dpf", "admin"];
+  const secondary = ["fuel", "pids", "myopel", "dpf", "compare", "admin"];
   return (
     <nav className="bottom-nav">
       {items.map(it => (
@@ -1875,21 +1805,46 @@ const App = () => {
   const [view, setView] = useState("dashboard");
   const [selectedTripId, setSelectedTripId] = useState(TRIPS[0]?.id);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [periodSelection, setPeriodSelection] = useState(() => {
+    try { return OBD.restorePeriod(JSON.parse(localStorage.getItem("obd-period") || "null")); }
+    catch (_) { return { preset: "30d" }; }
+  });
+  const [appliedRange, setAppliedRange] = useState(null);
+  const [evidence, setEvidence] = useState(null);
+  const range = OBD.periodRange(periodSelection);
   const [revision, setRevision] = useState(_dataVersion);
-  const [status, setStatus] = useState({ loading: false, checked: null,
+  const [status, setStatus] = useState({ loading: false, periodPending: true, checked: null,
     error: window.DASHBOARD_BOOTSTRAP_ERROR ? "Dati iniziali non caricati. Riprovo la connessione…" : null });
   useEffect(() => {
     const changed = event => {
       setStatus(previous => ({ ...previous, ...event.detail }));
       if (event.detail.changed) setRevision(_dataVersion);
+      if (event.detail.range) setAppliedRange(event.detail.range);
     };
     const refresh = () => { if (!document.hidden) refreshDashboard().catch(() => {}); };
     window.addEventListener("dashboard-status", changed);
     document.addEventListener("visibilitychange", refresh);
     const timer = setInterval(refresh, 60000);
-    refresh();
     return () => { clearInterval(timer); window.removeEventListener("dashboard-status", changed); document.removeEventListener("visibilitychange", refresh); };
   }, []);
+
+  useEffect(() => {
+    if (!range.error) try { localStorage.setItem("obd-period", JSON.stringify(periodSelection)); } catch (_) { /* Optional persistence. */ }
+  }, [periodSelection]);
+  useEffect(() => {
+    if (!range.error) selectDashboardPeriod(range).catch(() => {});
+  }, [range.query]);
+
+  useEffect(() => {
+    const open = event => {
+      const { tripId, pidSlug } = event.detail || {};
+      if (!TRIPS.some(trip => trip.id === tripId)) return;
+      setSelectedTripId(tripId); setEvidence({ tripId, pidSlug, openedAt: Date.now() }); setView("trips");
+    };
+    window.addEventListener("open-evidence", open);
+    return () => window.removeEventListener("open-evidence", open);
+  }, []);
+  const periodPending = !!range.error || status.periodPending || appliedRange?.query !== range.query;
 
   // Apply tweaks to <html> as data-* attributes
   useEffect(() => {
@@ -1908,10 +1863,11 @@ const App = () => {
     trips: "Viaggi",
     map: "Mappa GPS",
     fuel: "Carburante · Serbatoio & Rifornimenti",
-    pids: "PID Explorer",
+    pids: "Catalogo PID",
+    compare: "Confronta viaggi",
     dpf: "DPF / FAP",
     myopel: "MyOpel · Stellantis",
-    trends: "Trend e controlli Insights",
+    trends: "Trend e controlli",
     admin: "Admin · Impostazioni",
   };
 
@@ -1931,6 +1887,7 @@ const App = () => {
 
   return (
     <DataRevision.Provider value={revision}>
+    <PeriodScope.Provider value={appliedRange || range}>
     <div className={`app ${sidebarClass} ${drawerClass}`} onClick={(e) => {
       // close drawer when clicking outside sidebar
       if (drawerOpen && !e.target.closest(".sidebar") && !e.target.closest(".menu-btn")) {
@@ -1940,25 +1897,31 @@ const App = () => {
       <Sidebar active={view} setActive={setView} />
       <BottomNav active={view} setActive={setView} onMenu={() => setDrawerOpen(v => !v)} />
       <main className="main">
-        <TopBar view={viewLabels[view]} onMenu={() => setDrawerOpen(v => !v)} status={status}
+        <TopBar view={viewLabels[view]} onMenu={() => setDrawerOpen(v => !v)} status={{ ...status, periodPending }}
           onRefresh={() => refreshDashboard().catch(() => {})}
           onAppearance={() => window.postMessage({ type: "__activate_edit_mode" }, window.location.origin)} />
         <div className="content">
+          <PeriodToolbar selection={periodSelection} onChange={setPeriodSelection} range={range} loading={status.loading} />
           <div className={`data-status ${status.error ? "error" : ""}`} role={status.error ? "alert" : "status"}>
-            {status.error ? `${status.error}${status.checked ? " · restano visibili gli ultimi dati caricati" : ""}`
-              : status.loading ? "Aggiornamento dati…" : `Ultimo dato registrato: ${TRIPS[0]?.start ? new Date(TRIPS[0].start).toLocaleString("it-IT", {dateStyle:"short",timeStyle:"short"}) : "nessun viaggio"}${status.checked ? " · verifica " + status.checked.toLocaleTimeString("it-IT", {hour:"2-digit",minute:"2-digit"}) : ""}`}
+            {status.error ? `${status.error}${status.checked && !periodPending ? " · restano visibili gli ultimi dati caricati" : ""}`
+              : status.loading ? "Aggiornamento dati…" : `Riepiloghi ed esportazione: periodo selezionato. Stato veicolo e livello serbatoio: ultimi dati globali.${status.checked ? " Verifica " + status.checked.toLocaleTimeString("it-IT", {hour:"2-digit",minute:"2-digit"}) : ""}`}
           </div>
-          <div className="view-wrap" key={view}>
+          {periodPending ? <div className="period-loading" role={status.error || range.error ? "alert" : "status"}>
+            <Icon name={status.error || range.error ? "warn" : "clock"} size={28} />
+            <p>{range.error || status.error || "Caricamento del periodo selezionato…"}</p>
+            {status.error && !range.error && <button className="icon-btn" onClick={() => selectDashboardPeriod(range).catch(() => {})}>Riprova</button>}
+          </div> : <div className="view-wrap" key={view}>
             {view === "dashboard" && <Dashboard setActive={setView} setSelectedTripId={setSelectedTripId} />}
-            {view === "trips"     && <TripsView selectedId={selectedTripId} setSelectedId={setSelectedTripId} />}
+            {view === "trips"     && <TripsView key={evidence?.openedAt || "trips"} selectedId={selectedTripId} setSelectedId={setSelectedTripId} evidence={evidence} />}
             {view === "map"       && <MapView />}
+            {view === "compare"   && <CompareView trips={TRIPS} periodLabel={appliedRange?.label} />}
             {view === "fuel"      && <FuelView />}
             {view === "pids"      && <PidExplorer />}
             {view === "dpf"       && <DpfView />}
             {view === "myopel"    && <MyOpelView />}
             {view === "trends"    && <TrendsView />}
             {view === "admin"     && <AdminView />}
-          </div>
+          </div>}
         </div>
       </main>
 
@@ -1988,6 +1951,7 @@ const App = () => {
                      onChange={v => setTweak("anim", v)} />
       </TweaksPanel>
     </div>
+    </PeriodScope.Provider>
     </DataRevision.Provider>
   );
 };

@@ -6,6 +6,6 @@ revisioni sono dati da preservare; il database materializzato è ricostruibile
 solo quando la disponibilità delle sorgenti è stata verificata.
 
 Eseguire i test Python con `PYTHONPATH=backend python -m pytest -q`, i test
-frontend con `node --test tests/frontend.test.cjs`, quindi la compilazione Python
+frontend con `node --test tests/*.test.cjs`, quindi la compilazione Python
 e `node scripts/check-frontend.cjs`. Il push su main pubblica un'immagine GHCR
 solo dopo il job di verifica; verificare il commit effettivo nell'immagine.

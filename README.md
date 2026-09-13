@@ -8,6 +8,30 @@ Aggrega ed elabora i log esportati da:
 
 Costruito per essere **self-hosted via Docker su Unraid**, in **un singolo container**.
 
+### v0.9 — periodi, confronti e lettura dei dati
+
+Il selettore condiviso permette di consultare 7 giorni, 30 giorni, il mese
+corrente, un intervallo personalizzato o tutto lo storico. Viaggi, riepiloghi,
+trend, mappa ed esportazione seguono lo stesso periodo. Lo stato del veicolo e
+il livello stimato del serbatoio restano gli ultimi disponibili sull'intero
+archivio e sono indicati come tali. La scelta del periodo viene salvata nel browser.
+
+La dashboard è più compatta, con indicatori leggibili e accesso alle osservazioni
+che sostengono gli insight. L'analisi di un viaggio permette di esplorare gli
+intervalli temporali e confrontare i segnali; la vista di confronto affianca due
+viaggi e rende visibili le differenze di distanza, durata, temperatura e copertura.
+La vicinanza degli estremi GPS, quando disponibile, non certifica lo stesso percorso.
+Un confronto osservato non dimostra la causa di una variazione di consumo.
+
+I rifornimenti possono essere aggiunti e modificati mantenendo l'ora locale.
+I dati dei pieni vengono calcolati sull'intero ledger prima di selezionare gli
+intervalli chiusi nel periodo: un filtro non deve perdere il pieno di partenza.
+I record legacy con sorgenti insufficienti restano consultabili con un avviso.
+
+Il backend conserva riepiloghi aggiornabili separati dai blob PID/GPS e riusa
+le importazioni già verificate. I nuovi contenuti continuano a essere conservati
+e processati. Cache e riepiloghi non sostituiscono gli originali né il backup.
+
 ### v0.8 — dati verificabili e recupero dello storico
 
 Le metriche distinguono la fonte e la copertura disponibile: i consumi MyOpel
@@ -44,20 +68,23 @@ leggibili devono essere conservate e segnalate, non considerate import riusciti.
                                        │
                   ┌────────────────────┼────────────────────┐
                   ▼                    ▼                    ▼
-        /data/obd (CSV/BRC)  /data/myop (.myop)    /data/db (SQLite)
+        /data/obd (CSV)      /data/myop (.myop)    /data/db (SQLite)
 ```
 
 nginx e uvicorn girano nello stesso container, supervisionati dal `entrypoint.sh`:
-se uno dei due processi muore, il container si ferma e Docker lo riavvia.
+se uno dei due processi muore, il container si ferma. L'eventuale riavvio dipende
+dalla restart policy effettivamente configurata in Docker.
 
 Il backend:
 
 - elabora automaticamente i file droppati nelle directory montate (watchdog)
 - applica correzione **RBS byte-swap** per i PID errati del profilo MD1CS003 (briefing §7)
-- esegue la **DPF state machine** a 5 stati (`idle / requested / active / completed / post_regen`)
-- genera **AI Insights** in italiano (per-viaggio e cross-trip)
+- classifica il DPF (`idle / requested / active / completed / post_regen`), con
+  `unknown` quando le osservazioni non permettono una conclusione
+- genera insight deterministici in italiano (per viaggio e tra viaggi)
 - correla i viaggi OBD con quelli MyOpel raggruppando per sessione motore-acceso (una registrazione OBD può contenere più tratte MyOpel)
-- serve `/api/v1/data.js` con i globali JS che il frontend si aspetta — zero modifiche ai componenti React
+- serve `/api/v1/dashboard` per i dati delle viste e mantiene `/api/v1/data.js`
+  per il caricamento iniziale e la compatibilità
 
 ---
 
@@ -110,7 +137,8 @@ docker run -d --name obd-dashboard --restart unless-stopped \
 Due modi:
 
 **A. Drop diretto** (più comodo): copia i file via SMB/UnRAID share nelle directory mappate.
-Il watchdog li elabora entro 1-2 secondi.
+Il watcher attende che la copia sia stabile, quindi elabora i file in coda.
+Tempi e avanzamento dipendono dalle dimensioni dei file; lo stato è visibile in Admin.
 
 **B. Upload HTTP**:
 ```bash
@@ -125,16 +153,17 @@ curl -F "file=@trips-2026-05.myop" \
 
 ## Modalità solo-OBD (senza MyOpel)
 
-Il file `.myop` **non è più necessario** per i consumi e lo stato veicolo. Puoi
+Il file `.myop` non è obbligatorio per l'uso della piattaforma. Puoi
 disattivare la sorgente MyOpel da **Admin → Impostazioni** (o con
-`MYOP_ENABLED=false`): la piattaforma passa in modalità solo-OBD e ricava ogni
-campo dal log CarScanner, con questi equivalenti nativi.
+`MYOP_ENABLED=false`): la piattaforma passa in modalità solo-OBD e usa i segnali
+effettivamente presenti nei log CarScanner. Gli equivalenti sotto richiedono
+che il profilo registri i PID necessari; un campo mancante resta non disponibile.
 
 | Campo MyOpel | Equivalente OBD | Come |
 |---|---|---|
 | `fuelLevel` (%) | `[ECM] Fuel tank level` (sonda) **+ ledger − consumi** | stessa sonda lineare che legge MyOpel; oppure ricostruito dai rifornimenti |
 | `fuelAutonomy` (km) | litri stimati × km/L recente | calcolato |
-| `fuelConsumption` | integrale portata **+ metodo iniettori** `mdot = inj_q·rpm/30` | validato a ~834 g/L contro il contatore |
+| `fuelConsumption` | integrale portata **+ metodo iniettori** `mdot = inj_q·rpm/30` | selezione secondo fonte e copertura; la pompa resta il riferimento |
 | `priceFuel` / `costEur` | ledger rifornimenti (€/L manuale) | vista **Carburante** |
 | `distanceToNextMaintenance` | `[ECM] Distance remaining until the next oil change` | proxy tagliando |
 | `odometer` | `[ECM] Total mileage` | già nativo |
@@ -146,8 +175,8 @@ campo dal log CarScanner, con questi equivalenti nativi.
 La vista **Carburante** ricostruisce il livello del serbatoio dall'ultimo
 **pieno completo** meno il carburante misurato dall'OBD su ogni viaggio
 successivo. Registra i pieni (litri, prezzo, tipo, odometro): con due pieni
-completi consecutivi ottieni anche la **resa reale tank-to-tank** (litri pompa ÷
-km odometro, mai i delta livello per-viaggio — briefing §1), attribuita al
+completi consecutivi ottieni anche la **resa pieno-pieno** (km odometro ÷
+litri pompa, mai i delta livello per viaggio — briefing §1), attribuita al
 carburante che era *nel* serbatoio (off-by-one delle app rifornimenti corretto).
 HVO e B7 sono distinti per densità (780 / 835 g/L); i confronti nel tempo usano
 i **g/km** (immuni alla densità).
@@ -176,16 +205,17 @@ i **g/km** (immuni alla densità).
 | Metodo | Path | Descrizione |
 |--------|------|-------------|
 | GET  | `/api/v1/data.js`       | JavaScript con `window.TRIPS`, `window.VEHICLE`, `window.PID_CATALOG`, ecc. |
-| GET  | `/api/v1/dashboard`     | Riepilogo JSON per aggiornare le viste senza perdere il contesto |
-| GET  | `/api/v1/trips`         | JSON di tutti i viaggi (lista completa) |
+| GET  | `/api/v1/dashboard`     | Riepilogo JSON, filtro `from_date` / `to_date` inclusivo per giorno locale |
+| GET  | `/api/v1/trips`         | Export completo dei viaggi, con gli stessi filtri di data opzionali |
 | GET  | `/api/v1/trips/{id}`    | Dettaglio singolo viaggio (include `pidSeriesFull`, `track`, `pidValues`) |
 | GET  | `/api/v1/tracks`        | Tutti i tracciati GPS, `{trip_id: [[lat,lon],…]}` (vista Mappa) |
-| POST | `/api/v1/upload/obd`    | Upload `.csv` / `.brc` (multipart) |
+| POST | `/api/v1/upload/obd`    | Upload `.csv` (multipart); BRC binario respinto esplicitamente |
 | POST | `/api/v1/upload/myop`   | Upload `.myop` (multipart) |
 | GET  | `/api/v1/settings`      | Impostazioni effettive (override DB su default env) + default |
 | PUT  | `/api/v1/settings`      | Aggiorna `myop_enabled`, `tank_capacity_l`, `fuel_density_gl` |
 | GET  | `/api/v1/fuel`          | Livello serbatoio (ledger − consumi / sonda OBD), resa tank-to-tank, ledger rifornimenti, valori MyOpel sospetti |
 | POST | `/api/v1/refuels`       | Registra un rifornimento (`liters` obbligatorio; `odometerKm`, `pricePerL`, `fuelType`, `fullTank`, `ts`, `note`) |
+| PUT | `/api/v1/refuels/{id}` | Modifica i campi del rifornimento, con validazione completa prima della scrittura |
 | DELETE | `/api/v1/refuels/{id}` | Elimina un rifornimento dal ledger |
 | POST | `/api/v1/admin/correlate` | Forza un passaggio di correlazione autonoma |
 | GET  | `/api/v1/admin/uncorrelated` | Diagnostica: coppie candidate non correlate + correlazioni sospette (copertura km fuori norma) |

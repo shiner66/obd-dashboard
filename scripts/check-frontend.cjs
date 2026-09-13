@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const babel = require('@babel/standalone');
 const root = path.resolve(__dirname, '..');
-for (const file of ['components.jsx', 'app.jsx', 'tweaks-panel.jsx']) {
+for (const file of fs.readdirSync(path.join(root, 'frontend')).filter(name => name.endsWith('.jsx')).sort()) {
   babel.transform(fs.readFileSync(path.join(root, 'frontend', file), 'utf8'), {presets: ['react']});
   console.log(`JSX OK: ${file}`);
 }

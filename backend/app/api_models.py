@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
@@ -57,7 +58,6 @@ class RefuelCreate(BaseModel):
         """Keep supplied local time semantics, accepting only ISO timestamps."""
         if value is None:
             return None
-        if not value or "T" not in value:
-            raise ValueError("Data e ora ISO richieste")
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return value
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?", value):
+            raise ValueError("Data e ora locali richieste, senza fuso orario")
+        return datetime.fromisoformat(value).isoformat(timespec="seconds")

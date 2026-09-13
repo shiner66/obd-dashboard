@@ -17,13 +17,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 _DB_PATH: Path | None = None
+_DATA_REVISION = 0
 _ROME = ZoneInfo("Europe/Rome")
 log = logging.getLogger(__name__)
 
 
 def init(db_path: str | Path) -> None:
-    global _DB_PATH
+    global _DB_PATH, _DATA_REVISION
     _DB_PATH = Path(db_path)
+    _DATA_REVISION += 1
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _conn() as con:
         con.executescript(_SCHEMA)
@@ -457,12 +459,15 @@ def _conn():
     """
     if _DB_PATH is None:
         raise RuntimeError("Database not initialised — call init() first")
+    global _DATA_REVISION
     con = sqlite3.connect(_DB_PATH)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     try:
         yield con
         con.commit()
+        if con.total_changes:
+            _DATA_REVISION += 1
     except BaseException:
         con.rollback()
         raise
@@ -549,6 +554,25 @@ CREATE TABLE IF NOT EXISTS trips (
     merged_ids           TEXT DEFAULT NULL,
     vin                  TEXT DEFAULT NULL,
     created_at           TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS trips_start_local_idx ON trips(start_local);
+CREATE TABLE IF NOT EXISTS trip_summaries (
+    trip_id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS trips_summary_update AFTER UPDATE ON trips
+BEGIN DELETE FROM trip_summaries WHERE trip_id=OLD.id; END;
+CREATE TRIGGER IF NOT EXISTS trips_summary_delete AFTER DELETE ON trips
+BEGIN DELETE FROM trip_summaries WHERE trip_id=OLD.id; END;
+CREATE TRIGGER IF NOT EXISTS trips_summary_insert AFTER INSERT ON trips
+BEGIN DELETE FROM trip_summaries WHERE trip_id=NEW.id; END;
+CREATE TABLE IF NOT EXISTS source_parse_cache (
+    source_key TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    parser_version INTEGER NOT NULL,
+    signature_json TEXT,
+    trip_ids TEXT NOT NULL
 );
 
 -- Global PID catalog, deduplicated by slug (previously duplicated per trip).
@@ -693,6 +717,19 @@ def get_refuels() -> list[dict]:
     with _conn() as con:
         rows = con.execute("SELECT * FROM refuels ORDER BY odometer_km, ts").fetchall()
     return [_row_to_refuel(dict(r)) for r in rows]
+
+
+def update_refuel(refuel_id: int, entry: dict) -> dict | None:
+    """Atomically replace the validated editable fields of an existing refuel."""
+    with _conn() as con:
+        cursor = con.execute("""UPDATE refuels SET ts=?,odometer_km=?,liters=?,price_per_l=?,
+            fuel_type=?,full_tank=?,note=? WHERE id=?""", (entry.get("ts"), entry.get("odometerKm"),
+            entry["liters"], entry.get("pricePerL"), entry.get("fuelType"),
+            int(entry.get("fullTank", True)), entry.get("note"), refuel_id))
+        if not cursor.rowcount:
+            return None
+        row = con.execute("SELECT * FROM refuels WHERE id=?", (refuel_id,)).fetchone()
+    return _row_to_refuel(dict(row))
 
 
 def delete_refuel(refuel_id: int) -> None:
@@ -1026,11 +1063,126 @@ def rebuild_materialized_from_raw() -> dict:
             "preservedLegacy": protected, "withheldRawIds": sorted(held_raw)}
 
 
-def get_all_trips() -> list[dict]:
+_INSIGHT_SLUGS = {"rpm", "fuel_p_d", "ecm_measured_high_pressure_common_rail_fuel_pressure",
+    "boost", "oil_dil", "regen_st", "regen_dist", "regen_avg", "soot_cl", "bat_v",
+    "coolant", "coolant_c", "urea_km", "fuel_rate", "inj_q", "speed", "speed_v",
+    "ac_amp", "ss_state", "egt_a", "egt_dpf_i", "egt_dpf_o", "nox_t"}
+
+
+def data_revision() -> tuple[str, int]:
+    """A process-local cache token changes after every committed database mutation."""
+    return str(_DB_PATH), _DATA_REVISION
+
+
+def _date_filter(from_date: str | None, to_date: str | None, column="start_local") -> tuple[str, list]:
+    """Build parameterized inclusive local-day bounds for an ISO timestamp column."""
+    clauses, values = [], []
+    if from_date:
+        clauses.append(f"{column} >= ?")
+        values.append(from_date)
+    if to_date:
+        if to_date == "9999-12-31":
+            # datetime cannot represent the next day after its maximum year.
+            clauses.append(f"{column} <= ?")
+            values.append("9999-12-31T23:59:59.999999")
+        else:
+            clauses.append(f"{column} < ?")
+            values.append((datetime.fromisoformat(to_date) + timedelta(days=1)).date().isoformat())
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", values
+
+
+def get_trip_summaries(from_date: str | None = None, to_date: str | None = None,
+                       *, include_insight_features: bool = False) -> list[dict]:
+    """Read summaries without decompressing tracks/PID blobs after each row's first read.
+
+    SQLite triggers invalidate only changed trips. Compact rule input statistics
+    are cached with each summary and never exposed by the summary API by default.
+    """
+    where, params = _date_filter(from_date, to_date, "t.start_local")
     with _conn() as con:
-        rows = con.execute(
-            "SELECT * FROM trips ORDER BY start_local DESC"
-        ).fetchall()
+        dirty_where = where + (" AND " if where else " WHERE ") + "s.trip_id IS NULL"
+        rows = con.execute("SELECT t.* FROM trips t LEFT JOIN trip_summaries s ON s.trip_id=t.id" + dirty_where, params).fetchall()
+        updates = []
+        for row in rows:
+            trip = _row_to_trip(dict(row))
+            summary = {key: value for key, value in trip.items()
+                       if key not in {"pidValues", "pidSeriesFull", "pidSeriesTimes", "track"}}
+            summary["hasTrack"] = bool(trip.get("track"))
+            track = trip.get("track") or []
+            valid_points = [point for point in track if isinstance(point, list) and len(point) >= 2 and
+                            all(isinstance(v, (int, float)) and math.isfinite(v) for v in point[:2]) and
+                            -90 <= point[0] <= 90 and -180 <= point[1] <= 180 and point[:2] != [0, 0]]
+            summary["routeStart"] = valid_points[0][:2] if len(valid_points) >= 2 else None
+            summary["routeEnd"] = valid_points[-1][:2] if len(valid_points) >= 2 else None
+            summary["pidCount"] = len(trip.get("pidValues") or {})
+            summary["_insightPidValues"] = {slug: {key: stat.get(key) for key in ("min", "max", "mean", "mode", "samples")}
+                for slug, stat in (trip.get("pidValues") or {}).items() if slug in _INSIGHT_SLUGS}
+            updates.append((trip["id"], json.dumps(summary, ensure_ascii=False, allow_nan=False)))
+        if updates:
+            con.executemany("INSERT OR REPLACE INTO trip_summaries(trip_id,payload) VALUES(?,?)", updates)
+        rows = con.execute("SELECT s.payload FROM trips t JOIN trip_summaries s ON s.trip_id=t.id" + where + " ORDER BY t.start_local DESC", params).fetchall()
+    summaries = []
+    for row in rows:
+        summary = json.loads(row["payload"])
+        features = summary.pop("_insightPidValues", {})
+        if include_insight_features:
+            summary["pidValues"] = features
+        summaries.append(summary)
+    return summaries
+
+
+def legacy_rebuild_ids() -> list[str]:
+    """Read durable recovery flags without decoding every summary on health checks."""
+    with _conn() as con:
+        dirty = con.execute("SELECT t.id FROM trips t LEFT JOIN trip_summaries s ON s.trip_id=t.id WHERE s.trip_id IS NULL LIMIT 1").fetchone()
+    if dirty:
+        get_trip_summaries()
+    with _conn() as con:
+        rows = con.execute("SELECT trip_id FROM trip_summaries WHERE json_extract(payload,'$.legacyIncomplete')=1 ORDER BY trip_id").fetchall()
+    return [row["trip_id"] for row in rows]
+
+
+def check_readiness() -> None:
+    """Verify the query used by the dashboard can access its database and schema."""
+    with _conn() as con:
+        con.execute("SELECT id,start_local FROM trips LIMIT 1").fetchall()
+        con.execute("SELECT trip_id FROM trip_summaries LIMIT 1").fetchall()
+
+
+def source_parse_cached(source_key: str, signature: tuple, parser_version: int,
+                        content_hash: str | None = None) -> dict | None:
+    """Reuse only a successful parse of the same file version and parser version."""
+    with _conn() as con:
+        row = con.execute("SELECT * FROM source_parse_cache WHERE source_key=? AND parser_version=?",
+                          (source_key, parser_version)).fetchone()
+    if row is None:
+        return None
+    row = dict(row)
+    if content_hash is None or row["content_hash"] != content_hash:
+        return None
+    ids = json.loads(row["trip_ids"])
+    # Cache alone is never proof data survived a restore/recovery of the DB.
+    if any(not (raw_trip_exists(tid) or trip_exists(tid) or trip_is_absorbed(tid)) for tid in ids):
+        return None
+    return row
+
+
+def record_source_parse(source_key: str, signature: tuple, content_hash: str,
+                        parser_version: int, trip_ids: list[str]) -> None:
+    """Record a successful immutable parse only after its rows are durable."""
+    with _conn() as con:
+        con.execute("""INSERT INTO source_parse_cache VALUES(?,?,?,?,?)
+            ON CONFLICT(source_key) DO UPDATE SET content_hash=excluded.content_hash,
+            parser_version=excluded.parser_version,signature_json=excluded.signature_json,
+            trip_ids=excluded.trip_ids""", (source_key, content_hash, parser_version,
+              json.dumps(list(signature)), json.dumps(trip_ids)))
+
+
+def get_all_trips(from_date: str | None = None, to_date: str | None = None) -> list[dict]:
+    """Return full trip details, optionally filtered by inclusive local dates."""
+    where, params = _date_filter(from_date, to_date)
+    with _conn() as con:
+        rows = con.execute("SELECT * FROM trips" + where + " ORDER BY start_local DESC", params).fetchall()
     return [_row_to_trip(dict(r)) for r in rows]
 
 
@@ -1040,12 +1192,12 @@ def get_trip(trip_id: str) -> dict | None:
     return _row_to_trip(dict(row)) if row else None
 
 
-def get_all_tracks() -> dict[str, list]:
+def get_all_tracks(from_date: str | None = None, to_date: str | None = None) -> dict[str, list]:
     """Lightweight: just id → GPS track, without deserializing the PID blobs."""
+    where, params = _date_filter(from_date, to_date)
+    where += (" AND " if where else " WHERE ") + "gps_track_json IS NOT NULL"
     with _conn() as con:
-        rows = con.execute(
-            "SELECT id, gps_track_json FROM trips WHERE gps_track_json IS NOT NULL"
-        ).fetchall()
+        rows = con.execute("SELECT id,gps_track_json FROM trips" + where, params).fetchall()
     out: dict[str, list] = {}
     for r in rows:
         try:
@@ -1266,6 +1418,7 @@ def _row_to_trip(row: dict) -> dict:
 
     return {
         "id":                    row["id"],
+        "legacyIncomplete":      "obd" in sources and metadata.get("parserVersion", 0) < 2,
         "sources":               sources,
         "filename":              row.get("filename"),
         "myopId":                row.get("myop_trip_id"),

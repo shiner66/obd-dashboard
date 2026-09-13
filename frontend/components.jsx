@@ -78,66 +78,103 @@ const Sparkline = ({ data, times, height = 50, color = "var(--accent)", showFill
   );
 };
 
-/** Inspect an observed series with elapsed time, pointer/touch and keyboard controls. */
-const LineChart = ({ data, times, labels, height = 200, color = "var(--accent)", yLabel = "", animate = true }) => {
+/** Inspect observed samples with bounded zoom, real time axes and visible gaps. */
+const LineChart = ({ data, times, labels, height = 200, color = "var(--accent)", yLabel = "", animate = true,
+  gaps = [], events = [], range: controlledRange, onRangeChange, domain: sharedDomain, title = "Serie", zoom = true }) => {
   const svgRef = useRef(null);
   const [hover, setHover] = useState(null);
-  const gradId = React.useId().replace(/:/g, "");
-  const values = OBD.chartValues(data);
-  const clean = values.filter(v => v != null);
-  const axis = OBD.chartPositions(values, times);
-  useEffect(() => setHover(null), [data, times]);
-  if (clean.length < 2) return <div className="chart-empty">{clean.length ? "Un solo campione disponibile" : "Serie non disponibile"}</div>;
-  const min = Math.min(...clean), max = Math.max(...clean), range = max - min || 1;
-  const w = 600, padX = 20, padTop = 18, padBottom = 26, innerW = w - padX * 2, innerH = height - padTop - padBottom;
-  const from = axis.times[0], span = axis.times[axis.times.length - 1] - from || 1;
-  const points = values.map((v, i) => v == null ? null : {
-    x: padX + (axis.times[i] - from) / span * innerW,
-    y: padTop + innerH - (v - min) / range * innerH,
-  });
-  const paths = chartPaths(points, padTop + innerH);
-  const axisLabel = i => labels?.[i] || (axis.timed ? `${OBD.measurement(axis.times[i] / 60, 1)} min` : `campione ${i + 1}`);
-  const pointAt = e => {
+  const [localRange, setLocalRange] = useState(null);
+  const unique = React.useId().replace(/:/g, "");
+  const series = useMemo(() => OBDExploration.prepareSeries(data, times, gaps), [data, times, gaps]);
+  const domain = sharedDomain?.length === 2 && series.timed ? sharedDomain : series.domain;
+  const range = OBDExploration.clampRange(controlledRange || localRange, domain);
+  const visible = OBDExploration.visibleSeries(series, range);
+  useEffect(() => { setHover(null); setLocalRange(null); }, [data, times]);
+  const updateRange = next => { setHover(null); if (onRangeChange) onRangeChange(next); else setLocalRange(next); };
+  const zoomBy = factor => updateRange(OBDExploration.zoomRange(range, domain, factor, hover != null ? series.axis[hover] : undefined));
+  const axisLabel = (time, index) => labels?.[index] || (series.timed ? `${OBD.measurement(time / 60, 1)} min` : `campione ${index + 1}`);
+  const edgeLabel = time => {
+    const index = series.axis.reduce((best, candidate, at) => Math.abs(candidate - time) < Math.abs(series.axis[best] - time) ? at : best, 0);
+    return labels?.[index] || (series.timed ? `${OBD.measurement(time / 60, 1)} min` : `campione ${Math.round(time) + 1}`);
+  };
+  const min = visible.min, max = visible.max, spread = max - min || 1;
+  const w = 600, padX = 20, padTop = 26, padBottom = 26, innerW = w - padX * 2, innerH = height - padTop - padBottom;
+  const span = range[1] - range[0] || 1;
+  const xAt = time => padX + (time - range[0]) / span * innerW;
+  const plot = point => ({...point, x: xAt(point.time), y: padTop + innerH - (max === min ? 0.5 : (point.value - min) / spread) * innerH});
+  const points = visible.points.map(plot);
+  const selected = points.find(point => point.index === hover);
+  const paths = chartPaths(visible.segments.flatMap((segment, index) => [...(index ? [null] : []), ...segment.map(plot)]), padTop + innerH);
+  const pointAt = event => {
     const rect = svgRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const x = (e.clientX - rect.left) / rect.width * w;
-    let nearest = null, distance = Infinity;
-    points.forEach((p, i) => { if (p && Math.abs(p.x - x) < distance) { nearest = i; distance = Math.abs(p.x - x); } });
-    setHover(nearest);
+    if (!rect || !points.length) return;
+    const x = (event.clientX - rect.left) / rect.width * w;
+    setHover(points.reduce((nearest, point) => Math.abs(point.x - x) < Math.abs(nearest.x - x) ? point : nearest).index);
   };
-  const keyboard = e => {
-    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
-    e.preventDefault();
-    const indices = values.map((v, i) => v == null ? null : i).filter(i => i != null);
-    const at = Math.max(0, indices.indexOf(hover));
-    const next = e.key === "Home" ? 0 : e.key === "End" ? indices.length - 1 : Math.max(0, Math.min(indices.length - 1, at + (e.key === "ArrowRight" ? 1 : -1)));
-    setHover(indices[next]);
+  const keyboard = event => {
+    if (["+", "=", "-", "Escape"].includes(event.key) && zoom) {
+      event.preventDefault();
+      if (event.key === "Escape") updateRange(null); else zoomBy(event.key === "-" ? 2 : 0.5);
+      return;
+    }
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key) || !points.length) return;
+    event.preventDefault();
+    const index = points.findIndex(point => point.index === hover);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? points.length - 1
+      : Math.max(0, Math.min(points.length - 1, index < 0 ? 0 : index + (event.key === "ArrowRight" ? 1 : -1)));
+    setHover(points[next].index);
   };
-  const selected = hover != null ? points[hover] : null;
-  return (
-    <div className="line-chart">
-      <svg ref={svgRef} viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none"
-           role="img" tabIndex={0} aria-label={`Grafico ${yLabel}. Frecce per esplorare i campioni; tocca per leggere un valore.`}
-           onKeyDown={keyboard} onFocus={() => setHover(values.findIndex(v => v != null))}
-           onPointerDown={pointAt} onPointerMove={pointAt}
-           style={{ width: "100%", height, display: "block", touchAction: "pan-y" }}>
-        <defs><linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="0.25" /><stop offset="100%" stopColor={color} stopOpacity="0" />
-        </linearGradient></defs>
-        {[0, 0.25, 0.5, 0.75, 1].map(t => <line key={t} x1={padX} x2={w-padX} y1={padTop+t*innerH} y2={padTop+t*innerH} stroke="var(--line-soft)" />)}
-        <path d={paths.fill} fill={`url(#${gradId})`} />
-        <path d={paths.line} fill="none" stroke={color} strokeWidth="1.6" className={animate ? "lc-draw" : ""} />
-        <text x={padX} y={12} fill="var(--fg-2)" fontSize="11">{OBD.measurement(max)} {yLabel}</text>
-        <text x={padX} y={height-padBottom-3} fill="var(--fg-2)" fontSize="11">{OBD.measurement(min)}</text>
-        <text x={padX} y={height-5} fill="var(--fg-2)" fontSize="10">{axisLabel(0)}</text>
-        <text x={w-padX} y={height-5} fill="var(--fg-2)" fontSize="10" textAnchor="end">{axisLabel(values.length-1)}</text>
-        {selected && <circle cx={selected.x} cy={selected.y} r={4} fill={color} />}
-      </svg>
-      <div className="chart-readout" aria-live="polite">{selected
-        ? `${axisLabel(hover)} · ${OBD.measurement(values[hover], 2)} ${yLabel}`
-        : `${values.length} campioni visualizzati · tocca o usa le frecce per esplorare`}</div>
-    </div>
-  );
+  const changed = range[0] !== domain[0] || range[1] !== domain[1];
+  const rangeStep = (domain[1] - domain[0]) / 1000 || 1;
+  return <div className="line-chart exploration-chart">
+    {zoom && series.values.length > 1 && <div className="chart-controls" aria-label={`Intervallo ${title}`}>
+      <span className="chart-window-label">{edgeLabel(range[0])} → {edgeLabel(range[1])}</span>
+      <div className="chart-zoom-buttons">
+        <button type="button" className="icon-btn" onClick={() => zoomBy(0.5)} aria-label={`Ingrandisci ${title}`}>＋</button>
+        <button type="button" className="icon-btn" onClick={() => zoomBy(2)} disabled={!changed} aria-label={`Riduci ${title}`}>−</button>
+        <button type="button" className="icon-btn" onClick={() => updateRange(null)} disabled={!changed}>Tutta la serie</button>
+      </div>
+    </div>}
+    <svg ref={svgRef} viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none" role="img" tabIndex={0}
+      aria-label={`${title}, ${yLabel || "unità non dichiarata"}. ${series.timed ? "Tempo trascorso reale" : "Indice campione, tempi assenti"}. Frecce per i valori; più e meno per lo zoom, Esc per ripristinare.`}
+      onKeyDown={keyboard} onFocus={() => setHover(points[0]?.index ?? null)} onPointerDown={pointAt} onPointerMove={pointAt}
+      style={{width: "100%", height, display: "block", touchAction: "pan-y"}}>
+      <defs>
+        <linearGradient id={`gradient-${unique}`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.2"/><stop offset="100%" stopColor={color} stopOpacity="0"/>
+        </linearGradient>
+        <pattern id={`gap-${unique}`} width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+          <rect width="8" height="8" fill="var(--bg-2)"/><line x1="0" y1="0" x2="0" y2="8" stroke="var(--fg-3)" strokeWidth="2"/>
+        </pattern>
+        <clipPath id={`clip-${unique}`}><rect x={padX} y={padTop} width={innerW} height={innerH}/></clipPath>
+      </defs>
+      {[0, 0.25, 0.5, 0.75, 1].map(t => <line key={t} x1={padX} x2={w-padX} y1={padTop+t*innerH} y2={padTop+t*innerH} stroke="var(--line-soft)"/>)}
+      <g clipPath={`url(#clip-${unique})`}>
+        {visible.gaps.map((gap, index) => <rect key={`gap-${index}`} x={xAt(gap.from)} y={padTop} width={Math.max(1,xAt(gap.to)-xAt(gap.from))} height={innerH} fill={`url(#gap-${unique})`} opacity="0.55"><title>{gap.label}</title></rect>)}
+        {series.timed && events.filter(event => event.to >= range[0] && event.from <= range[1]).map((event,index) => <line key={`event-${index}`} x1={xAt(event.from)} x2={xAt(event.from)} y1={padTop} y2={padTop+innerH} stroke="var(--warn)" strokeDasharray="3 4" opacity="0.7"><title>{event.label}</title></line>)}
+        <path d={paths.fill} fill={`url(#gradient-${unique})`}/>
+        <path d={paths.line} fill="none" stroke={color} strokeWidth="1.8" vectorEffect="non-scaling-stroke" className={animate ? "lc-draw" : ""}/>
+        {visible.segments.filter(segment => segment.length === 1).map((segment,index) => { const point = plot(segment[0]); return <circle key={index} cx={point.x} cy={point.y} r="2.5" fill={color}/>; })}
+        {selected && <><line x1={selected.x} x2={selected.x} y1={padTop} y2={padTop+innerH} stroke="var(--fg-2)" strokeDasharray="2 3"/><circle cx={selected.x} cy={selected.y} r="4" fill={color}/></>}
+      </g>
+      <text x={padX} y="14" fill="var(--fg-2)" fontSize="11">{OBD.measurement(max)} {yLabel}</text>
+      <text x={w-padX} y="14" fill="var(--fg-2)" fontSize="10" textAnchor="end">Scala Y nell’intervallo</text>
+      <text x={padX} y={height-padBottom-3} fill="var(--fg-2)" fontSize="11">{OBD.measurement(min)}</text>
+      <text x={padX} y={height-5} fill="var(--fg-2)" fontSize="10">{edgeLabel(range[0])}</text>
+      <text x={w-padX} y={height-5} fill="var(--fg-2)" fontSize="10" textAnchor="end">{edgeLabel(range[1])}</text>
+      {!points.length && <text x={w/2} y={height/2} fill="var(--fg-2)" fontSize="13" textAnchor="middle">Nessun campione in questo intervallo</text>}
+    </svg>
+    <div className="chart-readout" aria-live="polite">{selected
+      ? `${axisLabel(selected.time,selected.index)} · ${OBD.measurement(selected.value, 2)} ${yLabel}`
+      : `${points.length} campioni mostrati${series.timed ? " · tempo trascorso reale" : " · tempi assenti, asse per campione"} · tocca o usa le frecce`}</div>
+    {visible.gaps.length > 0 && <div className="chart-gap-key"><span aria-hidden="true"/> Tratteggio: intervalli senza osservazioni; la linea non li interpola.</div>}
+    {zoom && domain[1] > domain[0] && <div className="chart-range-controls">
+      <label>Da <input type="range" min={domain[0]} max={domain[1]} step={rangeStep} value={range[0]}
+        aria-label={`Inizio intervallo ${title}`} onChange={event => updateRange([Math.min(Number(event.target.value),range[1]-rangeStep),range[1]])}/></label>
+      <label>A <input type="range" min={domain[0]} max={domain[1]} step={rangeStep} value={range[1]}
+        aria-label={`Fine intervallo ${title}`} onChange={event => updateRange([range[0],Math.max(Number(event.target.value),range[0]+rangeStep)])}/></label>
+    </div>}
+  </div>;
 };
 
 /** Inspect daily distances using pointer/touch or a keyboard. */
@@ -216,7 +253,7 @@ const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accen
                 strokeDasharray={`${dash} ${circ - dash}`} />
       </svg>
       <div className="gauge-value">
-        <div className="v">{known ? shown.toFixed(decimals) : "—"}</div>
+        <div className="v">{known ? OBD.measurement(shown, decimals) : "—"}</div>
         <div className="l">{label}</div>
       </div>
     </div>
@@ -407,19 +444,19 @@ const TripCard = ({ trip, active, onClick }) => {
       <div className="trip-card-stats">
         <div className="trip-stat">
           <span className="lbl">Distanza</span>
-          <span className="val">{trip.distanceKm?.toFixed(1) ?? "—"}<span className="unit"> km</span></span>
+          <span className="val">{OBD.measurement(trip.distanceKm, 1)}<span className="unit"> km</span></span>
         </div>
         <div className="trip-stat">
           <span className="lbl">Tempo osservato</span>
-          <span className="val">{trip.durationMin?.toFixed(0) ?? "—"}<span className="unit"> min</span></span>
+          <span className="val">{OBD.measurement(trip.durationMin, 0)}<span className="unit"> min</span></span>
         </div>
         <div className="trip-stat">
           <span className="lbl">Vel. osservata</span>
-          <span className="val">{trip.avgSpeedKmh?.toFixed(0) ?? "—"}<span className="unit"> km/h</span></span>
+          <span className="val">{OBD.measurement(trip.avgSpeedKmh, 0)}<span className="unit"> km/h</span></span>
         </div>
         <div className="trip-stat">
           <span className="lbl">Consumo</span>
-          <span className="val">{trip.consumptionKmL?.toFixed(1) ?? "—"}<span className="unit"> km/L</span></span>
+          <span className="val">{OBD.measurement(trip.consumptionKmL, 1)}<span className="unit"> km/L</span></span>
         </div>
       </div>
       <div className="trip-card-foot">
@@ -447,7 +484,13 @@ const INSIGHT_CAT_LABEL = {
 const INSIGHT_COLOR = {
   critical: "var(--crit)", warning: "var(--warn)", info: "var(--accent)",
 };
-const InsightCard = ({ insight }) => {
+const InsightCard = ({ insight, onEvidence }) => {
+  const evidence = OBDExploration.insightEvidence(insight);
+  const openEvidence = tripId => {
+    const detail = {tripId, pidSlug: evidence.pidSlugs[0] || null};
+    if (onEvidence) onEvidence(detail);
+    else window.dispatchEvent(new CustomEvent("open-evidence", {detail}));
+  };
   const icon = INSIGHT_ICON[insight.category]
             || (insight.level === "critical" || insight.level === "warning" ? "warn" : "info");
   return (
@@ -457,6 +500,14 @@ const InsightCard = ({ insight }) => {
         <div className="insight-cat">{INSIGHT_CAT_LABEL[insight.category] || insight.category}</div>
         <div className="insight-title">{insight.title}</div>
         <div className="insight-text">{insight.body}</div>
+        {evidence.tripIds.length > 0 && <div className="insight-evidence">
+          <span>{evidence.tripIds.length} {evidence.tripIds.length === 1 ? "viaggio di riferimento" : "viaggi di riferimento"}{evidence.sampleCount != null ? ` · ${evidence.sampleCount} campioni` : ""}</span>
+          {evidence.tripIds.slice(0, 3).map((tripId, index) => <button type="button" className="icon-btn" key={tripId}
+            onClick={() => openEvidence(tripId)} aria-label={`Vedi prove, viaggio ${tripId}`}>Vedi prove{evidence.tripIds.length > 1 ? ` ${index + 1}` : ""}</button>)}
+          {evidence.tripIds.length > 3 && <details><summary>Altri {evidence.tripIds.length - 3} viaggi</summary>
+            {evidence.tripIds.slice(3).map(tripId => <button type="button" className="evidence-link" key={tripId} onClick={() => openEvidence(tripId)}>{tripId}</button>)}
+          </details>}
+        </div>}
         {insight.series && insight.series.length >= 3 && (
           <div className="insight-spark">
             <Sparkline data={insight.series} height={34}

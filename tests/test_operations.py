@@ -208,7 +208,7 @@ def test_settings_and_refuels_accept_valid_boundaries(client):
                                                   "fullTank": False, "ts": "2026-09-13T12:30"})
     assert response.status_code == 200, response.text
     assert response.json()["refuel"]["fullTank"] is False
-    assert response.json()["refuel"]["ts"] == "2026-09-13T12:30"
+    assert response.json()["refuel"]["ts"] == "2026-09-13T12:30:00"
 
 
 @pytest.mark.parametrize("client", [True, False], indirect=True)
@@ -231,7 +231,7 @@ def test_dashboard_contract_omits_heavy_fields(client):
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     payload = response.json()
-    assert set(payload) == {"vehicle", "trips", "alerts", "trendInsights", "pidCatalog", "pidGroups", "settings", "fuel", "meta"}
+    assert set(payload) == {"vehicle", "trips", "alerts", "trendInsights", "pidCatalog", "pidGroups", "settings", "fuel", "meta", "aggregates", "scope"}
     assert not {"track", "pidValues", "pidSeriesFull", "pidSeriesTimes"}.intersection(payload["trips"][0])
     assert client.get("/api/v1/data.js").status_code == 200
 
@@ -240,7 +240,8 @@ def test_readiness_and_bootstrap_expose_database_failure(client, monkeypatch):
     def unavailable():
         """Represent a real database read failure after application startup."""
         raise OSError("database unavailable")
-    monkeypatch.setattr(main.db, "get_all_trips", unavailable)
+    monkeypatch.setattr(main.db, "get_trip_summaries", unavailable)
+    monkeypatch.setattr(main.db, "check_readiness", unavailable)
     assert client.get("/api/v1/dashboard").status_code == 503
     assert client.get("/api/v1/health").status_code == 503
     bootstrap = client.get("/api/v1/data.js")

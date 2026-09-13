@@ -5,6 +5,34 @@ Tutte le modifiche rilevanti al progetto sono annotate qui.
 Formato basato su [Keep a Changelog](https://keepachangelog.com/it/1.1.0/);
 il versionamento segue [SemVer](https://semver.org/lang/it/).
 
+## [0.9.0] — 2026-09-13
+
+### Aggiunto
+- Periodo condiviso tra le viste e l'export: 7/30 giorni, mese corrente,
+  intervallo personalizzato e tutto lo storico; preferenza salvata nel browser.
+- Analisi dei segnali con selezione dell'intervallo, confronto tra PID e
+  indicazioni degli eventi osservati e dei buchi di registrazione.
+- Confronto tra viaggi con distanza, durata, temperatura e qualità dei consumi;
+  la somiglianza delle condizioni è distinta da una spiegazione causale.
+- Collegamenti dagli insight ai viaggi e ai PID che sostengono le conclusioni.
+- Modifica dei rifornimenti tramite interfaccia e API `PUT /refuels/{id}`.
+
+### Corretto
+- Formato della data dei rifornimenti allineato tra modulo e validazione API;
+  errori leggibili nel modulo, senza perdere i dati inseriti.
+- Riepiloghi del carburante nel periodo costruiti dopo il calcolo pieno-pieno
+  sull'intero ledger; lo stato corrente del serbatoio resta distinto dal periodo.
+- Avvisi legacy persistenti: le sorgenti possono essere presenti ma insufficienti
+  per un ricalcolo attendibile. Gli originali e i record precedenti sono preservati.
+
+### Modificato
+- Dashboard compatta, gerarchia visiva, contrasto e testi italiani; liste suddivise
+  in pagine per limitare il lavoro di rendering.
+- Riepiloghi SQLite separati dai blob PID/GPS, invalidazione al cambio dei dati
+  e riuso delle importazioni già verificate per ridurre letture ripetute.
+- Stato veicolo globale distinto dai dati del periodo; risposte tardive di un
+  vecchio filtro non sostituiscono il periodo più recente selezionato.
+
 ## [0.8.0] — 2026-09-13
 
 ### Corretto
