@@ -234,6 +234,7 @@ const Sidebar = ({ active, setActive }) => {
     { id: "dpf",       icon: "chart",    label: "DPF / FAP" },
     { id: "myopel",    icon: "fuel",     label: myopOn ? "MyOpel" : "MyOpel · off" },
     { id: "trends",    icon: "trend",    label: "Trend e controlli" },
+    { id: "events",    icon: "clock",    label: "Registro eventi" },
     { id: "admin",     icon: "settings", label: "Admin" },
   ];
 
@@ -247,7 +248,7 @@ const Sidebar = ({ active, setActive }) => {
         <div className="brand-mark"></div>
         <div>
           <div className="brand-name">OBD Cockpit</div>
-          <div className="brand-sub"><span className="live-dot"></span>v0.9 · dati registrati</div>
+          <div className="brand-sub"><span className="live-dot"></span>v0.10 · dati registrati</div>
         </div>
       </div>
 
@@ -307,7 +308,7 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
   const fueled = TRIPS.filter(trip => OBD.usableForAnalysis(trip) && trip.fuelConsumedL > 0 && trip.fuelDistanceKm > 0);
   const activity = useMemo(() => OBD.activitySeries(TRIPS, scope), [TRIPS, scope.fromDate, scope.toDate]);
   const consumption = [...fueled].sort((a, b) => a.start.localeCompare(b.start));
-  const attention = TREND_INSIGHTS.filter(insight => ["critical", "warning"].includes(insight.level))
+  const attention = TREND_INSIGHTS.filter(insight => OBD.insightPresentation(insight).finding === "anomaly" && ["critical", "warning"].includes(insight.level))
     .sort((a, b) => (a.level === "critical" ? 0 : 1) - (b.level === "critical" ? 0 : 1));
   const recent = TRIPS.slice(0, 4);
   return (
@@ -336,9 +337,10 @@ const Dashboard = ({ setActive, setSelectedTripId }) => {
       <div className="overview-columns">
         <section className="overview-attention">
           <div className="section-head"><h2 className="section-title">Da tenere d'occhio</h2><button className="text-action" onClick={() => setActive("trends")}>Tutti i controlli →</button></div>
-          {attention.length ? <div className="attention-stack">{attention.slice(0, 3).map((insight, i) => <InsightCard key={i} insight={insight} />)}
+          <p className="muted" style={{ fontSize: 11, lineHeight: 1.5, margin: "0 0 10px" }}>Controlli fino a 90 giorni prima dell'ultimo viaggio del periodo.</p>
+          {attention.length ? <div className="attention-stack">{attention.slice(0, 3).map((insight, i) => <InsightCard key={insight.ruleId || i} insight={insight} />)}
             {attention.length > 3 && <button className="text-action" onClick={() => setActive("trends")}>Altri {attention.length - 3} avvisi</button>}</div>
-            : <div className="card attention-empty"><Icon name="info" size={20} /><div>{TREND_INSIGHTS.length ? "Nessuna anomalia nei controlli disponibili per questo periodo." : "Dati insufficienti per valutare questo periodo."}<small>I controlli dipendono dai sensori e dalla copertura dei viaggi registrati.</small></div></div>}
+            : <div className="card attention-empty"><Icon name="info" size={20} /><div>{TREND_INSIGHTS.some(insight => OBD.insightPresentation(insight).finding === "normal") ? "Nessuno scostamento nei controlli valutabili." : "Le prove disponibili non bastano per una valutazione diagnostica."}<small>I controlli dipendono dai sensori e dalla copertura dei viaggi registrati.</small></div></div>}
         </section>
         <section>
           <div className="section-head"><h2 className="section-title">Ultimi viaggi del periodo</h2><button className="text-action" onClick={() => setActive("trips")}>Vedi tutti →</button></div>
@@ -1422,49 +1424,36 @@ const MyOpelView = () => {
   );
 };
 
-/* ============== Trends & AI view (predictive diagnosis) ============== */
-const SEV_LABEL = { critical: "critici", warning: "avvisi", info: "sotto controllo" };
+/* ============== Evidence-based observations in the selected period ============== */
+/** Separate insufficient coverage from normal findings in period summaries. */
 const TrendsView = () => {
   const scope = React.useContext(PeriodScope);
   const [filter, setFilter] = useState("all");
-  const counts = { critical: 0, warning: 0, info: 0 };
-  TREND_INSIGHTS.forEach(i => { counts[i.level] = (counts[i.level] || 0) + 1; });
-  const shown = TREND_INSIGHTS.filter(i => filter === "all" || i.level === filter);
-  const assessed = TREND_INSIGHTS.length > 0;
-  const healthy = assessed && counts.critical === 0 && counts.warning === 0;
+  const counts = { anomaly: 0, normal: 0, insufficient: 0, information: 0 };
+  TREND_INSIGHTS.forEach(insight => { counts[OBD.insightPresentation(insight).finding] += 1; });
+  const shown = TREND_INSIGHTS.filter(insight => filter === "all" || OBD.insightPresentation(insight).finding === filter);
   const observationPage = usePagination(TRIPS.filter(t => t.insights?.length > 0), scope.query, 8);
   const insightPage = usePagination(shown, scope.query + filter, 12);
-
   return (
     <div className="page" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      <div className={`diag-banner ${healthy ? "ok" : counts.critical ? "critical" : "warning"}`}>
-        <div className="diag-ico">
-          <Icon name={healthy ? "trend" : "warn"} size={22} />
-        </div>
+      <div className={`diag-banner ${counts.anomaly ? "warning" : "neutral"}`}>
+        <div className="diag-ico"><Icon name={counts.anomaly ? "warn" : "info"} size={22} /></div>
         <div style={{ flex: 1, minWidth: 200 }}>
-          <div className="diag-title">
-            {!assessed ? "Dati insufficienti per una valutazione" : healthy ? "Nessuna anomalia rilevata nei controlli disponibili"
-             : counts.critical ? "Interventi consigliati"
-             : "Qualcosa da tenere d'occhio"}
-          </div>
-          <div className="diag-sub">
-            {TREND_INSIGHTS.length} risultati dei controlli disponibili nel periodo selezionato: diluizione olio,
-            rigenerazioni, batteria, rail, turbo, minimo, AdBlue, tagliando.
-          </div>
+          <div className="diag-title">{counts.anomaly ? "Scostamenti osservati nel periodo"
+            : counts.normal ? "Nessuno scostamento nei controlli valutabili"
+              : "Dati insufficienti per una valutazione diagnostica"}</div>
+          <div className="diag-sub">{TREND_INSIGHTS.length} risultati: i riepiloghi seguono il periodo; i controlli diagnostici considerano fino a 90 giorni prima della sua ultima registrazione. Le prove possono precedere il filtro e sono consultabili senza cambiarlo. La solidità delle prove è distinta dalla gravità.</div>
         </div>
         <div className="filter-row">
-          {[["all", `Tutti ${TREND_INSIGHTS.length}`],
-            ...(counts.critical ? [["critical", `Critici ${counts.critical}`]] : []),
-            ...(counts.warning ? [["warning", `Avvisi ${counts.warning}`]] : []),
-            ["info", `OK ${counts.info}`]].map(([id, lbl]) => (
-            <button key={id} className={`chip ${filter === id ? "active" : ""}`}
-                    onClick={() => setFilter(id)}>{lbl}</button>
+          {[["all", `Tutti ${TREND_INSIGHTS.length}`], ["anomaly", `Scostamenti ${counts.anomaly}`], ["normal", `Nei riferimenti ${counts.normal}`],
+            ["insufficient", `Dati insufficienti ${counts.insufficient}`], ["information", `Informazioni ${counts.information}`]].map(([id, label]) => (
+            <button key={id} className={`chip ${filter === id ? "active" : ""}`} aria-pressed={filter === id} onClick={() => setFilter(id)}>{label}</button>
           ))}
         </div>
       </div>
 
-      <div className="stagger" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(330px, 1fr))", gap: 12 }}>
-        {insightPage.items.map((ins, i) => <InsightCard key={i} insight={ins} />)}
+      <div className="stagger" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 330px), 1fr))", gap: 12 }}>
+        {insightPage.items.map((ins, i) => <InsightCard key={ins.ruleId || i} insight={ins} />)}
         {shown.length === 0 && <div className="muted" style={{ padding: 20 }}>Nessun controllo in questa categoria.</div>}
       </div>
 
@@ -1483,7 +1472,7 @@ const TrendsView = () => {
                 <span>{t.distanceKm} km · {t.durationMin} min</span>
                 {t.dpfRegenState && <DpfPill state={t.dpfRegenState} />}
               </div>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 10 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 300px), 1fr))", gap: 10 }}>
                 {t.insights.map((i, idx) => <InsightCard key={idx} insight={{ ...i, evidence: i.evidence || { tripIds: [t.id], pidSlugs: [] } }} />)}
               </div>
             </div>
@@ -1780,7 +1769,7 @@ const BottomNav = ({ active, setActive, onMenu }) => {
     { id: "trends",    icon: "trend", label: "Trend" },
     { id: "map",       icon: "map",   label: "Mappa" },
   ];
-  const secondary = ["fuel", "pids", "myopel", "dpf", "compare", "admin"];
+  const secondary = ["fuel", "pids", "myopel", "dpf", "compare", "events", "admin"];
   return (
     <nav className="bottom-nav">
       {items.map(it => (
@@ -1811,6 +1800,7 @@ const App = () => {
   });
   const [appliedRange, setAppliedRange] = useState(null);
   const [evidence, setEvidence] = useState(null);
+  const [historicalEvidence, setHistoricalEvidence] = useState(null);
   const range = OBD.periodRange(periodSelection);
   const [revision, setRevision] = useState(_dataVersion);
   const [status, setStatus] = useState({ loading: false, periodPending: true, checked: null,
@@ -1838,7 +1828,8 @@ const App = () => {
   useEffect(() => {
     const open = event => {
       const { tripId, pidSlug } = event.detail || {};
-      if (!TRIPS.some(trip => trip.id === tripId)) return;
+      if (!tripId) return;
+      if (!TRIPS.some(trip => trip.id === tripId)) { setHistoricalEvidence({ tripId, pidSlug }); return; }
       setSelectedTripId(tripId); setEvidence({ tripId, pidSlug, openedAt: Date.now() }); setView("trips");
     };
     window.addEventListener("open-evidence", open);
@@ -1868,6 +1859,7 @@ const App = () => {
     dpf: "DPF / FAP",
     myopel: "MyOpel · Stellantis",
     trends: "Trend e controlli",
+    events: "Registro eventi",
     admin: "Admin · Impostazioni",
   };
 
@@ -1920,10 +1912,12 @@ const App = () => {
             {view === "dpf"       && <DpfView />}
             {view === "myopel"    && <MyOpelView />}
             {view === "trends"    && <TrendsView />}
+            {view === "events"    && <EventsView scope={appliedRange} revision={revision} api={apiJson} onMutation={() => refreshDashboard(true)} PageControls={Pagination} />}
             {view === "admin"     && <AdminView />}
           </div>}
         </div>
       </main>
+      {historicalEvidence && <HistoricalEvidenceDialog evidence={historicalEvidence} api={apiJson} onClose={() => setHistoricalEvidence(null)} />}
 
       <TweaksPanel title="Aspetto e preferenze">
         <TweakSection label="Aspetto" />

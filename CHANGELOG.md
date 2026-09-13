@@ -5,6 +5,29 @@ Tutte le modifiche rilevanti al progetto sono annotate qui.
 Formato basato su [Keep a Changelog](https://keepachangelog.com/it/1.1.0/);
 il versionamento segue [SemVer](https://semver.org/lang/it/).
 
+## [0.10.0] — 2026-09-13
+
+### Aggiunto
+- Insight strutturati con solidità delle prove distinta dalla gravità, data,
+  osservazione, ipotesi, limiti, prove contrarie e azione suggerita.
+- Confronti personali con almeno cinque predecessori compatibili negli ultimi
+  180 giorni, mediana/MAD e condizioni mancanti dichiarate.
+- Registro eventi con interventi manuali modificabili, archiviazione reversibile,
+  rifornimenti e osservazioni DPF/diagnostiche datate e filtrabili.
+- Memoria SQLite degli avvisi, deduplicazione dei refresh e stato storico esplicito;
+  miglioramento e risoluzione richiedono nuove prove sufficienti.
+- Apertura delle prove fuori dal periodo in un pannello senza cambiare il filtro.
+
+### Corretto
+- Riferimenti dei viaggi privi di osservazioni future o del viaggio stesso;
+  diagnostica sui 90 giorni precedenti la fine selezionata, riepiloghi nel periodo.
+- Rimossi nessi causali non dimostrati tra diluizione olio e interruzioni DPF,
+  rapporto ruota/GPS e pressione pneumatici, picchi turbo e salute del componente.
+- Temperatura esterna distinta da temperatura iniziale del motore; mediana distinta
+  dalla media, proiezioni euristiche ancorate alle osservazioni storiche.
+- Dati insufficienti espliciti; assenza di segnali o interventi annotati non
+  risolvono automaticamente gli avvisi. Dettagli ed export usano l'analisi corrente.
+
 ## [0.9.0] — 2026-09-13
 
 ### Aggiunto

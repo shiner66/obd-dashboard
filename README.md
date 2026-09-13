@@ -8,6 +8,56 @@ Aggrega ed elabora i log esportati da:
 
 Costruito per essere **self-hosted via Docker su Unraid**, in **un singolo container**.
 
+### v0.10 — insight verificabili e registro eventi
+
+Gli insight separano osservazioni, ipotesi, prove contrarie, limiti e azioni.
+La solidità delle prove è qualitativa (limitata/moderata/elevata), non una
+probabilità di guasto; la gravità resta un indicatore distinto. Le soglie
+meccaniche esistenti sono euristiche e non certificano lo stato del veicolo.
+
+Il confronto dei consumi usa almeno cinque viaggi precedenti negli ultimi
+180 giorni, con fonte, copertura, distanza e velocità compatibili. Temperatura
+iniziale, ambiente e stato DPF affinano il confronto quando disponibili;
+le condizioni mancanti sono dichiarate e riducono la solidità. La mediana e
+la dispersione robusta descrivono il riferimento, senza provare una causa.
+La diagnostica usa fino a 90 giorni di storia terminanti all'ultimo viaggio
+selezionato; i riepiloghi di distanza, consumi e costi restano del periodo.
+Cambiare l'inizio del filtro non cambia il riferimento dello stesso viaggio.
+Le prove esterne al periodo si aprono in un pannello mantenendo il filtro.
+
+Il **Registro eventi** unisce interventi manuali, rifornimenti e osservazioni
+DPF/diagnostiche con data e fonte. Cambio olio, tagliando, batteria e pneumatici
+si possono annotare, modificare, archiviare e ripristinare. Gli interventi
+pertinenti separano le serie diagnostiche prima/dopo senza attribuire effetti
+causali. Non vengono aggiunti interventi ipotetici. Le osservazioni DPF non
+sono un conteggio certificato di cicli e non provano uno spegnimento.
+
+La memoria persistente degli avvisi inizia con le valutazioni di questa versione:
+prima osservazione, ricorrente, in miglioramento, non più rilevato, in osservazione.
+Il miglioramento richiede nuove prove sufficienti e una deviazione comparabile
+ridotta almeno del 20% (oppure gravità inferiore). La risoluzione richiede due
+nuove osservazioni normali sufficienti. Un refresh, un intervento annotato,
+una correzione della stessa osservazione o dati mancanti non confermano un
+recupero. La cronologia usa la data delle prove, non quella di apertura pagina;
+le viste storiche sono esplicitamente distinte dallo stato memorizzato corrente.
+Il motore resta deterministico e locale; non richiede un servizio LLM.
+
+API aggiunte (timestamp locali ISO, `T`, senza fuso):
+
+- `GET /api/v1/events?from_date=YYYY-MM-DD&to_date=YYYY-MM-DD`: cronologia e
+  interventi del periodo, compreso l'archivio manuale separato.
+- `GET /api/v1/maintenance`: interventi registrati; `include_archived=false`
+  esclude quelli archiviati. Supporta gli stessi filtri data.
+- `POST /api/v1/maintenance`, `PUT /api/v1/maintenance/{id}`: corpo completo
+  `{ts, type, odometerKm?, note?, archived?}`; `type` tra `oil_change`, `service`,
+  `battery`, `tyres`, `other`. Data e tipo obbligatori; nota vuota `""`, massimo
+  2000 caratteri. `archived` predefinito `false`.
+- `DELETE /api/v1/maintenance/{id}`: archiviazione reversibile; ripristino con
+  `PUT` e `archived:false`. Identificatore inesistente: 404; payload invalido: 422.
+
+Le nuove tabelle SQLite `maintenance_events`, `insight_states`, `insight_history`
+sono additive. Backup e rollback includono il DB completo insieme al container.
+
 ### v0.9 — periodi, confronti e lettura dei dati
 
 Il selettore condiviso permette di consultare 7 giorni, 30 giorni, il mese

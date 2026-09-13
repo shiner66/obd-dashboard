@@ -205,7 +205,9 @@ def test_insight_evidence_contains_only_actual_rule_inputs_and_available_pids(cl
     assert card["evidence"]["sampleCount"] == 600
     seed(*valid, invalid)
     filtered = client.get("/api/v1/dashboard?from_date=2026-09-01&to_date=2026-09-03").json()
-    assert not any(c["category"] == "battery" for c in filtered["trendInsights"])
+    battery = next(c for c in filtered["trendInsights"] if c["category"] == "battery")
+    assert battery["finding"] == "insufficient"
+    assert set(battery["evidence"]["tripIds"]) == {t["id"] for t in valid[:3]}
     visible_ids = {t["id"] for t in filtered["trips"]}
     assert all(set(c["evidence"]["tripIds"]) <= visible_ids for c in filtered["trendInsights"])
 

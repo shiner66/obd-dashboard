@@ -22,11 +22,12 @@ from fastapi.responses import Response, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import database as db
-from .api_models import SettingsUpdate, RefuelCreate
+from .api_models import SettingsUpdate, RefuelCreate, MaintenanceCreate
 from .parsers import csv_parser, myop_parser
 from .services import correlator as corr_svc
 from .services import fuel as fuel_svc
 from .services import insights as insight_svc
+from .services import insight_memory, event_log
 from .services.watcher import Watcher
 from .services import ingestion as ingest
 
@@ -36,7 +37,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(messa
 OBD_FILES_DIR   = Path(os.getenv("OBD_FILES_DIR",   "/data/obd"))
 MYOP_FILES_DIR  = Path(os.getenv("MYOP_FILES_DIR",  "/data/myop"))
 DB_PATH         = Path(os.getenv("DB_PATH",         "/data/db/trips.db"))
-APP_VERSION    = os.getenv("APP_VERSION", "0.9.0")
+APP_VERSION    = os.getenv("APP_VERSION", "0.10.0")
 APP_REVISION   = os.getenv("APP_REVISION", "unknown")
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 VEHICLE_NAME    = os.getenv("VEHICLE_NAME",    "Opel Corsa F Elegance")
@@ -281,7 +282,7 @@ async def lifespan(app: FastAPI):
 def _recompute_all_insights() -> None:
     try:
         trips = _effective_trip_metrics(db.get_trip_summaries(include_insight_features=True))
-        ctx = insight_svc.build_context(trips)
+        ctx = insight_svc.build_context(trips, events=db.get_maintenance())
         updated = 0
         for trip in trips:
             if "obd" not in trip.get("sources", []):
@@ -298,7 +299,8 @@ def _refresh_cross_trip_insights() -> None:
     try:
         trips = _effective_trip_metrics(db.get_trip_summaries(include_insight_features=True))
         if trips:
-            ct = insight_svc.cross_trip(trips)
+            ct = insight_svc.cross_trip(trips, history=trips, events=db.get_maintenance())
+            db.save_insight_reconciliation(insight_memory.reconcile(db.get_insight_states(), ct))
             log.info("Generated %d cross-trip insights", len(ct))
             # Store on a synthetic key in the app state (returned via data.js)
             app.state.trend_insights = ct
@@ -492,29 +494,66 @@ def _effective_trip_metrics(trips: list[dict], settings: dict | None = None) -> 
     return [{**t, **fuel_svc.select_consumption(t, density)} for t in trips]
 
 
+def _ensure_global_cache() -> dict:
+    """Cache global causal history and persist only genuinely changed measured states.
+
+    Callers hold the ingestion lock. Selecting a period never writes a different
+    diagnostic state: reconciliation always uses the complete available history.
+    """
+    global _cache_revision
+    if db.data_revision() != _cache_revision:
+        _dashboard_cache.clear()
+        _global_cache.clear()
+    if not _global_cache:
+        settings = effective_settings()
+        trips = _effective_trip_metrics(db.get_trip_summaries(include_insight_features=True), settings)
+        SettingsUpdate.model_validate({key: settings[key] for key in DEFAULT_SETTINGS})
+        refuels, events = db.get_refuels(), db.get_maintenance()
+        fuel = fuel_svc.fuel_summary(refuels, trips, settings, db.get_raw_trips("myopel"))
+        cards = insight_svc.cross_trip(trips, history=trips, events=events)
+        result = insight_memory.reconcile(db.get_insight_states(), cards)
+        db.save_insight_reconciliation(result)
+        _global_cache.update(trips=trips, settings=settings, refuels=refuels, fuel=fuel,
+                             catalog=db.get_pid_catalog(), vehicle=_build_vehicle(trips, settings, fuel),
+                             events=events, context=insight_svc.build_context(trips, events=events),
+                             states={state["ruleId"]: state for state in result["states"]}, cards=cards)
+        _cache_revision = db.data_revision()
+    return _global_cache
+
+
+def _with_lifecycle(cards: list[dict], states: dict) -> list[dict]:
+    """Attach current memory only to its exact observation, clearly marking historical views."""
+    out = []
+    for card in cards:
+        state = states.get(card.get("ruleId"))
+        if state and card.get("finding") != "information":
+            lifecycle = {key: state.get(key) for key in ("state", "firstSeen", "lastSeen", "observations", "unconfirmed")}
+            if card.get("observedAt") != state.get("lastObservationAt"):
+                lifecycle = {"state": "historical", "unconfirmed": True}
+            out.append({**card, "lifecycle": lifecycle})
+        else:
+            out.append(card)
+    return out
+
+
+def _fresh_trip_insights(trips: list[dict]) -> list[dict]:
+    """Return current per-trip analysis without rewriting imported trip measurements."""
+    cached = _ensure_global_cache()
+    features = {trip["id"]: trip for trip in cached["trips"]}
+    return [{**trip, "insights": insight_svc.per_trip(features.get(trip["id"], trip), cached["context"])}
+            for trip in _effective_trip_metrics(trips, cached["settings"])]
+
+
 def _dashboard_payload(from_date: str | None = None, to_date: str | None = None) -> dict:
     """Serve cached lightweight period data while keeping vehicle/tank state global."""
-    global _cache_revision
     _validate_period(from_date, to_date)
     with ingest.LOCK:
-        token = db.data_revision()
-        if token != _cache_revision:
-            _dashboard_cache.clear()
-            _global_cache.clear()
-        if not _global_cache:
-            settings = effective_settings()
-            trips = _effective_trip_metrics(db.get_trip_summaries(include_insight_features=True), settings)
-            SettingsUpdate.model_validate({key: settings[key] for key in DEFAULT_SETTINGS})
-            refuels = db.get_refuels()
-            fuel = fuel_svc.fuel_summary(refuels, trips, settings, db.get_raw_trips("myopel"))
-            _global_cache.update(trips=trips, settings=settings, refuels=refuels, fuel=fuel,
-                                 catalog=db.get_pid_catalog(), vehicle=_build_vehicle(trips, settings, fuel))
-            _cache_revision = db.data_revision()
+        _ensure_global_cache()
         key = (from_date, to_date)
         if key not in _dashboard_cache:
             all_trips = _global_cache["trips"]
             trips = [t for t in all_trips if _in_period(t.get("start"), from_date, to_date)]
-            ctx = insight_svc.build_context(trips)
+            ctx = _global_cache["context"]
             slim = [{**{k: v for k, v in t.items() if k != "pidValues"},
                      "insights": insight_svc.per_trip(t, ctx)} for t in trips]
             refuels = [r for r in _global_cache["refuels"] if _in_period(r.get("ts"), from_date, to_date)]
@@ -529,11 +568,14 @@ def _dashboard_payload(from_date: str | None = None, to_date: str | None = None)
             catalog = _global_cache["catalog"]
             scope = {"fromDate": from_date, "toDate": to_date,
                      "trips": "selected_period" if from_date or to_date else "all",
-                     "trendInsights": "selected_period" if from_date or to_date else "all",
+                     "trendInsights": "diagnostics_prior_90_days_and_period_summaries",
+                     "diagnosticAsOf": max((t.get("start") or "" for t in trips), default=None),
+                     "diagnosticLookbackDays": 90, "tripBaselineLookbackDays": 180,
                      "vehicle": "latest_global", "fuelLevel": "latest_global",
                      "tankToTank": "interval_end_in_period", "refuels": "refuel_date_in_period"}
             payload = {"vehicle": _global_cache["vehicle"], "trips": slim,
-                       "alerts": myop_parser.ALERT_DICT, "trendInsights": insight_svc.cross_trip(trips),
+                       "alerts": myop_parser.ALERT_DICT, "trendInsights": _with_lifecycle(
+                           insight_svc.cross_trip(trips, history=all_trips, events=_global_cache["events"]), _global_cache["states"]),
                        "pidCatalog": catalog, "pidGroups": _build_pid_groups(catalog),
                        "settings": _global_cache["settings"], "fuel": fuel,
                        "aggregates": _period_aggregates(trips), "scope": scope}
@@ -583,15 +625,18 @@ def data_js():
 def list_trips(from_date: str | None = None, to_date: str | None = None, summary: bool = False):
     """Export full trips or light summaries using the dashboard's local-day bounds."""
     _validate_period(from_date, to_date)
-    return _effective_trip_metrics(db.get_trip_summaries(from_date, to_date) if summary else db.get_all_trips(from_date, to_date))
+    with ingest.LOCK:
+        return _fresh_trip_insights(db.get_trip_summaries(from_date, to_date) if summary else db.get_all_trips(from_date, to_date))
 
 
 @app.get("/api/v1/trips/{trip_id}")
 def get_trip(trip_id: str):
-    trip = db.get_trip(trip_id)
-    if trip is None:
-        raise HTTPException(status_code=404, detail="Trip not found")
-    return _effective_trip_metrics([trip])[0]
+    """Fetch full evidence even outside the selected dashboard period."""
+    with ingest.LOCK:
+        trip = db.get_trip(trip_id)
+        if trip is None:
+            raise HTTPException(status_code=404, detail="Viaggio non trovato")
+        return _fresh_trip_insights([trip])[0]
 
 
 @app.get("/api/v1/tracks")
@@ -753,6 +798,54 @@ def get_fuel(from_date: str | None = None, to_date: str | None = None):
     return _dashboard_payload(from_date, to_date)["fuel"]
 
 
+@app.get("/api/v1/maintenance")
+def list_maintenance(from_date: str | None = None, to_date: str | None = None, include_archived: bool = True):
+    """List manually recorded interventions, including restorable archived records."""
+    _validate_period(from_date, to_date)
+    with ingest.LOCK:
+        return {"events": [event for event in db.get_maintenance(include_archived)
+                           if _in_period(event["ts"], from_date, to_date)]}
+
+
+@app.post("/api/v1/maintenance")
+def add_maintenance(payload: MaintenanceCreate):
+    """Record an explicitly entered intervention without changing vehicle measurements."""
+    with ingest.LOCK:
+        return db.save_maintenance(payload.model_dump())
+
+
+@app.put("/api/v1/maintenance/{event_id}")
+def edit_maintenance(event_id: int, payload: MaintenanceCreate):
+    """Replace a validated event, including explicit restoration of an archived row."""
+    with ingest.LOCK:
+        event = db.save_maintenance(payload.model_dump(), event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Intervento non trovato")
+        return event
+
+
+@app.delete("/api/v1/maintenance/{event_id}")
+def archive_maintenance(event_id: int):
+    """Archive rather than erase user-entered maintenance history."""
+    with ingest.LOCK:
+        if not db.archive_maintenance(event_id):
+            raise HTTPException(status_code=404, detail="Intervento non trovato")
+        return {"id": event_id, "archived": True}
+
+
+@app.get("/api/v1/events")
+def list_events(from_date: str | None = None, to_date: str | None = None):
+    """Return a date-scoped timeline; reading or filtering never invents observations."""
+    _validate_period(from_date, to_date)
+    with ingest.LOCK:
+        cached = _ensure_global_cache()
+        maintenance = db.get_maintenance(include_archived=True)
+        timeline = event_log.build_timeline(maintenance, cached["refuels"], cached["trips"], db.get_insight_history())
+        return {"events": [event for event in timeline if _in_period(event["ts"], from_date, to_date)],
+                "maintenance": [event for event in maintenance if _in_period(event["ts"], from_date, to_date)],
+                "scope": {"fromDate": from_date, "toDate": to_date, "events": "event_date_in_period"}}
+
+
 @app.post("/api/v1/refuels")
 def add_refuel(payload: RefuelCreate):
     """Record a validated refuel atomically, preserving local timestamp semantics."""
@@ -908,15 +1001,10 @@ def recompute_insights():
     Safe to call multiple times. Use after updating insight/DPF logic to
     refresh the stored insights without re-uploading CSV files.
     """
-    trips = db.get_all_trips()
-    ctx = insight_svc.build_context(trips)
-    updated = 0
-    for trip in trips:
-        if "obd" not in trip.get("sources", []):
-            continue
-        new_insights = insight_svc.per_trip(trip, ctx)
-        db.update_insights(trip["id"], new_insights)
-        updated += 1
+    with ingest.LOCK:
+        _recompute_all_insights()
+        _refresh_cross_trip_insights()
+        updated = sum("obd" in trip.get("sources", []) for trip in db.get_trip_summaries())
     log.info("recompute-insights: updated %d OBD trips", updated)
     return {"updated": updated}
 

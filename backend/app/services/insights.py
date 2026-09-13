@@ -1,11 +1,11 @@
 """
-AI Insight Engine — predictive maintenance from the vehicle's own history.
+Deterministic insight engine — observations and comparisons from vehicle history.
 
 Two layers:
   • per_trip(trip, ctx)   — concrete, per-trip notes shown in the trip detail.
-  • cross_trip(trips)     — the "Trend & AI" diagnosis cards: every rule is a
-                            trend against the car's own baseline, quantified,
-                            with a projection when the math supports one.
+  • cross_trip(trips, history, events) — selected-period summaries and a bounded
+                            diagnostic reference, with explicit evidence,
+                            qualitative confidence and heuristic projections.
 
 Design principles
   • A healthy car rarely trips an absolute threshold — compare to the car's
@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import statistics
 from datetime import datetime, timedelta
+
+from . import insight_analysis as analysis
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -92,10 +94,15 @@ def _fmt_date(s: str | None) -> str:
     return f"{dt.day} {months[dt.month - 1]}"
 
 
-def _fmt_future(days: float | None) -> str:
-    if days is None or days <= 0 or days > 730:
+def _fmt_future(days: float | None, observed_at: str | None = None) -> str:
+    """Anchor heuristic dates to the observation; suppress calendar forecasts for past records."""
+    anchor = _parse_dt(observed_at)
+    if days is None or days <= 0 or days > 730 or not anchor or anchor.date() < datetime.now().date():
         return ""
-    dt = datetime.now() + timedelta(days=days)
+    try:
+        dt = anchor + timedelta(days=days)
+    except OverflowError:
+        return ""
     months = ["gen", "feb", "mar", "apr", "mag", "giu",
               "lug", "ago", "set", "ott", "nov", "dic"]
     return f"≈ {dt.day} {months[dt.month - 1]}"
@@ -172,20 +179,54 @@ def _fuel_evidence(trips: list[dict]) -> dict:
     return evidence
 
 
-def build_context(trips: list[dict]) -> dict:
-    """Aggregate stats used to compare a single trip against the car's history."""
-    trips = [t for t in trips if usable_for_analysis(t)]
-    baseline = [t for t in trips if (k := _km_l(t)) and 2 < k < 60]
-    kml = [_km_l(t) for t in baseline]
-    obd = [t for t in trips if "obd" in t.get("sources", [])]
-    avg_regen = next((t["dpfAvgRegenKm"] for t in reversed(obd)
-                      if t.get("dpfAvgRegenKm")), None)
-    return {
-        "median_kml": round(statistics.median(kml), 1) if kml else None,
-        "avg_regen_km": avg_regen,
-        "n": len(trips),
-        "baselineTrips": baseline,
-    }
+def build_context(trips: list[dict], events: list[dict] | None = None) -> dict:
+    """Retain history for causal-time selection; never precompute a future-inclusive baseline."""
+    history = analysis.unique([t for t in trips if usable_for_analysis(t)])
+    return {"history": history, "baselineTrips": history, "events": list(events or []), "n": len(history)}
+
+
+def _fuel_comparison(trip: dict, history: list[dict], rule_id="trip.fuel.peer_comparison") -> dict | None:
+    """Compare with five predecessors, retaining the prior -18% consumption trigger.
+
+    A deficit must also exceed 2.5 median absolute deviations of the cohort;
+    this conservative statistical guard is not a mechanical threshold or a
+    probability interval. The prior +12% descriptive improvement trigger remains.
+    """
+    kml = _km_l(trip)
+    if not kml or not 2 < kml < 60:
+        return None
+    baseline = analysis.peer_baseline(trip, history)
+    peers = baseline["trips"]
+    count = len(peers)
+    median, mad, delta = baseline["median"], baseline["mad"], baseline["deltaPct"]
+    finding, level = "insufficient", "info"
+    title = f"Consumo · {_it_number(kml)} km/L · confronto insufficiente"
+    body = f"{count} viaggi precedenti comparabili: ne servono almeno 5. Valore osservato {_it_number(kml)} km/L."
+    counter = []
+    deviation = None
+    if baseline["sufficient"]:
+        unusual = abs(kml - median) > 2.5 * mad
+        finding = "anomaly" if delta <= -18 and unusual else "normal"
+        level = "warning" if finding == "anomaly" else "info"
+        title = ("Consumo elevato rispetto ai precedenti" if finding == "anomaly" else "Consumo confrontabile con i precedenti")
+        body = (f"{_it_number(kml)} km/L contro una mediana di {_it_number(median)} km/L "
+                f"su {count} predecessori comparabili ({_it_number(delta, '+.1f')}%). "
+                f"Dispersione robusta (MAD): {_it_number(mad)} km/L.")
+        if delta >= 12 and unusual:
+            finding, title = "information", "Consumo inferiore rispetto ai precedenti"
+        if not unusual:
+            counter.append("Lo scarto rientra nella dispersione robusta dei predecessori.")
+        if delta > -18:
+            counter.append("Il deficit di km/L non raggiunge la soglia di attenzione del confronto.")
+        deviation = {"metric": "fuel_peer_deficit_pct", "value": max(0, -delta), "unit": "%"}
+    raw = _ins("fuel", level, title, body, evidence=_fuel_evidence([trip, *peers]))
+    return analysis.structure(raw, rule_id, [trip, *peers], finding=finding, baseline=baseline,
+        hypotheses=["Traffico, carico e stile di guida possono differire anche fra viaggi comparabili."] if finding == "anomaly" else [],
+        limitations=["Confronto osservazionale: non identifica una causa meccanica.",
+                     "Mediana e MAD descrivono il gruppo; non sono un intervallo di previsione."],
+        counter_evidence=counter, deviation=deviation,
+        action="Raccogli altri viaggi nelle stesse condizioni." if finding == "insufficient" else
+               "Controlla percorso e condizioni registrate; verifica in officina solo eventuali sintomi persistenti.")
 
 
 # ── per-trip ──────────────────────────────────────────────────────────────────
@@ -196,80 +237,69 @@ def per_trip(trip: dict, ctx: dict | None = None) -> list[dict]:
     ctx = ctx or {}
     is_obd = "obd" in trip.get("sources", [])
     if not usable_for_analysis(trip):
-        return [_ins("data", "info", "Storico conservato: dati insufficienti",
+        return [analysis.structure(_ins("data", "info", "Storico conservato: dati insufficienti",
                      "Sorgenti mancanti o insufficienti per ricalcolare questo viaggio; escluso dai confronti.",
-                     evidence=_evidence([trip]))]
+                     evidence=_evidence([trip])), "trip.data.incomplete", [trip], finding="insufficient")]
     evidence = _fuel_evidence([trip])
 
-    def emit(*args, **kwargs):
-        """Attach the exact input selection of the current per-trip rule."""
-        return _ins(*args, **kwargs, evidence=evidence)
+    rule_id = "trip.observation"
 
-    # ── Fuel economy vs your median (works for OBD and MyOpel trips) ──────────
-    kml = _km_l(trip)
-    med = ctx.get("median_kml")
+    def emit(*args, **kwargs):
+        """Attach stable rule identity and only the current trip's actual measurements."""
+        card = _ins(*args, **kwargs, evidence=evidence)
+        return analysis.structure(card, rule_id, [trip], finding="information" if card["level"] == "info" else "anomaly",
+                                  limitations=["Una singola registrazione non identifica una causa meccanica."])
+
+    # Compare only predecessors, regardless of which history the caller supplied.
     dist = trip.get("distanceKm") or 0
-    if kml:
-        if med and dist >= 3:
-            evidence = _fuel_evidence([trip, *ctx.get("baselineTrips", [])])
-            delta = (kml - med) / med * 100
-            if delta >= 12:
-                out.append(emit("fuel", "info", f"Viaggio efficiente · {_it_number(kml, '.1f')} km/L",
-                    f"Il {abs(delta):.0f}% meglio della tua media ({_it_number(med, '.1f')} km/L). "
-                    "Guida fluida e percorso scorrevole."))
-            elif delta <= -18:
-                out.append(emit("fuel", "warning", f"Consumo elevato · {_it_number(kml, '.1f')} km/L",
-                    f"Il {abs(delta):.0f}% sotto la tua media ({_it_number(med, '.1f')} km/L). "
-                    "Tipico di traffico, partenza a freddo o tragitto urbano."))
-            else:
-                out.append(emit("fuel", "info", f"Consumo nella norma · {_it_number(kml, '.1f')} km/L",
-                    f"In linea con la tua media ({_it_number(med, '.1f')} km/L)."))
-        else:
-            out.append(emit("fuel", "info", f"Consumo · {_it_number(kml, '.1f')} km/L",
-                f"≈ {_it_number(100/kml, '.1f')} L/100 km su questo viaggio."))
+    comparison = _fuel_comparison(trip, ctx.get("history", ctx.get("baselineTrips", [])))
+    if comparison:
+        out.append(comparison)
 
     if not is_obd:
         return out
 
     evidence = _evidence([trip], ("coolant", "coolant_c"))
     # ── Cold-start warm-up ───────────────────────────────────────────────────
+    rule_id = "trip.temperature"
     air = trip.get("airTempC")
     coolant_max = trip.get("coolantMaxC")
     if air is not None and air < 18 and coolant_max:
-        warmed = coolant_max >= 80
-        out.append(emit("engine", "info", "Partenza a freddo",
-            f"Avvio a ~{air:.0f}°C ambiente; liquido salito a {coolant_max:.0f}°C — "
-            f"{'temperatura di esercizio raggiunta' if warmed else 'motore non del tutto in temperatura, consumo penalizzato'}."))
+        out.append(emit("engine", "info", "Temperature osservate",
+            f"Ambiente iniziale ~{air:.0f}°C; liquido massimo {coolant_max:.0f}°C. "
+            "La temperatura ambiente non dimostra una partenza a motore freddo."))
 
     evidence = _evidence([trip], ("regen_st", "regen_dist", "soot_cl", "egt_a", "egt_dpf_i", "egt_dpf_o", "nox_t"))
     # ── DPF regeneration narrative ───────────────────────────────────────────
+    rule_id = "trip.dpf.state"
     state = trip.get("dpfRegenState") or "idle"
     egt = trip.get("exhaustAfterCatC")
     if state == "active":
         out.append(emit("dpf", "warning", "Rigenerazione attiva all’ultima osservazione",
             f"I sensori indicavano una rigenerazione all’ultima osservazione disponibile"
             + (f" (EGT {egt:.0f}°C)" if egt else "")
-            + ". Interromperla immette gasolio nell'olio: se possibile prosegui "
-              "la marcia finché non termina (5–15 min a velocità costante)."))
+            + ". L'esito successivo non è osservato: non dimostra uno spegnimento né la causa di una diluizione. "
+              "Segui le indicazioni del manuale del veicolo."))
     elif state == "completed":
         out.append(emit("dpf", "info", "Rigenerazione DPF completata",
-            "Ciclo completato con successo: il soot è stato bruciato. "
-            "Il contatore km riparte da zero."))
+            "La sequenza osservata soddisfa i criteri della regola di completamento DPF. "
+            "Il riepilogo non misura direttamente la quantità di soot bruciata."))
     elif state == "requested":
         if dist < 8:
             out.append(emit("dpf", "warning", "Rigenerazione richiesta ma viaggio breve",
-                "L'ECU ha richiesto una rigenerazione ma il tragitto è troppo corto per "
-                "raggiungere le temperature. Ripetuti viaggi brevi accumulano soot."))
+                "Richiesta ECU osservata durante un viaggio breve. La durata da sola non dimostra "
+                "che la temperatura fosse insufficiente o che la rigenerazione sia stata interrotta."))
         else:
             out.append(emit("dpf", "warning", "Rigenerazione DPF richiesta",
                 f"Richiesta in corso{f', EGT post-cat {egt:.0f}°C' if egt else ''}. "
                 "Un tratto a velocità costante (extraurbano) aiuta a completarla."))
     elif state == "post_regen":
         out.append(emit("dpf", "info", "Post-rigenerazione",
-            "Rigenerazione completata poco prima di questo viaggio."))
+            "I segnali osservati sono classificati come post-rigenerazione; il ciclo precedente non è ricostruito integralmente."))
 
     evidence = _evidence([trip], ("soot_cl",))
     # ── Short trip + soot building (the #1 diesel/DPF risk) ───────────────────
+    rule_id = "trip.dpf.soot"
     soot = trip.get("dpfClosedSoot")
     if dist < 5 and state in ("idle", "requested") and soot is not None and soot >= 4:
         out.append(emit("dpf", "warning", "Viaggio breve con soot in accumulo",
@@ -277,10 +307,11 @@ def per_trip(trip: dict, ctx: dict | None = None) -> list[dict]:
             "Programma ogni tanto un tratto extraurbano per far pulire il filtro."))
     elif soot is not None and soot >= 7:
         out.append(emit("dpf", "warning", f"Closed soot alto · {_it_number(soot, '.1f')} g/L",
-            "Vicino alla soglia di rigenerazione: attesa a breve."))
+            "Valore soot elevato rispetto alla soglia di attenzione della regola; il momento della rigenerazione non è prevedibile da questo solo dato."))
 
     evidence = _evidence([trip], ("rpm",))
     # ── Near-stall idle dip (mount/flywheel/EGR clue, aggregated in Trend&AI) ─
+    rule_id = "trip.engine.idle_dip"
     rpm_min = _pid_stat(trip, "rpm", "min")
     if rpm_min is not None and 150 < rpm_min < 600:
         out.append(emit("engine", "info", f"Calo di giri sotto il minimo · {rpm_min:.0f} rpm",
@@ -289,12 +320,14 @@ def per_trip(trip: dict, ctx: dict | None = None) -> list[dict]:
 
     evidence = _evidence([trip], ("egt_a",))
     # ── EGT spike outside regen ──────────────────────────────────────────────
+    rule_id = "trip.engine.egt"
     if egt is not None and egt > 700 and state not in ("active", "completed"):
         out.append(emit("engine", "info", f"Picco EGT {egt:.0f}°C",
             "Temperatura gas di scarico elevata, compatibile con guida sostenuta."))
 
     evidence = _evidence([trip], ("oil_dil",))
     # ── Oil dilution (diesel: fuel dilutes oil during regens) ────────────────
+    rule_id = "trip.engine.oil_dilution"
     dil = trip.get("oilDilutionPct")
     if dil is not None and 5.0 < dil < 15:
         out.append(emit("engine", "critical", f"Diluizione olio {_it_number(dil, '.1f')}%",
@@ -302,12 +335,14 @@ def per_trip(trip: dict, ctx: dict | None = None) -> list[dict]:
 
     evidence = _evidence([trip], ("ss_state",))
     # ── Stop&Start genuine fault only ────────────────────────────────────────
+    rule_id = "trip.engine.stop_start"
     if trip.get("ssState") == 7:
         out.append(emit("engine", "warning", "Stop&Start — guasto",
             "Il sistema Stop&Start ha riportato un guasto. Diagnostica consigliata."))
 
     evidence = _evidence([trip], ("rpm", "speed", "speed_v", "inj_q"))
     # ── Idle share (OBD-derived, §3) ─────────────────────────────────────────
+    rule_id = "trip.fuel.idle_share"
     idle_share = trip.get("idleSharePct")
     idle_s = trip.get("idleSeconds") or 0
     if idle_share is not None and idle_share >= 20 and idle_s >= 120:
@@ -318,6 +353,7 @@ def per_trip(trip: dict, ctx: dict | None = None) -> list[dict]:
 
     evidence = _evidence([trip], ("ac_amp",))
     # ── A/C usage (compressor solenoid current, §2) ──────────────────────────
+    rule_id = "trip.fuel.ac_usage"
     ac_share = trip.get("acActivePct")
     if ac_share is not None and ac_share >= 40:
         out.append(emit("fuel", "info", f"Clima attivo · {ac_share:.0f}% del viaggio",
@@ -330,10 +366,20 @@ def per_trip(trip: dict, ctx: dict | None = None) -> list[dict]:
 
 # ── cross-trip (Trend & AI diagnosis cards) ───────────────────────────────────
 
-def cross_trip(trips: list[dict]) -> list[dict]:
-    """Predictive-maintenance cards: trends vs the car's own baseline."""
+def cross_trip(trips: list[dict], history: list[dict] | None = None, events: list[dict] | None = None) -> list[dict]:
+    """Period summaries plus diagnostics on the preceding 90 days, bounded by selected end."""
     out: list[dict] = []
-    trips = [t for t in trips if usable_for_analysis(t)]
+    period = [t for t in analysis.unique(trips) if usable_for_analysis(t)]
+    diagnostic = analysis.bounded_history(trips, history)
+    if not diagnostic:
+        return []
+    trips, boundaries = analysis.segment_history(diagnostic, events)
+    lookup = {t["id"]: t for t in [*period, *trips]}
+    rule_id = "diagnostic.observation"
+    min_count = 5
+    deviation = None
+    informational = {"period.fuel.economy", "period.fuel.cost", "period.fuel.mass", "diagnostic.adblue.range",
+                     "diagnostic.service.countdown", "diagnostic.dpf.interval"}
     evidence = _evidence([])
     daily_inputs = []
 
@@ -344,7 +390,43 @@ def cross_trip(trips: list[dict]) -> list[dict]:
             context_ids = [t["id"] for t in daily_inputs]
             used["contextTripIds"] = context_ids
             used["tripIds"] = list(dict.fromkeys([*used["tripIds"], *context_ids]))
-        return _ins(category, level, title, body, *args, **kwargs, evidence=used)
+        inputs = [lookup[i] for i in evidence["tripIds"] if i in lookup]
+        limitations = ["Le osservazioni descrivono un segnale; non provano una causa meccanica."]
+        if "euristic" in body:
+            limitations.append("Proiezione euristica, senza intervallo di previsione e non una scadenza certa.")
+        kind = {"diagnostic.oil.dilution": "oil_change", "diagnostic.battery.cranking": "battery",
+                "diagnostic.tyres.speed_ratio": "tyres", "diagnostic.service.countdown": "service"}.get(rule_id)
+        if kind in boundaries:
+            event = boundaries[kind]
+            used["eventIds"] = [event["id"]]
+            limitations.append(f"Serie dopo l'evento registrato del {event['ts'][:10]}; nessun effetto causale attribuito.")
+        body = body.replace(" ()", "")
+        if rule_id.startswith("period."):
+            level = "info"
+        policies = {
+            "diagnostic.oil.dilution": (["Strategia ECU e condizioni d'uso possono contribuire al segnale; la causa non è identificata."],
+                                         "Confronta le letture con la manutenzione e verifica il livello secondo il manuale."),
+            "diagnostic.battery.cranking": (["Temperatura, carica e condizioni di avviamento possono influire sul minimo misurato."],
+                                             "Se il calo si ripete o l'avviamento è difficoltoso, richiedi un test batteria."),
+            "diagnostic.engine.rail": (["Richiesta di carico e campionamento possono cambiare il rapporto delle medie."],
+                                        "Confronta richiesta e misura sulla stessa timeline prima di una diagnosi."),
+            "diagnostic.engine.boost": (["Carico e richiesta turbo possono differire anche a regimi simili."],
+                                         "Confronta i segnali in condizioni di carico simili; verifica eventuali sintomi persistenti."),
+            "diagnostic.tyres.speed_ratio": (["Campionamento GPS e condizioni del percorso possono influire sul rapporto."],
+                                              "Per conoscere la pressione usa una misura diretta con il manometro."),
+        }
+        hypotheses, action = policies.get(rule_id, ([], None))
+        card = _ins(category, level, title, body, *args, **kwargs, evidence=used)
+        result = analysis.structure(card, rule_id, inputs, min_count=min_count,
+                                    finding="information" if rule_id in informational else None,
+                                    hypotheses=hypotheses if level in ("warning", "critical") else [],
+                                    action=action, limitations=limitations, deviation=deviation)
+        if rule_id.startswith("diagnostic."):
+            # Abundant summaries cannot establish fully controlled operating conditions.
+            if result["confidence"]["grade"] == "high":
+                result["confidence"]["grade"] = "moderate"
+            result["confidence"]["reasons"].append("Condizioni di esercizio non completamente controllate nelle statistiche di viaggio")
+        return result
 
     obd = sorted([t for t in trips if "obd" in t.get("sources", [])],
                  key=lambda t: t.get("start") or "")
@@ -356,6 +438,8 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         daily_inputs = [t for t in dated if (last_date - _parse_dt(t["start"])).days <= 30]
 
     # ── 1. Oil dilution trend (regression over km) ────────────────────────────
+    rule_id, min_count = "diagnostic.oil.dilution", 8
+    deviation = None
     dil_pts = _clean([( (t.get("odometerKm") or 0), t.get("oilDilutionPct") )
                       for t in obd if t.get("odometerKm")], 0.0, 15.0)
     dil_pts.sort(key=lambda p: p[0])
@@ -365,6 +449,7 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         ys = [p[1] for p in dil_pts]
         fit = _linreg(xs, ys)
         last = ys[-1]
+        deviation = {"metric": "oil_dilution_pct", "value": max(0, last), "unit": "%"}
         if fit:
             per_1000 = fit[0] * 1000.0
             km_to_5 = (5.0 - last) / per_1000 * 1000.0 if per_1000 > 0.01 else None
@@ -377,29 +462,33 @@ def cross_trip(trips: list[dict]) -> list[dict]:
                 out.append(emit("engine", "warning", "Diluizione olio in aumento",
                     f"Da {_it_number(ys[0], '.1f')}% a {_it_number(last, '.1f')}% (+{_it_number(per_1000, '.2f')}%/1000 km). Di questo passo "
                     f"la soglia del 5% arriva tra ~{_it_number(km_to_5, ',.0f')} km"
-                     + (f" ({_fmt_future(days_to_5)})" if days_to_5 else "") +
-                    ". Causa tipica: rigenerazioni DPF interrotte. Anticipa il cambio olio.",
+                     + (f" ({_fmt_future(days_to_5, max((lookup[i].get("start") or "" for i in evidence["tripIds"]), default=""))})" if days_to_5 else "") +
+                    ". Proiezione euristica della tendenza, non una scadenza. La causa non è identificata: valuta il dato con la manutenzione registrata.",
                     ys, "%"))
             elif per_1000 >= 0.10:
                 body = (f"{_it_number(last, '.1f')}% attuale, in lento aumento (+{_it_number(per_1000, '.2f')}%/1000 km)")
                 if km_to_5:
                     body += f" — soglia 5% tra ~{_it_number(km_to_5, ',.0f')} km"
                     if days_to_5:
-                        body += f" ({_fmt_future(days_to_5)})"
-                body += ". Fisiologico per un diesel usato in città; completa le rigenerazioni per rallentarlo."
+                        body += f" ({_fmt_future(days_to_5, max((lookup[i].get("start") or "" for i in evidence["tripIds"]), default=""))})"
+                body += ". Proiezione euristica: percorso e strategia ECU possono variare. Questi dati non identificano la causa dell'aumento."
                 out.append(emit("engine", "info", "Diluizione olio sotto controllo", body, ys, "%"))
             else:
                 out.append(emit("engine", "info", f"Diluizione olio stabile · {_it_number(last, '.1f')}%",
-                    "Nessuna deriva significativa nel periodo osservato (allarme oltre il 5%).",
+                    "La deriva resta sotto la soglia di attenzione della regola nel riferimento osservato (livello di attenzione oltre il 5%).",
                     ys, "%"))
 
     # ── 2. Interrupted regenerations (root cause of dilution) ─────────────────
-    # A trip that ends while state == "active" means the engine was switched
-    # off mid-regen. What matters is the *share* of regens that get cut short.
+    rule_id, min_count = "diagnostic.dpf.observed_outcomes", 5
+    deviation = None
+    # Active at the final measurement means the later outcome was not observed.
+    # It cannot establish that the engine stopped or the cycle was interrupted.
     window = obd[-40:]
     regen_done = [t for t in window if t.get("dpfRegenState") == "completed"]
     regen_cut  = [t for t in window if t.get("dpfRegenState") == "active"]
     regen_events = len(regen_done) + len(regen_cut)
+    if regen_events:
+        deviation = {"metric": "dpf_unobserved_outcome_share_pct", "value": len(regen_cut) / regen_events * 100, "unit": "%"}
     evidence = _evidence([*regen_done, *regen_cut], ("regen_st", "regen_dist", "soot_cl", "egt_a", "egt_dpf_i", "egt_dpf_o", "nox_t"))
     if regen_cut and regen_events >= 2:
         share = len(regen_cut) / regen_events * 100
@@ -407,18 +496,23 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         if share >= 30 and len(regen_cut) >= 2:
             out.append(emit("dpf", "warning",
                 f"{len(regen_cut)} rigenerazioni su {regen_events} ancora attive all’ultima osservazione ({share:.0f}%)",
-                f"Ultima osservazione attiva il {when}. Il dato non dimostra uno spegnimento. Spegnere il motore a rigenerazione in corso "
-                "immette gasolio nell'olio (è la causa principale della diluizione) e fa "
-                "ripartire il ciclo da capo: quando il minimo sale e la ventola resta attiva, "
-                "prosegui la marcia 5–15 minuti finché non termina."))
+                f"Ultima osservazione attiva il {when}. L'esito successivo non è osservato. "
+                "Questi dati non provano uno spegnimento, un'interruzione o la causa di una diluizione dell'olio."))
         else:
             cut_txt = "1 con esito non osservato" if len(regen_cut) == 1 else f"{len(regen_cut)} con esito non osservato"
             out.append(emit("dpf", "info",
                 f"Rigenerazioni: {len(regen_done)} completate, {cut_txt}",
                 f"Ultima osservazione attiva il {when}. L’esito successivo non è disponibile; "
-                "completarle mantiene bassa la diluizione dell'olio."))
+                "non può essere usato per attribuire una causa alla diluizione dell'olio."))
+
+    elif regen_events >= min_count:
+        out.append(emit("dpf", "info", "Esiti DPF osservati nel riferimento",
+            f"{regen_events} viaggi soddisfano i criteri di completamento osservato; "
+            "nessuno termina con stato classificato attivo. Il dato non certifica l'efficienza del filtro."))
 
     # ── 3. DPF — next regen prediction + interval trend ───────────────────────
+    rule_id, min_count = "diagnostic.dpf.interval", 5
+    deviation = None
     since = next((t.get("dpfSinceRegenKm") for t in reversed(obd)
                   if t.get("dpfSinceRegenKm") is not None), None)
     avg_regen = next((t.get("dpfAvgRegenKm") for t in reversed(obd)
@@ -442,23 +536,25 @@ def cross_trip(trips: list[dict]) -> list[dict]:
                 if delta_pct <= -8:
                     level = "warning"
                     trend_txt = (f" Intervallo medio in calo del {abs(delta_pct):.0f}% "
-                                 "nel periodo: il filtro si intasa più in fretta (più urbano o filtro che invecchia).")
+                                 "nel riferimento diagnostico; condizioni d'uso e strategia ECU possono differire.")
                 elif delta_pct >= 8:
-                    trend_txt = f" Intervallo medio in aumento ({delta_pct:+.0f}%): rigenera meno spesso, buon segno."
+                    trend_txt = f" Intervallo medio in aumento ({delta_pct:+.0f}%) nel riferimento diagnostico."
         if remaining > 0:
             lvl = level if pct < 90 else "warning"
-            out.append(emit("dpf", lvl, "Prossima rigenerazione DPF",
+            out.append(emit("dpf", lvl, "Intervallo DPF · stima euristica",
                 f"{since:.0f} km dall'ultima · intervallo medio {avg_regen:.0f} km "
-                f"({pct:.0f}% del ciclo). Stimata tra ~{remaining:.0f} km"
-                + (f" ({_fmt_future(remaining / daily)})" if daily else "") + "." + trend_txt,
+                f"({pct:.0f}% del riferimento). Proiezione euristica tra ~{remaining:.0f} km"
+                + (f" ({_fmt_future(remaining / daily, max((lookup[i].get("start") or "" for i in evidence["tripIds"]), default=""))})" if daily else "") + "." + trend_txt,
                 interval_series, "km"))
         else:
-            out.append(emit("dpf", "warning", "Rigenerazione DPF imminente",
+            out.append(emit("dpf", "warning", "Intervallo DPF storico superato",
                 f"Già {since:.0f} km dall'ultima, oltre l'intervallo medio "
-                f"({avg_regen:.0f} km). Favorisci un tratto extraurbano." + trend_txt,
+                f"({avg_regen:.0f} km). L'intervallo medio non determina quando partirà il prossimo ciclo." + trend_txt,
                 interval_series, "km"))
 
     # ── 4. DPF soot now ───────────────────────────────────────────────────────
+    rule_id, min_count = "diagnostic.dpf.soot", 5
+    deviation = None
     soot = next((t.get("dpfClosedSoot") for t in reversed(obd)
                  if t.get("dpfClosedSoot") is not None), None)
     soot_series = [t.get("dpfClosedSoot") for t in obd[-25:] if t.get("dpfClosedSoot") is not None]
@@ -468,14 +564,16 @@ def cross_trip(trips: list[dict]) -> list[dict]:
     if soot is not None:
         if soot >= 7:
             out.append(emit("dpf", "warning", f"Closed soot {_it_number(soot, '.1f')} g/L",
-                "Carico soot alto: rigenerazione attesa a breve. Evita di interrompere il viaggio se parte.",
+                "Carico soot elevato rispetto alla soglia di attenzione della regola. Non determina l'inizio del prossimo ciclo.",
                 soot_series, "g/L"))
         else:
             out.append(emit("dpf", "info", f"Closed soot {_it_number(soot, '.1f')} g/L",
-                "Il filtro si svuota con la rigenerazione intorno a ~8 g/L. Valore nella norma.",
+                "Valore inferiore alla soglia di attenzione della regola; da solo non certifica lo stato del filtro.",
                 soot_series, "g/L"))
 
     # ── 5. Battery cranking voltage (trend + projection) ─────────────────────
+    rule_id, min_count = "diagnostic.battery.cranking", 6
+    deviation = None
     bat_pts = [(d, t["batteryStartupV"]) for t in obd
                if t.get("batteryStartupV") is not None
                and 6 <= t["batteryStartupV"] <= 14
@@ -486,6 +584,7 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         xs = [(d - t0).days + (d - t0).seconds / 86400 for d, _ in bat_pts]
         ys = [v for _, v in bat_pts]
         med_v = _median(ys)
+        deviation = {"metric": "battery_median_deficit_8_8v", "value": max(0, 8.8 - med_v), "unit": "V"}
         fit = _linreg(xs, ys)
         slope_month = fit[0] * 30 if fit else 0.0
         last = ys[-1]
@@ -497,7 +596,7 @@ def cross_trip(trips: list[dict]) -> list[dict]:
             months_to_88 = (last - 8.8) / abs(slope_month) if slope_month < 0 else None
             out.append(emit("battery", "warning", "Batteria in lento declino",
                 f"Spunto in calo di {_it_number(abs(slope_month), '.2f')} V/mese (ora {_it_number(last, '.2f')} V, mediana {_it_number(med_v, '.2f')} V)."
-                + (f" A questo ritmo scende sotto 8,8 V tra ~{months_to_88:.0f} mesi." if months_to_88 and months_to_88 < 24 else "")
+                + (f" Proiezione euristica: soglia di 8,8 V tra ~{months_to_88:.0f} mesi dall'osservazione, se la tendenza persiste." if months_to_88 and months_to_88 < 24 else "")
                 + " Un test batteria in officina è economico e toglie il dubbio.", ys, "V"))
         else:
             out.append(emit("battery", "info", f"Spunto batteria stabile · {_it_number(last, '.2f')} V",
@@ -505,6 +604,8 @@ def cross_trip(trips: list[dict]) -> list[dict]:
                 f"deriva {_it_number(slope_month, '+.2f')} V/mese).", ys, "V"))
 
     # ── 6. Common-rail pressure regulation drift ─────────────────────────────
+    rule_id, min_count = "diagnostic.engine.rail", 10
+    deviation = None
     rail_pts = []
     rail_inputs = []
     for t in obd:
@@ -518,19 +619,22 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         baseline = statistics.median(rail_pts)
         recent = statistics.median(rail_pts[-5:])
         drift = (recent / baseline - 1) * 100 if baseline else 0
+        deviation = {"metric": "rail_recent_deviation_from_median_pct", "value": abs(drift), "unit": "%"}
         series = [r * 100 for r in rail_pts]
         if abs(drift) >= 4:
             out.append(emit("engine", "warning", "Pressione rail in deriva",
                 f"Il rapporto misurata/richiesta si è spostato del {_it_number(drift, '+.1f')}% rispetto allo storico. "
-                "Possibili cause: regolatore di pressione, pompa alta pressione o iniettori in usura. "
-                "Da verificare se compaiono anche spunti irregolari o fumo.", series, "%"))
+                "Le medie di viaggio non allineano necessariamente richiesta e risposta istantanea. "
+                "Verifica i segnali insieme prima di attribuire il dato a un componente.", series, "%"))
         else:
-            out.append(emit("engine", "info", "Regolazione rail stabile",
-                f"Pressione carburante misurata allineata alla richiesta "
+            out.append(emit("engine", "info", "Rapporto medio rail senza deriva oltre soglia",
+                f"Rapporto fra medie di pressione misurata e richiesta senza deriva oltre soglia "
                 f"(deriva {_it_number(drift, '+.1f')}% sulle ultime uscite). Non è un test diagnostico di pompa e regolatore.",
                 series, "%"))
 
     # ── 7. Turbo peak boost vs baseline ───────────────────────────────────────
+    rule_id, min_count = "diagnostic.engine.boost", 10
+    deviation = None
     # Compare only trips where power was actually demanded (max rpm ≥ 2600),
     # otherwise a run of relaxed drives would fake a "turbo in decline".
     boost_pts = [b for t in obd
@@ -544,15 +648,16 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         if ratio <= 0.90:
             out.append(emit("engine", "warning", "Picco turbo in calo",
                 f"Boost massimo recente {recent:.0f} mbar contro i {baseline:.0f} tipici "
-                f"({(1-ratio)*100:.0f}% in meno), a parità di richiesta (giri > 2600). "
-                "Possibili cause: geometria variabile sporca, attuatore, tubi/intercooler "
-                "che perdono. Se noti meno spinta, falla vedere.", boost_pts, "mbar"))
+                f"({(1-ratio)*100:.0f}% in meno) nei viaggi con giri > 2600. "
+                "Gli stessi giri non implicano uguale carico o richiesta turbo; il dato non identifica un guasto.", boost_pts, "mbar"))
         else:
-            out.append(emit("engine", "info", f"Turbo in forma · picco tipico {baseline:.0f} mbar",
-                f"Pressione di sovralimentazione massima costante nel tempo "
-                f"(ultime uscite a pieno carico: {recent:.0f} mbar).", boost_pts, "mbar"))
+            out.append(emit("engine", "info", f"Picchi boost osservati stabili · mediana {baseline:.0f} mbar",
+                f"Mediana dei picchi di sovralimentazione senza calo oltre la soglia della regola "
+                f"(mediana recente: {recent:.0f} mbar). Carico non normalizzato; non è un test del turbo.", boost_pts, "mbar"))
 
     # ── 8. Idle stability (dual-mass flywheel / EGR / mounts clue) ────────────
+    rule_id, min_count = "diagnostic.engine.idle", 8
+    deviation = None
     idle_modes = [m for t in obd
                   if (m := _pid_stat(t, "rpm", "mode")) and 600 <= m <= 1000]
     dips = [t for t in obd[-15:]
@@ -560,7 +665,7 @@ def cross_trip(trips: list[dict]) -> list[dict]:
     evidence = _evidence([t for t in obd if (m := _pid_stat(t, "rpm", "mode")) and 600 <= m <= 1000] + dips, ("rpm",))
     if len(idle_modes) >= 8:
         med_idle = statistics.median(idle_modes)
-        spread = statistics.pstdev(idle_modes[-10:]) if len(idle_modes) >= 10 else 0
+        spread = statistics.pstdev(idle_modes[-10:])
         if spread > 25 or len(dips) >= 3:
             reasons = []
             if spread > 25:
@@ -568,9 +673,8 @@ def cross_trip(trips: list[dict]) -> list[dict]:
             if len(dips) >= 3:
                 reasons.append(f"{len(dips)} cali sotto i 600 rpm negli ultimi 15 viaggi")
             out.append(emit("engine", "warning", "Minimo motore irregolare",
-                f"Rilevato: {'; '.join(reasons)}. Su un 1,5 diesel le cause tipiche sono "
-                "volano bimassa in usura (vibrazioni al minimo/spegnimento), valvola EGR sporca, "
-                "supporti motore o iniettori. Vale un controllo se senti vibrazioni.",
+                f"Rilevato: {'; '.join(reasons)}. Le statistiche di viaggio non isolano il minimo "
+                "da manovre e cambi di carico. Verifica i segnali temporali se avverti vibrazioni.",
                 idle_modes, "rpm"))
         else:
             out.append(emit("engine", "info", f"Minimo osservato stabile · ~{med_idle:.0f} rpm",
@@ -579,6 +683,8 @@ def cross_trip(trips: list[dict]) -> list[dict]:
                 ". Questi dati da soli non escludono guasti meccanici.", idle_modes, "rpm"))
 
     # ── 9. Thermostat / warm-up check ─────────────────────────────────────────
+    rule_id, min_count = "diagnostic.engine.warmup", 5
+    deviation = None
     warm_candidates = [t for t in obd[-12:]
                        if (t.get("durationMin") or 0) >= 15 and (t.get("distanceKm") or 0) >= 8
                        and t.get("coolantMaxC") is not None]
@@ -587,10 +693,11 @@ def cross_trip(trips: list[dict]) -> list[dict]:
     if len(cold_runs) >= 2:
         out.append(emit("engine", "warning", "Motore che non va in temperatura",
             f"In {len(cold_runs)} viaggi recenti da 15+ minuti il liquido non ha superato i 75°C. "
-            "Sintomo classico di termostato bloccato aperto: consumi più alti, più diluizione olio, "
-            "riscaldamento debole. Ricambio economico, vale la verifica."))
+            "Temperatura iniziale, ambiente e carico possono differire. Il valore non dimostra un problema al termostato."))
 
     # ── 10. AdBlue — consumption rate and refill forecast ─────────────────────
+    rule_id, min_count = "diagnostic.adblue.range", 5
+    deviation = None
     ad_pts = [((t.get("odometerKm") or 0), t["adblueRangeKm"]) for t in obd
               if t.get("adblueRangeKm") is not None and t.get("odometerKm")]
     ad_pts = [(o, r) for o, r in ad_pts if 0 <= r <= 30000]
@@ -610,95 +717,36 @@ def cross_trip(trips: list[dict]) -> list[dict]:
             if fit and fit[0] < -0.2:
                 rate = -fit[0]            # km of range per km driven
                 km_left = last_range / rate
-                rate_txt = f" Consumo effettivo: {_it_number(rate, '.2f')} km di autonomia per km percorso."
+                rate_txt = f" Calo del contatore osservato: {_it_number(rate, '.2f')} km di autonomia dichiarata per km percorso."
         days_left = (km_left / daily) if daily else None
         lvl = "critical" if km_left < 500 else "warning" if km_left < 1500 else "info"
         out.append(emit("adblue", lvl, f"AdBlue · {last_range:.0f} km dichiarati",
-            (f"Al tuo ritmo reale bastano per ~{_it_number(km_left, ',.0f')} km"
-             + (f" ({_fmt_future(days_left)})" if days_left else "") + "." + rate_txt
+            (f"Stima euristica all'ultima osservazione: ~{_it_number(km_left, ',.0f')} km"
+             + (f" ({_fmt_future(days_left, max((lookup[i].get("start") or "" for i in evidence["tripIds"]), default=""))})" if days_left else "") + "." + rate_txt
              + (" Pianifica il rabbocco per evitare il blocco avviamento." if lvl != "info" else "")),
             [r for _, r in ad_pts], "km"))
 
-    # ── 11. Fuel economy — normalized by route type, traffic-aware ────────────
-    # Raw km/L depends mostly on the *kind* of trip (distance bucket + average
-    # speed). Comparing recent trips only against historical peers of the same
-    # kind separates "more traffic / more urban" (info, not the car's fault)
-    # from "worse at equal conditions" (warning: tyres, air filter, brakes…).
-    def _bucket(km: float):
-        for lo, hi in ((0, 4), (4, 8), (8, 15), (15, 40), (40, 1e9)):
-            if lo <= km < hi:
-                return (lo, hi)
-        return None
-
-    recs = [{"kml": k, "km": t.get("distanceKm") or 0,
-             "spd": t.get("avgSpeedKmh"), "temp": t.get("airTempC"),
-             "start": t.get("start")}
-            for t in chrono if (k := _km_l(t)) and 2 < k < 60]
-    evidence = _fuel_evidence([t for t in chrono if (k := _km_l(t)) and 2 < k < 60])
-    if len(recs) >= 8:
-        vals = [r["kml"] for r in recs]
-        n_recent = 8 if len(recs) >= 25 else 5
-        recent, hist = recs[-n_recent:], recs[:-n_recent]
-        raw_drift = (statistics.median([r["kml"] for r in recent])
-                     / statistics.median([r["kml"] for r in hist]) - 1)
-
-        # normalized drift: each recent trip vs historical peers of the same
-        # distance bucket and comparable average speed (±25 %, min ±6 km/h)
-        deltas = []
-        for r in recent:
-            if not r["spd"]:
-                continue
-            tol = max(6.0, r["spd"] * 0.25)
-            peers = [h["kml"] for h in hist
-                     if h["spd"] and _bucket(h["km"]) == _bucket(r["km"])
-                     and abs(h["spd"] - r["spd"]) <= tol]
-            if len(peers) >= 5:
-                deltas.append(r["kml"] / statistics.median(peers) - 1)
-        norm_drift = statistics.median(deltas) if len(deltas) >= 3 else None
-
-        # context shifts, for the explanation
-        rec_buckets = {_bucket(r["km"]) for r in recent}
-        spd_hist = statistics.median([h["spd"] for h in hist
-                                      if h["spd"] and _bucket(h["km"]) in rec_buckets] or [0])
-        spd_rec = statistics.median([r["spd"] for r in recent if r["spd"]] or [0])
-        t_hist = [h["temp"] for h in hist if h["temp"] is not None]
-        t_rec = [r["temp"] for r in recent if r["temp"] is not None]
-        temp_up = (statistics.median(t_rec) - statistics.median(t_hist)
-                   if t_hist and t_rec else 0)
-
-        med = statistics.median(vals)
-        if norm_drift is not None and norm_drift <= -0.12:
-            out.append(emit("fuel", "warning", "Consumo alto a parità di percorso",
-                f"Sugli ultimi {n_recent} viaggi il motore rende il {abs(norm_drift)*100:.0f}% in meno "
-                "(km/L) rispetto a viaggi storici dello stesso tipo — stessa distanza e velocità "
-                "media. Traffico e carico possono comunque differire. Possibili fattori: pressione gomme (controlla a freddo), "
-                "filtro aria, freno che rimane appoggiato, carburante diverso.", vals, "km/L"))
-        elif raw_drift <= -0.10:
-            body = (f"Ultimi {n_recent} viaggi al {abs(raw_drift)*100:.0f}% sotto la tua media "
-                    f"({_it_number(med, '.1f')} km/L); condizioni di percorso e campionamento possono incidere")
-            if norm_drift is not None:
-                body += f": a parità di condizioni il motore è in linea ({norm_drift*100:+.0f}%)"
-            body += "."
-            if spd_hist and spd_rec and spd_rec <= spd_hist * 0.85:
-                body += (f" Velocità media scesa da {spd_hist:.0f} a {spd_rec:.0f} km/h "
-                         "— più traffico o tragitti più urbani.")
-            if temp_up >= 3:
-                body += f" Fa anche più caldo (+{temp_up:.0f}°C): il clima incide in città."
-            out.append(emit("fuel", "info", "Consumi in aumento: confronto da approfondire", body, vals, "km/L"))
-        else:
-            best = max(recs, key=lambda r: r["kml"])
-            body = (f"Media {_it_number(med, '.1f')} km/L su {len(vals)} viaggi · "
-                    f"miglior viaggio {_it_number(best['kml'], '.1f')} km/L ({_fmt_date(best['start'])}).")
-            if raw_drift >= 0.08:
-                body += f" In miglioramento: ultimi {n_recent} viaggi {raw_drift*100:+.0f}%."
-            out.append(emit("fuel", "info", "Efficienza carburante", body, vals, "km/L"))
-    elif len(recs) >= 3:
-        vals = [r["kml"] for r in recs]
-        out.append(emit("fuel", "info", "Efficienza carburante",
-            f"Media {_it_number(statistics.median(vals), '.1f')} km/L su {len(vals)} viaggi.", vals, "km/L"))
+    # ── 11. Selected-period fuel summary and causal personal comparison ───────
+    rule_id, min_count = "period.fuel.economy", 5
+    deviation = None
+    period_chrono = sorted(period, key=lambda t: t.get("start") or "")
+    fuel_inputs = [t for t in period_chrono if (k := _km_l(t)) and 2 < k < 60]
+    evidence = _fuel_evidence(fuel_inputs)
+    if fuel_inputs:
+        vals = [_km_l(t) for t in fuel_inputs]
+        out.append(emit("fuel", "info", "Efficienza carburante nel periodo",
+                        f"Mediana {_it_number(statistics.median(vals))} km/L su {len(vals)} viaggi. "
+                        "Riepilogo descrittivo: fonti e condizioni possono differire.", vals, "km/L"))
+    latest_fuel = next((t for t in reversed(chrono) if (k := _km_l(t)) and 2 < k < 60), None)
+    if latest_fuel:
+        comparison = _fuel_comparison(latest_fuel, diagnostic, "diagnostic.fuel.peer_comparison")
+        if comparison:
+            out.append(comparison)
 
     # ── 12. Fuel cost ─────────────────────────────────────────────────────────
-    costed = [t for t in chrono if t.get("costEur") and t.get("costDistanceKm")]
+    rule_id, min_count = "period.fuel.cost", 5
+    deviation = None
+    costed = [t for t in period_chrono if t.get("costEur") and t.get("costDistanceKm")]
     evidence = _evidence(costed)
     if len(costed) >= 4:
         total_cost = sum(t["costEur"] for t in costed)
@@ -715,6 +763,8 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         out.append(emit("fuel", "info", "Spesa carburante", body))
 
     # ── 13. Service countdown with date estimate ──────────────────────────────
+    rule_id, min_count = "diagnostic.service.countdown", 5
+    deviation = None
     km_svc = next((t.get("kmToService") for t in reversed(chrono)
                    if t.get("kmToService") is not None), None)
     days_svc = next((t.get("daysToService") for t in reversed(chrono)
@@ -728,7 +778,7 @@ def cross_trip(trips: list[dict]) -> list[dict]:
     if km_svc is not None:
         by_km_days = (km_svc / daily) if daily else None
         eta_days = min([d for d in (by_km_days, days_svc) if d is not None], default=None)
-        eta = _fmt_future(eta_days)
+        eta = _fmt_future(eta_days, max((lookup[i].get("start") or "" for i in evidence["tripIds"]), default=""))
         if km_svc < 1500 or (days_svc is not None and days_svc < 30):
             lvl = "critical" if (km_svc <= 0 or (days_svc or 99) <= 0) else "warning"
             out.append(emit("service", lvl, "Tagliando in avvicinamento",
@@ -739,16 +789,18 @@ def cross_trip(trips: list[dict]) -> list[dict]:
             out.append(emit("service", "info", "Tagliando",
                 f"Prossimo tra {_it_number(km_svc, ',.0f')} km"
                 + (f" / {days_svc} giorni" if days_svc else "")
-                + (f" — al tuo ritmo {eta}" if eta else "") + "."))
+                + (f" — proiezione euristica {eta}" if eta else "") + "."))
 
     # ── 14. Fuel economy in mass (g/km) — density-independent, OBD-only ───────
+    rule_id, min_count = "period.fuel.mass", 5
+    deviation = None
     # km/L and L/100 assume diesel density; with HVO (~780 g/L) they mislead.
     # g/km comes straight from the injector-mass integral (§2) and is immune to
     # the fuel blend — the honest cross-fuel economy number, no MyOpel needed.
-    gkm_pts = [(d, t["gPerKm"]) for t in obd
-               if t.get("gPerKm") and 20 < t["gPerKm"] < 200
+    gkm_pts = [(d, t["gPerKm"]) for t in period_chrono
+               if "obd" in t.get("sources", []) and t.get("gPerKm") and 20 < t["gPerKm"] < 200
                and (d := _parse_dt(t.get("start")))]
-    evidence = _evidence([t for t in obd if t.get("gPerKm") and 20 < t["gPerKm"] < 200 and _parse_dt(t.get("start"))], ("inj_q", "rpm"))
+    evidence = _evidence([t for t in period_chrono if "obd" in t.get("sources", []) and t.get("gPerKm") and 20 < t["gPerKm"] < 200 and _parse_dt(t.get("start"))], ("inj_q", "rpm"))
     if len(gkm_pts) >= 8:
         vals = [g for _, g in gkm_pts]
         med = statistics.median(vals)
@@ -766,10 +818,10 @@ def cross_trip(trips: list[dict]) -> list[dict]:
             out.append(emit("fuel", "info", f"Consumo in massa · {med:.0f} g/km", body, vals, "g/km"))
 
     # ── 15. Tyre-pressure monitor via wheel/GPS speed ratio (§3) ──────────────
-    # ratio_wg = wheel speed / GPS speed. Deflation shrinks the rolling radius →
-    # the wheel turns faster for the same ground speed → the ratio drifts up.
-    # Alert on a > +0.3% rise over ~4 weeks (≈ −0.4/0.5 bar). Only per-trip
-    # ratios with ≥ 60 samples reach here, so a short log can't fake a spike.
+    rule_id, min_count = "diagnostic.tyres.speed_ratio", 8
+    deviation = None
+    # ratio_wg is a wheel/GPS measurement ratio, not a tyre pressure estimate.
+    # Keep the prior drift threshold; infer neither pressure nor mechanical cause.
     ratio_pts = [(d, t["ratioWg"]) for t in obd
                  if t.get("ratioWg") and 0.95 < t["ratioWg"] < 1.05
                  and (d := _parse_dt(t.get("start")))]
@@ -783,16 +835,39 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         if fit:
             drift_4w = fit[0] * 28 / statistics.median(ys) * 100   # % change over 28 days
             if drift_4w >= 0.30:
-                out.append(emit("tyres", "warning", "Possibile calo pressione gomme",
-                    f"Il rapporto ruota/GPS sale di +{_it_number(drift_4w, '.2f')}% su 4 settimane: compatibile "
-                    "con uno sgonfiamento gomme (≈ −0,4/0,5 bar). Controlla la pressione a freddo "
-                    "col manometro — questo monitor rileva le variazioni, non una pressione bassa costante.",
+                out.append(emit("tyres", "warning", "Rapporto velocità ruota/GPS in aumento",
+                    f"Il rapporto ruota/GPS sale di +{_it_number(drift_4w, '.2f')}% su 4 settimane. "
+                    "Campionamento GPS, percorso e circonferenza di rotolamento possono incidere. "
+                    "Non è una misura della pressione: nessuna conversione in bar è ricavabile da questi dati.",
                     series, "‰"))
             else:
-                out.append(emit("tyres", "info", "Gomme · pressione stabile",
-                    f"Rapporto ruota/GPS senza deriva significativa ({_it_number(drift_4w, '+.2f')}%/4 settimane "
-                    f"su {len(ys)} viaggi). Nessun segnale di sgonfiamento; il manometro resta "
-                    "l'unico test assoluto.", series, "‰"))
+                out.append(emit("tyres", "info", "Rapporto velocità ruota/GPS stabile",
+                    f"Rapporto ruota/GPS senza deriva oltre la soglia della regola ({_it_number(drift_4w, '+.2f')}%/4 settimane "
+                    f"su {len(ys)} viaggi). Non permette di stabilire la pressione delle gomme; "
+                    "per quella serve una misura diretta.", series, "‰"))
+
+    # Sparse measured series remain visible as insufficient instead of implying normality.
+    sparse_rules = [
+        ("diagnostic.oil.dilution", "engine", "Diluizione olio", "oilDilutionPct", 8, ("oil_dil",), "oil_change"),
+        ("diagnostic.battery.cranking", "battery", "Spunto batteria", "batteryStartupV", 6, ("bat_v",), "battery"),
+        ("diagnostic.tyres.speed_ratio", "tyres", "Rapporto velocità ruota/GPS", "ratioWg", 8, ("speed", "speed_v"), "tyres"),
+    ]
+    for identity, category, label, field, needed, slugs, event_kind in sparse_rules:
+        if any(card["ruleId"] == identity for card in out):
+            continue
+        bounds = {"oilDilutionPct": (0, 15), "batteryStartupV": (6, 14), "ratioWg": (.95, 1.05)}[field]
+        measured = [t for t in obd if analysis.number(t.get(field)) and bounds[0] <= t[field] <= bounds[1]]
+        if not measured and not (event_kind in boundaries and any(t.get(field) is not None for t in diagnostic)):
+            continue
+        proof = _evidence(measured, slugs)
+        limits = ["Servono un numero sufficiente di letture e una finestra temporale o chilometrica utile alla regola."]
+        if event_kind in boundaries:
+            proof["eventIds"] = [boundaries[event_kind]["id"]]
+            limits.append("Serie separata dall'evento registrato; nessun miglioramento o risoluzione dedotto dall'intervento.")
+        card = _ins(category, "info", label + " · osservazioni insufficienti",
+                    f"{len(measured)} letture pertinenti; la regola richiede almeno {needed} viaggi e una serie confrontabile.", evidence=proof)
+        out.append(analysis.structure(card, identity, measured, finding="insufficient", min_count=needed,
+                                      limitations=limits, action="Raccogli ulteriori registrazioni prima di interpretare una tendenza."))
 
     out.sort(key=lambda i: _LEVEL_RANK.get(i.get("level"), 3))
     return out

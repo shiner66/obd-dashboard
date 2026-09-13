@@ -77,3 +77,14 @@ file va fatto a container fermo, conservando il vecchio DB e i relativi file WAL
 Il rollback comprende immagine precedente e, quando necessario, il relativo DB
 consistente. Non assumere che una versione precedente legga correttamente uno
 schema o dati migrati. Non rimuovere volumi né backup durante il rilascio.
+
+## Memoria insight dalla v0.10
+
+Il DB completo comprende anche interventi manuali, ultimo stato per regola e
+cronologia delle osservazioni. Non ricostruire queste tre tabelle cancellandole
+ad ogni avvio. L'inizializzazione è additiva; il refresh non incrementa il numero
+di osservazioni. La prima valutazione della v0.10 non simula retroattivamente
+una sequenza di avvisi mai registrati. Per il rollback conservare insieme
+immagine precedente, DB precedente e sorgenti; non copiare dati di test dal
+preview nella produzione. Verificare conteggi raw, hash delle metriche originali,
+assenza di interventi/rifornimenti di prova e idempotenza dopo il riavvio.

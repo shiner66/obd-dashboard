@@ -484,39 +484,71 @@ const INSIGHT_CAT_LABEL = {
 const INSIGHT_COLOR = {
   critical: "var(--crit)", warning: "var(--warn)", info: "var(--accent)",
 };
+/** Present evidence strength independently from severity and keep caveats inspectable. */
 const InsightCard = ({ insight, onEvidence }) => {
   const evidence = OBDExploration.insightEvidence(insight);
+  const model = OBD.insightPresentation(insight);
+  const confidence = insight.confidence || {}, baseline = insight.baseline, lifecycle = insight.lifecycle || {};
   const openEvidence = tripId => {
-    const detail = {tripId, pidSlug: evidence.pidSlugs[0] || null};
+    const detail = { tripId, pidSlug: evidence.pidSlugs[0] || null };
     if (onEvidence) onEvidence(detail);
-    else window.dispatchEvent(new CustomEvent("open-evidence", {detail}));
+    else window.dispatchEvent(new CustomEvent("open-evidence", { detail }));
   };
-  const icon = INSIGHT_ICON[insight.category]
-            || (insight.level === "critical" || insight.level === "warning" ? "warn" : "info");
+  const list = values => Array.isArray(values) ? values.filter(value => typeof value === "string" && value.trim()) : [];
+  const reasons = list(confidence.reasons), hypotheses = list(insight.hypotheses), limitations = list(insight.limitations), counter = list(insight.counterEvidence);
+  const conditions = list(baseline?.conditions), missingConditions = list(baseline?.missingConditions);
+  const baselineIds = Array.isArray(baseline?.tripIds) ? [...new Set(baseline.tripIds)] : [];
+  const icon = INSIGHT_ICON[insight.category] || (model.finding === "anomaly" ? "warn" : "info");
   return (
-    <div className={`insight ${insight.level}`}>
+    <article className={`insight ${model.severity} finding-${model.finding}${model.historical ? " insight-historical" : ""}`}>
       <div className="insight-ico"><Icon name={icon} size={17} /></div>
       <div className="insight-body">
         <div className="insight-cat">{INSIGHT_CAT_LABEL[insight.category] || insight.category}</div>
-        <div className="insight-title">{insight.title}</div>
-        <div className="insight-text">{insight.body}</div>
-        {evidence.tripIds.length > 0 && <div className="insight-evidence">
-          <span>{evidence.tripIds.length} {evidence.tripIds.length === 1 ? "viaggio di riferimento" : "viaggi di riferimento"}{evidence.sampleCount != null ? ` · ${evidence.sampleCount} campioni` : ""}</span>
-          {evidence.tripIds.slice(0, 3).map((tripId, index) => <button type="button" className="icon-btn" key={tripId}
-            onClick={() => openEvidence(tripId)} aria-label={`Vedi prove, viaggio ${tripId}`}>Vedi prove{evidence.tripIds.length > 1 ? ` ${index + 1}` : ""}</button>)}
-          {evidence.tripIds.length > 3 && <details><summary>Altri {evidence.tripIds.length - 3} viaggi</summary>
-            {evidence.tripIds.slice(3).map(tripId => <button type="button" className="evidence-link" key={tripId} onClick={() => openEvidence(tripId)}>{tripId}</button>)}
-          </details>}
-        </div>}
-        {insight.series && insight.series.length >= 3 && (
-          <div className="insight-spark">
-            <Sparkline data={insight.series} height={34}
-                       color={INSIGHT_COLOR[insight.level] || "var(--accent)"} animate={false} />
-            {insight.unit && <span className="insight-unit mono">{insight.unit}</span>}
+        <h3 className="insight-title">{insight.title}</h3>
+        <div className="insight-badges">
+          <span className="finding-badge">{model.findingLabel}{model.finding === "anomaly" && model.severity !== "info" ? ` · ${model.severity === "critical" ? "priorità alta" : "attenzione"}` : ""}</span>
+          {model.lifecycleLabel && <span className="lifecycle-badge">{model.lifecycleLabel}</span>}
+          {model.unconfirmed && <span className="lifecycle-badge">Esito non confermato</span>}
+        </div>
+        <div className="insight-proof-meta"><span>Solidità delle prove: <strong>{model.gradeLabel.toLowerCase()}</strong></span>
+          <time dateTime={insight.observedAt || undefined}>{insight.observedAt ? `Prove del ${OBD.recordedDate(insight.observedAt)}` : "Data delle prove non disponibile"}</time></div>
+        {model.historical && <div className="insight-history-note">Osservazione storica: non descrive lo stato attuale del veicolo.</div>}
+        <p className="insight-text">{model.observation}</p>
+        {model.action && <p className="insight-action"><strong>Cosa verificare</strong>{model.action}</p>}
+        <details className="insight-details">
+          <summary>Cosa cambia, attendibilità e prove</summary>
+          <div className="insight-detail-section"><h4>Attendibilità</h4>
+            <p>La solidità descrive quantità, qualità e coerenza dei dati; non è una probabilità di guasto.</p>
+            <p>{confidence.tripCount != null ? `${OBD.measurement(confidence.tripCount, 0)} viaggi` : "Numero di viaggi non disponibile"}{confidence.dayCount != null ? ` · ${OBD.measurement(confidence.dayCount, 0)} giorni distinti` : ""}{evidence.sampleCount != null ? ` · ${OBD.measurement(evidence.sampleCount, 0)} campioni disponibili` : ""}</p>
+            {reasons.length > 0 && <ul>{reasons.map((text, i) => <li key={i}>{text}</li>)}</ul>}
           </div>
-        )}
+          {baseline && <div className="insight-detail-section"><h4>Cosa cambia rispetto ai tuoi viaggi</h4>
+            <p>Mediana di riferimento: <strong>{OBD.measurement(baseline.median, 2)} {baseline.unit || insight.unit || ""}</strong>
+              {Number.isFinite(baseline.deltaPct) && <> · differenza <strong>{baseline.deltaPct > 0 ? "+" : ""}{OBD.measurement(baseline.deltaPct, 1)} %</strong></>}</p>
+            {conditions.length > 0 && <p>Condizioni confrontate: {conditions.join(" · ")}</p>}
+            {missingConditions.length > 0 && <p>Condizioni non verificate: {missingConditions.join(" · ")}</p>}
+            {baselineIds.length > 0 && <details><summary>{baselineIds.length} viaggi del confronto</summary><div className="evidence-links">
+              {baselineIds.map(tripId => <button type="button" className="evidence-link" key={tripId} onClick={() => openEvidence(tripId)}>{tripId}</button>)}
+            </div></details>}
+          </div>}
+          {[["Ipotesi da verificare", hypotheses], ["Limiti", limitations], ["Prove contrarie", counter]].map(([title, values]) => values.length > 0 &&
+            <div className="insight-detail-section" key={title}><h4>{title}</h4><ul>{values.map((text, i) => <li key={i}>{text}</li>)}</ul></div>)}
+          {model.lifecycleLabel && <div className="insight-detail-section"><h4>Storia di questa osservazione</h4>
+            <p>Prima: {OBD.recordedDate(lifecycle.firstSeen)} · ultima: {OBD.recordedDate(lifecycle.lastSeen)}
+              {lifecycle.observations != null ? ` · ${OBD.measurement(lifecycle.observations, 0)} osservazioni` : ""}</p>
+          </div>}
+          {evidence.tripIds.length > 0 ? <div className="insight-evidence"><span>Viaggi con le prove registrate</span>
+            <div className="evidence-links">{evidence.tripIds.slice(0, 3).map((tripId, index) => <button type="button" className="icon-btn" key={tripId}
+              onClick={() => openEvidence(tripId)} aria-label={`Vedi prove, viaggio ${tripId}`}>Vedi prove{evidence.tripIds.length > 1 ? ` ${index + 1}` : ""}</button>)}</div>
+            {evidence.tripIds.length > 3 && <details><summary>Altri {evidence.tripIds.length - 3} viaggi</summary><div className="evidence-links">
+              {evidence.tripIds.slice(3).map(tripId => <button type="button" className="evidence-link" key={tripId} onClick={() => openEvidence(tripId)}>{tripId}</button>)}
+            </div></details>}
+          </div> : <p className="muted">Nessun viaggio di prova collegato a questa informazione.</p>}
+          {insight.series && insight.series.length >= 3 && <div className="insight-spark"><Sparkline data={insight.series} height={34}
+            color={INSIGHT_COLOR[model.severity] || "var(--accent)"} animate={false} />{insight.unit && <span className="insight-unit mono">{insight.unit}</span>}</div>}
+        </details>
       </div>
-    </div>
+    </article>
   );
 };
 

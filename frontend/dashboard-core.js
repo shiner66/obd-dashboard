@@ -142,10 +142,10 @@
   function apiError(detail, fallback = "Operazione non riuscita") {
     if (typeof detail === "string") return detail;
     if (Array.isArray(detail)) return detail.map(error => {
-      const field = { ts: "Data e ora", odometerKm: "Odometro", liters: "Litri", pricePerL: "Prezzo", fuelType: "Carburante", fullTank: "Pieno" }[error.loc?.slice(-1)[0]] || "Valore";
+      const field = { ts: "Data e ora", odometerKm: "Odometro", liters: "Litri", pricePerL: "Prezzo", fuelType: "Carburante", fullTank: "Pieno", type: "Intervento", note: "Nota", archived: "Archiviazione" }[error.loc?.slice(-1)[0]] || "Valore";
       const messages = { datetime_from_date_parsing: "data e ora non valide", datetime_parsing: "data e ora non valide",
         float_parsing: "inserisci un numero", int_parsing: "inserisci un numero intero", finite_number: "inserisci un numero finito",
-        missing: "campo obbligatorio", greater_than: `il valore deve superare ${error.ctx?.gt ?? "il minimo"}`,
+        missing: "campo obbligatorio", string_too_long: `usa al massimo ${error.ctx?.max_length ?? "il limite di"} caratteri`, greater_than: `il valore deve superare ${error.ctx?.gt ?? "il minimo"}`,
         greater_than_equal: `il valore minimo è ${error.ctx?.ge ?? "quello indicato"}`, less_than_equal: `il valore massimo è ${error.ctx?.le ?? "quello indicato"}` };
       return `${field}: ${messages[error.type] || error.msg?.replace(/^Value error, /, "") || "controlla il valore inserito"}`;
     }).join(" · ") || fallback;
@@ -193,8 +193,65 @@
     }
     return { data, unit: monthly ? "mese" : "giorno" };
   }
+  /** Separate an observed finding, its severity and qualitative evidence strength. */
+  function insightPresentation(insight) {
+    const findings = { anomaly: "Scostamento osservato", normal: "Nei riferimenti disponibili", insufficient: "Dati insufficienti", information: "Informazione" };
+    const finding = Object.hasOwn(findings, insight.finding) ? insight.finding
+      : ["critical", "warning"].includes(insight.level) ? "anomaly" : "information";
+    const grades = { low: "Limitata", moderate: "Moderata", high: "Elevata" };
+    const states = { new: "Prima osservazione", persistent: "Ricorrente", improving: "In miglioramento", resolved: "Non più rilevato", observing: "In osservazione", historical: "Storico" };
+    const confidence = insight.confidence || {}, lifecycle = insight.lifecycle || {};
+    return { finding, findingLabel: findings[finding], severity: finding === "anomaly" && ["critical", "warning"].includes(insight.level) ? insight.level : "info",
+      grade: Object.hasOwn(grades, confidence.grade) ? confidence.grade : "unknown", gradeLabel: grades[confidence.grade] || "Non valutata",
+      observation: typeof insight.observation === "string" && insight.observation.trim() ? insight.observation : insight.body || "Osservazione non disponibile.",
+      action: typeof insight.action === "string" && insight.action.trim() ? insight.action : null,
+      lifecycleLabel: states[lifecycle.state] || null, historical: lifecycle.state === "historical",
+      unconfirmed: lifecycle.unconfirmed === true };
+  }
+  /** Display recorded local timestamps without inventing a current observation date. */
+  function recordedDate(value) {
+    if (!value || typeof value !== "string") return "Data non disponibile";
+    const date = new Date(value.replace(" ", "T"));
+    return Number.isNaN(date.valueOf()) ? "Data non disponibile" : date.toLocaleString("it-IT", { dateStyle: "short", timeStyle: "short" });
+  }
+  const maintenanceTypes = { oil_change: "Cambio olio", service: "Tagliando", battery: "Batteria", tyres: "Pneumatici", other: "Altro intervento" };
+  /** Initialize only user-entered maintenance fields, preserving archive state on edits. */
+  function maintenanceDraft(event, now = new Date()) {
+    return { ts: event?.ts ? event.ts.replace(" ", "T").slice(0, 19) : localDateTime(now),
+      type: event?.type || event?.eventType || "other", odometerKm: event?.odometerKm ?? "", note: event?.note || "", archived: event?.archived === true };
+  }
+  /** Validate maintenance without converting local timestamps or inventing odometer values. */
+  function maintenancePayload(form) {
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(form.ts || "") || !calendarDate(form.ts.slice(0, 10))
+      || Number(form.ts.slice(11, 13)) > 23 || Number(form.ts.slice(14, 16)) > 59 || Number(form.ts.slice(17, 19)) > 59) throw new Error("Inserisci una data e un'ora valide.");
+    if (!Object.hasOwn(maintenanceTypes, form.type)) throw new Error("Seleziona un tipo di intervento valido.");
+    const odometerKm = String(form.odometerKm ?? "").trim() === "" ? null : Number(form.odometerKm);
+    if (odometerKm !== null && (!Number.isFinite(odometerKm) || odometerKm < 0 || odometerKm > 2000000)) throw new Error("Odometro: inserisci un valore tra 0 e 2000000 km.");
+    const note = String(form.note || "").trim();
+    if (note.length > 2000) throw new Error("La nota può contenere al massimo 2000 caratteri.");
+    return { ts: form.ts.length === 16 ? form.ts + ":00" : form.ts, type: form.type, odometerKm, note, archived: form.archived === true };
+  }
+  /** Reject missing event data so a failed load never looks like an empty history. */
+  function validateEvents(payload) {
+    if (!payload || !Array.isArray(payload.events) || !Array.isArray(payload.maintenance)) throw new Error("Risposta del registro eventi incompleta.");
+    return payload;
+  }
+  /** Filter API-provided observations; archive records always come from the manual ledger. */
+  function eventRecords(payload, filter = "all") {
+    if (!payload) return [];
+    const records = filter === "archived" ? payload.maintenance.filter(event => event.archived).map(event => ({ ...event,
+      kind: "maintenance", eventType: event.type, source: "utente", title: maintenanceTypes[event.type] || "Intervento registrato",
+      body: event.note || "", editable: true })) : payload.events.filter(event => !event.archived && (filter === "manual" ? event.kind === "maintenance" : filter === "automatic" ? event.kind !== "maintenance" : true));
+    return [...records].sort((a, b) => (b.ts || "").localeCompare(a.ts || "") || String(a.id).localeCompare(String(b.id)));
+  }
+  /** Resolve editable rows using the explicit ledger id rather than parsing timeline ids. */
+  function maintenanceForEvent(payload, event) {
+    if (event.kind !== "maintenance") return null;
+    return (payload?.maintenance || []).find(record => String(record.id) === String(event.maintenanceId ?? event.id)) || null;
+  }
   const api = { chartValues, localDateTime, weightedEconomy, tripEconomyDistance, usableForAnalysis, periodMetrics, selectedTrip, tripTab, measurement, validateSnapshot, chartPositions, restoreTweaks, ingestionStatus,
-    calendarDate, periodRange, restorePeriod, requestGate, pageItems, apiError, refuelDraft, refuelPayload, activitySeries };
+    calendarDate, periodRange, restorePeriod, requestGate, pageItems, apiError, refuelDraft, refuelPayload, activitySeries,
+    insightPresentation, recordedDate, maintenanceTypes, maintenanceDraft, maintenancePayload, validateEvents, eventRecords, maintenanceForEvent };
   root.OBD = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

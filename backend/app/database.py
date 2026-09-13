@@ -29,6 +29,7 @@ def init(db_path: str | Path) -> None:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _conn() as con:
         con.executescript(_SCHEMA)
+        con.executescript(_INSIGHT_SCHEMA)
         # Idempotent column migrations
         existing = {row[1] for row in con.execute("PRAGMA table_info(trips)").fetchall()}
         if "merged_ids" not in existing:
@@ -44,6 +45,97 @@ def init(db_path: str | Path) -> None:
             if col not in existing:
                 con.execute(f"ALTER TABLE trips ADD COLUMN {col} {decl}")
     _run_data_migrations()
+
+
+_INSIGHT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS maintenance_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    type TEXT NOT NULL,
+    odometer_km REAL,
+    note TEXT NOT NULL DEFAULT '',
+    archived INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS maintenance_event_time ON maintenance_events(ts);
+CREATE TABLE IF NOT EXISTS insight_states (
+    rule_id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS insight_history (
+    id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS insight_history_time ON insight_history(observed_at);
+"""
+
+
+def _maintenance_row(row) -> dict:
+    """Expose one persisted intervention through the camelCase API contract."""
+    return {"id": row["id"], "ts": row["ts"], "type": row["type"],
+            "odometerKm": row["odometer_km"], "note": row["note"], "archived": bool(row["archived"])}
+
+
+def get_maintenance(include_archived: bool = False) -> list[dict]:
+    """Read manual history; archived rows never influence diagnostic baselines."""
+    with _conn() as con:
+        rows = con.execute("SELECT * FROM maintenance_events " +
+                           ("" if include_archived else "WHERE archived=0 ") + "ORDER BY ts DESC,id DESC").fetchall()
+    return [_maintenance_row(row) for row in rows]
+
+
+def save_maintenance(entry: dict, event_id: int | None = None) -> dict | None:
+    """Insert or fully replace a validated intervention in one transaction."""
+    values = (entry["ts"], entry["type"], entry.get("odometerKm"), entry.get("note", ""), int(entry.get("archived", False)))
+    with _conn() as con:
+        if event_id is None:
+            cursor = con.execute("INSERT INTO maintenance_events(ts,type,odometer_km,note,archived) VALUES(?,?,?,?,?)", values)
+            event_id = cursor.lastrowid
+        else:
+            cursor = con.execute("UPDATE maintenance_events SET ts=?,type=?,odometer_km=?,note=?,archived=? WHERE id=?", (*values, event_id))
+            if not cursor.rowcount:
+                return None
+        row = con.execute("SELECT * FROM maintenance_events WHERE id=?", (event_id,)).fetchone()
+    return _maintenance_row(row)
+
+
+def archive_maintenance(event_id: int) -> bool:
+    """Archive an existing intervention without destroying its editable history."""
+    with _conn() as con:
+        row = con.execute("SELECT archived FROM maintenance_events WHERE id=?", (event_id,)).fetchone()
+        if row is None:
+            return False
+        if not row["archived"]:
+            con.execute("UPDATE maintenance_events SET archived=1 WHERE id=?", (event_id,))
+    return True
+
+
+def get_insight_states() -> list[dict]:
+    """Load the last measured state of each diagnostic rule across restarts."""
+    with _conn() as con:
+        return [json.loads(row[0]) for row in con.execute("SELECT payload FROM insight_states ORDER BY rule_id")]
+
+
+def save_insight_reconciliation(result: dict) -> None:
+    """Commit changed rule states and deduplicated historical observations atomically."""
+    with _conn() as con:
+        for state in result.get("changes", []):
+            payload = json.dumps(state, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            con.execute("INSERT INTO insight_states(rule_id,payload) VALUES(?,?) ON CONFLICT(rule_id) DO UPDATE SET payload=excluded.payload WHERE payload<>excluded.payload", (state["ruleId"], payload))
+        for event in result.get("history", []):
+            payload = json.dumps(event, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            fingerprint = hashlib.sha256(payload.encode()).hexdigest()
+            observed = event.get("lastObservationAt") or event.get("observedAt") or event.get("lastSeen")
+            if observed:
+                con.execute("INSERT OR IGNORE INTO insight_history(id,rule_id,observed_at,payload) VALUES(?,?,?,?)", (fingerprint, event["ruleId"], observed, payload))
+
+
+def get_insight_history() -> list[dict]:
+    """Read real diagnostic observations in chronological order, with stable identifiers."""
+    with _conn() as con:
+        return [{**json.loads(row["payload"]), "historyId": row["id"], "observedAt": row["observed_at"]}
+                for row in con.execute("SELECT * FROM insight_history ORDER BY observed_at,id")]
 
 
 # Columns added after the original schema — OBD-native fuel/service fields and
