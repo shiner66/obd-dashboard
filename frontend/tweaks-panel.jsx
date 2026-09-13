@@ -160,7 +160,13 @@ const __TWEAKS_STYLE = `
 // Single source of truth for tweak values. setTweak persists via the host
 // (__edit_mode_set_keys → host rewrites the EDITMODE block on disk).
 function useTweaks(defaults) {
-  const [values, setValues] = React.useState(defaults);
+  const [values, setValues] = React.useState(() => {
+    try { return OBD.restoreTweaks(defaults, JSON.parse(localStorage.getItem("obd-appearance") || "null")); }
+    catch (_) { return defaults; }
+  });
+  React.useEffect(() => {
+    try { localStorage.setItem("obd-appearance", JSON.stringify(values)); } catch (_) { /* Storage may be disabled. */ }
+  }, [values]);
   // Accepts either setTweak('key', value) or setTweak({ key: value, ... }) so a
   // useState-style call doesn't write a "[object Object]" key into the persisted
   // JSON block.
@@ -217,6 +223,7 @@ function TweaksPanel({ title = 'Tweaks', children }) {
 
   React.useEffect(() => {
     const onMsg = (e) => {
+      if (e.source !== window && e.source !== window.parent) return;
       const t = e?.data?.type;
       if (t === '__activate_edit_mode') setOpen(true);
       else if (t === '__deactivate_edit_mode') setOpen(false);
@@ -257,11 +264,11 @@ function TweaksPanel({ title = 'Tweaks', children }) {
   return (
     <>
       <style>{__TWEAKS_STYLE}</style>
-      <div ref={dragRef} className="twk-panel" data-omelette-chrome=""
+      <div ref={dragRef} className="twk-panel" role="dialog" aria-label="Aspetto e preferenze" data-omelette-chrome=""
            style={{ right: offsetRef.current.x, bottom: offsetRef.current.y }}>
         <div className="twk-hd" onMouseDown={onDragStart}>
           <b>{title}</b>
-          <button className="twk-x" aria-label="Close tweaks"
+          <button className="twk-x" aria-label="Chiudi preferenze"
                   onMouseDown={(e) => e.stopPropagation()}
                   onClick={dismiss}>✕</button>
         </div>

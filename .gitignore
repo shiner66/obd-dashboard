@@ -8,3 +8,5 @@ venv/
 *.db-shm
 *.db-wal
 .DS_Store
+.pytest_cache/
+node_modules/

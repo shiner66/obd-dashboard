@@ -2,7 +2,7 @@
 
 Dashboard self-hosted per i dati OBD di una **Opel Corsa F 1.5d BlueHDi (ECU
 MD1CS003)**. Aggrega log **CarScanner** (`.csv`/`.brc`) e **MyOpel** (`.myop`),
-li correla, applica correzioni RBS + una DPF state machine, e genera insight in
+li correla (BRC binario non ancora supportato), applica correzioni RBS + una DPF state machine, e genera insight in
 italiano. Container unico: nginx + uvicorn (FastAPI) + SQLite.
 
 ## Convenzioni di lavoro (richieste dall'utente — rispettarle SEMPRE)
@@ -31,14 +31,23 @@ italiano. Container unico: nginx + uvicorn (FastAPI) + SQLite.
   `myop_parser.py` (.myop → trip).
 - `backend/app/services/` — `correlator.py`, `dpf.py`, `rbs.py`, `insights.py`,
   `fuel.py` (livello per sottrazione + tank-to-tank).
-- `frontend/` — React via Babel in-browser (niente build step). I dati arrivano
-  come **globali JS** da `/api/v1/data.js`: `VEHICLE`, `TRIPS`, `SETTINGS`,
-  `FUEL`, `PID_CATALOG`, `TREND_INSIGHTS`. Dopo una mutazione (settings/refuel)
-  il frontend rilegge via `fetch` o `location.reload()`.
+- `frontend/` — React via Babel in-browser (niente build step). Lo snapshot JSON
+  `/api/v1/dashboard` alimenta i dati e i metadati di qualità; viene aggiornato
+  ogni 60 secondi, al ritorno nella finestra e dopo le mutazioni. I dettagli
+  pesanti dei viaggi sono caricati separatamente. `/api/v1/data.js` resta
+  disponibile per compatibilità.
 
 ## Verifica prima di committare
 
-Non c'è una suite di test formale; usa questo flusso (venv con `backend/requirements.txt`):
+La suite di regressione è in `tests/`; installare `backend/requirements-dev.txt`
+in una venv Python 3.12. Prima di committare:
+
+- `PYTHONPATH=backend python -m pytest -q`.
+- `node --test tests/frontend.test.cjs`.
+- `npm install --no-save --package-lock=false @babel/standalone@7.29.0`,
+  quindi `node scripts/check-frontend.cjs`.
+
+Completare inoltre queste verifiche mirate quando la modifica lo richiede:
 
 - **Backend**: `python -m py_compile` su tutti i file; test end-to-end con
   `fastapi.testclient.TestClient` (serve `httpx`) puntando `OBD_FILES_DIR` /

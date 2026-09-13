@@ -9,9 +9,9 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/shiner66/obd-dashboard/issues</Support>
   <Project>https://github.com/shiner66/obd-dashboard</Project>
-  <Overview>Self-hosted dashboard for the Peugeot 308 SW 1.5 BlueHDi (ECU MD1CS003). Parses CarScanner CSV/BRC exports and MyOpel .myop files, applies RBS byte-swap corrections, runs the DPF state machine, generates AI insights in Italian, and shows everything in a React/Leaflet UI. Single container: nginx + uvicorn supervised together. Drop files in the mapped "OBD files" and "MyOpel files" directories — they're auto-processed within seconds.</Overview>
+  <Overview>Self-hosted dashboard for the Opel Corsa F 1.5d BlueHDi (ECU MD1CS003). Parses CarScanner CSV/BRC exports and MyOpel .myop files, applies RBS byte-swap corrections, runs the DPF state machine, generates AI insights in Italian, and shows everything in a React/Leaflet UI. Single container: nginx + uvicorn supervised together. Drop files in the mapped "OBD files" and "MyOpel files" directories — they're auto-processed within seconds.</Overview>
   <Category>Tools: Status:Stable</Category>
-  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <WebUI>http://[IP]:[PORT:80]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/shiner66/obd-dashboard/main/unraid-templates/obd-dashboard.xml</TemplateURL>
   <Icon>https://raw.githubusercontent.com/shiner66/obd-dashboard/main/unraid-templates/icon.png</Icon>
   <ExtraParams/>

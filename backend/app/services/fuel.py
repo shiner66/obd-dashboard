@@ -16,6 +16,7 @@ only — never per-trip level deltas, briefing §1) and flags stale MyOpel
 from __future__ import annotations
 
 import statistics
+import math
 
 # Briefing §5 constants (overridable via settings).
 DEFAULT_TANK_L   = 43.5
@@ -34,18 +35,61 @@ def density_for(fuel_type: str | None) -> float:
     return DENSITY_GL.get(fuel_type.strip().upper(), DEFAULT_DENSITY)
 
 
-def trip_burn_l(trip: dict, density: float = DEFAULT_DENSITY) -> float:
-    """Best available litres burned on a trip.
+def _positive(value) -> bool:
+    """Accept finite positive measured quantities only."""
+    return isinstance(value, (int, float)) and math.isfinite(value) and value > 0
 
-    Prefers the volumetric figure (rate integral or MyOpel µL); falls back to the
-    density-independent mass integral (§2) converted at the given density."""
-    v = trip.get("fuelConsumedL")
-    if v and v > 0:
-        return v
-    g = trip.get("fuelMassG")
-    if g and g > 0 and density > 0:
-        return g / density
-    return 0.0
+
+def select_consumption(trip: dict, density: float = DEFAULT_DENSITY) -> dict:
+    """Select one comparable measurement with explicit source and coverage.
+
+    Unknown legacy OBD coverage is not upgraded to a reliable total. MyOpel
+    consumption stays separate unless its recorded km cover 90–110% of a session.
+    """
+    km = trip.get("distanceKm")
+    liters = None
+    source = None
+    coverage = None
+    denominator = km
+    rate = trip.get("obdFuelConsumedL")
+    if rate is None and trip.get("fuelSource") == "obd_rate":
+        rate = trip.get("fuelConsumedL")
+    rate_cov = trip.get("fuelRateCoveragePct")
+    mass_cov = trip.get("fuelMassCoveragePct")
+    mass = trip.get("fuelMassG")
+    if _positive(rate) and rate_cov is not None and rate_cov >= 90:
+        liters, source, coverage = rate, "obd_rate", rate_cov
+    elif _positive(mass) and mass_cov is not None and mass_cov >= 90 and _positive(density):
+        liters, source, coverage = mass / density, "obd_mass", mass_cov
+    else:
+        myop_l = trip.get("myopFuelConsumedL")
+        myop_km = trip.get("myopDistanceKm")
+        if "obd" not in trip.get("sources", []) and "myopel" in trip.get("sources", []):
+            myop_km = km
+            if myop_l is None:
+                myop_l = trip.get("fuelConsumedL")
+        ratio = myop_km / km if _positive(km) and _positive(myop_km) else None
+        if _positive(myop_l) and ratio is not None and 0.9 <= ratio <= 1.1:
+            liters, source, coverage = myop_l, "myopel", min(100.0, ratio * 100)
+            denominator = myop_km
+    l100 = liters / denominator * 100 if _positive(liters) and _positive(denominator) else None
+    return {
+        "fuelConsumedL": round(liters, 4) if liters is not None else None,
+        "fuelSource": source,
+        "fuelDistanceKm": denominator if source else None,
+        "fuelCoveragePct": round(coverage, 1) if coverage is not None else None,
+        "fuelDensityGL": density if source == "obd_mass" else None,
+        "consumptionL100km": round(l100, 2) if l100 else None,
+        "consumptionKmL": round(100 / l100, 2) if l100 else None,
+    }
+
+
+def trip_burn_l(trip: dict, density: float = DEFAULT_DENSITY) -> float:
+    """Litres from a validated source; never use a partial MyOpel leg as a total."""
+    # API trips expose the selected source; raw observations are selected here.
+    if trip.get("fuelSource") in ("obd_rate", "myopel") and _positive(trip.get("fuelConsumedL")):
+        return trip["fuelConsumedL"]
+    return select_consumption(trip, density)["fuelConsumedL"] or 0.0
 
 
 def estimate_level(refuels: list[dict], trips: list[dict],
@@ -74,11 +118,13 @@ def estimate_level(refuels: list[dict], trips: list[dict],
     events.sort(key=lambda e: (e[0], e[1]))
 
     level: float | None = None
+    incomplete = False
     for _odo, _pri, kind, payload in events:
         if kind == "refuel":
             r = payload
             if r.get("fullTank", True):
                 level = cap                          # a full fill tops off, anchors the model
+                incomplete = False
             elif level is not None:
                 level = min(cap, level + (r.get("liters") or 0.0))
         elif level is not None:                      # trip
@@ -105,7 +151,16 @@ def estimate_level(refuels: list[dict], trips: list[dict],
                     sorted(trips, key=lambda t: t.get("start") or "", reverse=True)
                     if t.get("fuelLevelObd") is not None), None)
 
-    if level is not None:
+    anchor = max((r.get("odometerKm") for r in refuels
+                  if r.get("fullTank") and r.get("odometerKm") is not None), default=None)
+    anchor_fill = next((r for r in refuels if r.get("fullTank") and r.get("odometerKm") == anchor), {})
+    anchor_date = anchor_fill.get("ts")
+    missing = [t for t in trips if anchor is not None and
+               ((t.get("odometerKm") is not None and t["odometerKm"] > anchor) or
+                (t.get("odometerKm") is None and (not anchor_date or not t.get("start") or t["start"] >= anchor_date)))
+               and (t.get("odometerKm") is None or trip_burn_l(t, density) <= 0)]
+    incomplete = bool(missing)
+    if level is not None and not incomplete:
         return {
             "capacityL":  cap,
             "liters":     round(level, 1),
@@ -120,6 +175,8 @@ def estimate_level(refuels: list[dict], trips: list[dict],
         "liters":     round(obd_pct / 100 * cap, 1) if obd_pct is not None else None,
         "pct":        obd_pct,
         "source":     "obd" if obd_pct is not None else None,
+        "qualityWarnings": (["Stima da rifornimenti incompleta: mancano consumi o odometri."] if incomplete else []),
+        "missingConsumptionTrips": len(missing),
         "obdPct":     obd_pct,
         "sinceRefuel": since,
         "lastRefuel":  last_refuel,
@@ -189,7 +246,8 @@ def detect_fc_suspects(trips: list[dict]) -> list[dict]:
     return suspects
 
 
-def fuel_summary(refuels: list[dict], trips: list[dict], settings: dict) -> dict:
+def fuel_summary(refuels: list[dict], trips: list[dict], settings: dict,
+                 myop_legs: list[dict] | None = None) -> dict:
     """One-call payload for the frontend Fuel view / dashboard gauge."""
     cap = settings.get("tank_capacity_l") or DEFAULT_TANK_L
     density = settings.get("fuel_density_gl") or DEFAULT_DENSITY
@@ -198,7 +256,8 @@ def fuel_summary(refuels: list[dict], trips: list[dict], settings: dict) -> dict
     return {
         "level":       level,
         "tankToTank":  intervals,
-        "fcSuspects":  detect_fc_suspects(trips),
+        "fcSuspects":  detect_fc_suspects(myop_legs if myop_legs is not None else [t for t in trips if "obd" not in t.get("sources", [])]),
+        "fcCheckedLegs": len(myop_legs) if myop_legs is not None else sum(1 for t in trips if "obd" not in t.get("sources", []) and t.get("myopFuelUl")),
         "capacityL":   cap,
         "densityGL":   density,
     }

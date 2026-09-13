@@ -5,6 +5,41 @@ Tutte le modifiche rilevanti al progetto sono annotate qui.
 Formato basato su [Keep a Changelog](https://keepachangelog.com/it/1.1.0/);
 il versionamento segue [SemVer](https://semver.org/lang/it/).
 
+## [0.8.0] — 2026-09-13
+
+### Corretto
+- Consumi e insight: i litri di una tratta MyOpel parziale non diventano più il
+  consumo dell'intera sessione OBD; fonti e copertura accompagnano la selezione.
+- Merge e correlazione: conservazione delle revisioni originali e aggregazione
+  delle metriche dei segmenti; le tratte MyOpel ricevute in momenti diversi
+  restano recuperabili e possono essere ricalcolate.
+- Parsing: gestione dei nomi con suffissi d'importazione, buchi temporali
+  distinti dal tempo osservato e segnali DPF allineati nel tempo.
+- Importazione: archivi per hash verificati, originali conservati, attesa di
+  stabilità delle copie, elaborazione serializzata e destinazione upload validata.
+- API: rifiuto di valori negativi/non finiti, impostazioni atomiche, aggiornamento
+  del watcher MyOpel al cambio sorgente e segnalazione esplicita degli errori.
+- Grafici: rimossa la pulizia statistica indiscriminata che eliminava picchi EGT
+  validi; dati assenti distinti dallo zero e selezione coerente con i filtri.
+- Rifornimenti: ora locale nel modulo e media pieno-pieno ponderata per litri.
+
+### Aggiunto
+- Endpoint JSON per aggiornare i dati delle viste, versione/revisione API,
+  informazioni sulla qualità delle osservazioni e controllo di disponibilità.
+- Script di recupero su un nuovo database, con conservazione del precedente e
+  report dei file elaborati e delle righe recuperate.
+- Suite di regressione backend/frontend e controlli obbligatori prima del push GHCR.
+
+### Modificato
+- Hero con spazio distinto per l'auto, controlli accessibili, preferenze salvate,
+  aggiornamento dei dati tra viste e indicazione dell'ultima acquisizione.
+- Dipendenze runtime fissate alle versioni verificate nel container esistente.
+- Documentazione allineata a Opel Corsa F e build linux/amd64. Il formato binario
+  BRC non è supportato: usare l'esportazione CSV.
+- La policy gzip conserva anche l'originale per proteggere dalle copie incomplete;
+  il vecchio valore `SOURCE_ARCHIVE=delete` usa lo stesso comportamento conservativo.
+  I nuovi import possono quindi occupare più spazio delle sole copie compresse.
+
 ## [0.7.0] — 2026-07-13
 
 ### Aggiunto — Modalità solo-OBD (il file MyOpel non è più necessario)

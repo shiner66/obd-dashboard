@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import gzip
 import logging
+import math
 import re
 import statistics
 from datetime import datetime, timedelta, timezone
@@ -151,7 +152,7 @@ CURATED_SLUG: dict[str, str] = {
     "Accuratezza GPS":                                                      "gps_acc",
     "Direzione GPS":                                                       "gps_brg",
     "[ECM] Total mileage":                                                 "odo",
-    "Distanza percorsa:":                                                  "odo",
+    "Distanza percorsa:":                                                  "trip_km",
 }
 
 
@@ -175,7 +176,7 @@ _CURATED = {
     "coolant_max_c":        {"pids": ["Temperatura liquido raffreddamento motore",
                                        "[ECM] Coolant temperature, corrected"],   "agg": "max"},
     "oil_temp_max_c":       {"pids": ["[ECM] Oil temperature"],                  "agg": "max"},
-    "odometer_km":          {"pids": ["[ECM] Total mileage", "Distanza percorsa:"], "agg": "last"},
+    "odometer_km":          {"pids": ["[ECM] Total mileage"],                    "agg": "last"},
     "air_temp_c":           {"pids": ["Temperatura d'aria ambiente",
                                        "[ECM] Outside air temperature",
                                        "[ECM] Intake air temperature"],           "agg": "first"},
@@ -315,7 +316,8 @@ def _grid_ffill(series, t0: float, n: int, step: float, limit: float) -> list:
 
 
 def _derive_metrics(pid_window: dict, t_start: float, t_end: float,
-                    distance_km: float | None, fuel_consumed_l: float | None) -> dict:
+                    distance_km: float | None, fuel_consumed_l: float | None,
+                    observed_windows: list | None = None) -> dict:
     """Mass-based fuel + idle / speed-band / A/C / wheel-vs-GPS metrics.
 
     All computed on a common forward-filled time grid so PIDs sampled at
@@ -338,12 +340,17 @@ def _derive_metrics(pid_window: dict, t_start: float, t_end: float,
     spd_g = _grid_ffill(gps_s or veh_s, t_start, n, step, 25.0)
     ac_g  = _grid_ffill(ac_s, t_start, n, step, 25.0)
 
-    fuel_mg = idle_fuel_mg = idle_s = engine_on_s = 0.0
+    fuel_mg = idle_fuel_mg = idle_s = engine_on_s = mass_covered_s = 0.0
     bands = {(f"{lo}-{hi}" if hi < 1e9 else f"{lo}+"): 0.0 for lo, hi in _SPEED_BANDS}
     band_keys = list(bands.keys())
-    for i in range(n):
+    for i in range(n - 1):
+        now = t_start + i * step
+        if observed_windows is not None and not any(a <= now < b for a, b in observed_windows):
+            continue
         rpm, inj, spd = rpm_g[i], inj_g[i], spd_g[i]
         mdot = (inj * rpm / _INJ_STROKES_PER_MIN) if (inj is not None and rpm and rpm > 0) else None
+        if rpm is not None and inj is not None:
+            mass_covered_s += step
         if rpm is not None and rpm > 0:               # engine running
             engine_on_s += step
             if mdot is not None:
@@ -379,9 +386,13 @@ def _derive_metrics(pid_window: dict, t_start: float, t_end: float,
         if len(ratios) >= _RATIO_MIN_SAMPLES:
             ratio_wg = statistics.median(ratios)
 
+    observed_s = sum(b-a for a,b in observed_windows) if observed_windows is not None else span
+    coverage = min(100.0, mass_covered_s / observed_s * 100) if observed_s and rpm_s and inj_s else None
     return {
+        "fuelMassCoveragePct": _r(coverage, 1),
+        "engineOnDurationMin": _r(engine_on_s / 60, 2) if rpm_s else None,
         "fuelMassG":        _r(fuel_g, 1),
-        "gPerKm":           _r(g_per_km, 1),
+        "gPerKm":           _r(g_per_km, 1) if coverage is not None and coverage >= 90 else None,
         "fuelValidationGL": _r(val_gl, 0),
         "acCurrentMa":      _r(ac_mean, 0),
         "acActivePct":      _r(ac_active, 1),
@@ -426,7 +437,7 @@ def source_stem(path: str | Path) -> str:
     name = Path(path).name
     if name.lower().endswith(".gz"):
         name = name[:-3]
-    return Path(name).stem
+    return re.sub(r"__zip_[0-9a-fA-F]+$", "", Path(name).stem)
 
 
 def _read_csv_rows(path: Path) -> list[tuple]:
@@ -450,6 +461,8 @@ def _read_csv_rows(path: Path) -> list[tuple]:
                         continue
                     pid = row[1].strip()
                     val = float(row[2])
+                    if not math.isfinite(sec) or not math.isfinite(val):
+                        continue
                 except (ValueError, IndexError):
                     continue
                 unit = row[3].strip() if len(row) > 3 else ""
@@ -499,6 +512,9 @@ def parse_file(path: str | Path) -> list[dict]:
         except ValueError:
             continue
 
+    if not start_local:
+        raise ValueError(f"Nome file senza data riconoscibile: {filename}")
+
     # ── Read CSV (try semicolon, fallback to comma/tab) ──────────────────────
     raw_rows = _read_csv_rows(path)
 
@@ -517,6 +533,17 @@ def parse_file(path: str | Path) -> list[dict]:
     pid_units: dict[str, str] = {}
     gps_all: list[tuple[float, float, float]] = []  # (ts, lat, lon)
 
+    # CarScanner SECONDS is commonly time-of-day; unwrap a midnight crossing
+    # before sorting each PID. Small out-of-order polls do not create a new day.
+    unwrapped = []
+    day_offset = 0.0
+    previous_sec = None
+    for sec, pid, val, unit, lat, lon in raw_rows:
+        if previous_sec is not None and sec < previous_sec - 43200:
+            day_offset += 86400
+        previous_sec = sec
+        unwrapped.append((sec + day_offset, pid, val, unit, lat, lon))
+    raw_rows = sorted(unwrapped, key=lambda row: row[0])
     for sec, pid, val, unit, lat, lon in raw_rows:
         pid_data.setdefault(pid, []).append((sec, val))
         pid_units[pid] = unit
@@ -534,7 +561,29 @@ def parse_file(path: str | Path) -> list[dict]:
         all_ts = [r[0] for r in raw_rows]
         t_start, t_end = min(all_ts), max(all_ts)
 
-    duration_min = (t_end - t_start) / 60.0
+    elapsed_min = (t_end - t_start) / 60.0
+    anchor_series = next((pid_data[n] for n in _ENGINE_ANCHORS if n in pid_data), None)
+    # Any observed PID can establish recording continuity. A slowly sampled
+    # trip counter must not erase a continuous GPS stream between its polls.
+    stamps = sorted(set(r[0] for r in raw_rows if t_start <= r[0] <= t_end))
+    windows = []
+    lo = last = stamps[0]
+    for timestamp in stamps[1:]:
+        if timestamp - last > 60:
+            if last > lo:
+                windows.append((lo, last))
+            lo = timestamp
+        last = timestamp
+    if last > lo:
+        windows.append((lo, last))
+    observed_s = sum(b - a for a, b in windows)
+    duration_min = observed_s / 60.0
+    gap_seconds = max(0.0, (t_end - t_start) - observed_s)
+    quality_warnings = []
+    if gap_seconds > 60:
+        quality_warnings.append("Interruzioni di acquisizione: durata riferita al tempo osservato.")
+    if not any(name in pid_data for name in _RPM_NAMES):
+        quality_warnings.append("RPM assenti: durata motore acceso non disponibile.")
 
     # ── Filter to engine window, apply RBS correction ─────────────────────────
     pid_window: dict[str, list[tuple[float, float]]] = {}
@@ -574,6 +623,7 @@ def parse_file(path: str | Path) -> list[dict]:
                 (rate_s[i][0] - rate_s[i-1][0]) / 3600
                 * (rate_s[i][1] + rate_s[i-1][1]) / 2
                 for i in range(1, len(rate_s))
+                if 0 < rate_s[i][0] - rate_s[i-1][0] <= 60
             )
             fuel_consumed_l = round(max(0, fuel_consumed_l), 3)
 
@@ -592,6 +642,7 @@ def parse_file(path: str | Path) -> list[dict]:
                 (spd[i][0] - spd[i-1][0]) / 3600
                 * (spd[i][1] + spd[i-1][1]) / 2
                 for i in range(1, len(spd))
+                if 0 < spd[i][0] - spd[i-1][0] <= 60
             )), 2)
 
     odo_delta: float | None = None
@@ -620,7 +671,10 @@ def parse_file(path: str | Path) -> list[dict]:
         return []
 
     # ── Derived metrics (briefing §2 mass fuel, §3 idle / bands / A/C / ratio) ─
-    metrics = _derive_metrics(pid_window, t_start, t_end, distance_km, fuel_consumed_l)
+    metrics = _derive_metrics(pid_window, t_start, t_end, distance_km, fuel_consumed_l, windows)
+    rate = pid_window.get("[ECM] Fuel consumption rate") or []
+    covered_rate_s = sum(rate[i][0] - rate[i-1][0] for i in range(1, len(rate)) if 0 < rate[i][0] - rate[i-1][0] <= 60)
+    rate_coverage = min(100.0, covered_rate_s / observed_s * 100) if observed_s and rate else None
 
     # ── Sanity filters (briefing §4) ──────────────────────────────────────────
     # Out-of-range decodes have polluted the aggregates before (soot 474 %,
@@ -634,11 +688,14 @@ def parse_file(path: str | Path) -> list[dict]:
     coolant_max = _clamp(fields.get("coolant_max_c"), -40.0, 130.0)
 
     # ── DPF state machine ─────────────────────────────────────────────────────
-    dpf_regen_state, dpf_regen_active = dpf_state(pid_window)
+    from ..services.dpf import assess_state
+    dpf_result = assess_state(pid_window)
+    dpf_regen_state, dpf_regen_active = dpf_result["state"], dpf_result["active"]
 
     # ── Per-PID statistics (§6) and downsampled series ────────────────────────
     pid_values: dict[str, dict] = {}
     pid_series: dict[str, list[float]] = {}
+    pid_series_times: dict[str, list[float]] = {}
     pid_catalog: list[dict] = []
     seen_slugs: set[str] = set()
 
@@ -675,7 +732,9 @@ def parse_file(path: str | Path) -> list[dict]:
         # Constant series draw as a flat line and the stats row already says
         # min == max — storing 60 identical points per PID is pure waste.
         if min(vals) != max(vals):
-            pid_series[slug] = _downsample(series, 60)
+            indices = list(range(len(series))) if len(series) <= 60 else [round(i * (len(series) - 1) / 59) for i in range(60)]
+            pid_series[slug] = [round(series[i][1], 2) for i in indices]
+            pid_series_times[slug] = [round(series[i][0] - t_start, 3) for i in indices]
 
         # Build PID catalog entry
         _name_clean = pid_name
@@ -697,7 +756,16 @@ def parse_file(path: str | Path) -> list[dict]:
         "filename":              filename,
         "start":                 start_local,
         "start_utc":             start_utc,
-        "end":                   _end_time(start_local, duration_min),
+        "end":                   _end_time(start_local, elapsed_min),
+        "parserVersion":         2,
+        "elapsedDurationMin":    _r(elapsed_min, 2),
+        "recordingGapSeconds":   _r(gap_seconds, 1),
+        "observedWindows":       [[_r(a-t_start, 3), _r(b-t_start, 3)] for a,b in windows],
+        "qualityWarnings":       quality_warnings,
+        "fuelRateCoveragePct":   _r(rate_coverage, 1),
+        "pidSeriesTimes":        pid_series_times,
+        "dpfEndObservedActive":  dpf_result["endObservedActive"],
+        "dpfQualityWarnings":    dpf_result["warnings"],
         "durationMin":           _r(duration_min, 1),
         "distanceKm":            _r(distance_km, 2),
         "distanceSource":        distance_source,

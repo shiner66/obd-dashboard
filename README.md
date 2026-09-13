@@ -1,12 +1,30 @@
 # OBD Trip Platform
 
-Dashboard locale per la gestione dei viaggi della tua **Peugeot 308 SW 1.5 BlueHDi (ECU MD1CS003)**.
+Dashboard locale per la gestione dei viaggi della tua **Opel Corsa F 1.5d BlueHDi (ECU MD1CS003)**.
 Aggrega ed elabora i log esportati da:
 
-- **CarScanner** (BTLE IOS-Vlink) → file `.csv` / `.brc`
+- **CarScanner** (BTLE IOS-Vlink) → file `.csv` (anche archivi `.csv.gz` già presenti)
 - **MyOpel** (Stellantis) → file `.myop` ricevuti via email
 
 Costruito per essere **self-hosted via Docker su Unraid**, in **un singolo container**.
+
+### v0.8 — dati verificabili e recupero dello storico
+
+Le metriche distinguono la fonte e la copertura disponibile: i consumi MyOpel
+parziali non vengono applicati all'intera sessione OBD. Le revisioni originali
+dei viaggi sono conservate separatamente dalle sessioni correlate. I grafici
+preservano i picchi, segnalano i dati mancanti e usano i timestamp quando disponibili.
+
+Gli import conservano gli originali e una copia compressa verificata per hash.
+Una copia ancora in corso può essere elaborata nuovamente senza perdere la coda.
+Questo aumenta lo spazio dei nuovi import rispetto alla precedente conservazione
+della sola copia gzip. La migrazione v9 è additiva: il recupero delle metriche
+storiche dai sorgenti richiede una procedura esplicita su copia, descritta in
+[`docs/releases.md`](docs/releases.md).
+
+**Formato BRC:** il briefing contiene una specifica binaria, ma il parser di
+questa applicazione supporta CSV; esportare CSV da CarScanner. Le sorgenti non
+leggibili devono essere conservate e segnalate, non considerate import riusciti.
 
 ---
 
@@ -56,7 +74,7 @@ Il backend:
 4. Apri `http://<unraid-ip>:8080/`
 
 L'immagine `ghcr.io/shiner66/obd-dashboard:latest` viene scaricata automaticamente
-(build multiplatform amd64 + arm64 prodotti dal workflow GitHub Actions).
+(build linux/amd64 prodotta dal workflow GitHub Actions dopo i test).
 
 ### Metodo 2 — Docker Compose (plugin Compose Manager)
 
@@ -158,6 +176,7 @@ i **g/km** (immuni alla densità).
 | Metodo | Path | Descrizione |
 |--------|------|-------------|
 | GET  | `/api/v1/data.js`       | JavaScript con `window.TRIPS`, `window.VEHICLE`, `window.PID_CATALOG`, ecc. |
+| GET  | `/api/v1/dashboard`     | Riepilogo JSON per aggiornare le viste senza perdere il contesto |
 | GET  | `/api/v1/trips`         | JSON di tutti i viaggi (lista completa) |
 | GET  | `/api/v1/trips/{id}`    | Dettaglio singolo viaggio (include `pidSeriesFull`, `track`, `pidValues`) |
 | GET  | `/api/v1/tracks`        | Tutti i tracciati GPS, `{trip_id: [[lat,lon],…]}` (vista Mappa) |
@@ -209,7 +228,7 @@ unraid-templates/
 └── obd-dashboard.xml       Template Unraid Community Apps
 
 .github/workflows/
-└── docker-publish.yml      Build multiplatform → GHCR su push a main
+└── docker-publish.yml      Test + build amd64 → GHCR su push a main
 
 project/                    Mockup originale di Claude Design (riferimento)
 ```
@@ -245,7 +264,7 @@ EOF
 | `OBD_FILES_DIR`    | `/data/obd`           | Directory watch per file CarScanner      |
 | `MYOP_FILES_DIR`   | `/data/myop`          | Directory watch per file MyOpel          |
 | `DB_PATH`          | `/data/db/trips.db`   | Path del file SQLite                     |
-| `SOURCE_ARCHIVE`   | `gzip`                | Cosa fare dei sorgenti dopo l'ingestione: `gzip` (comprime in `archive/`, ~90% più piccoli, ancora ri-analizzabili), `keep` (non toccarli), `delete` (elimina — il DB+ledger diventano l'unica copia) |
+| `SOURCE_ARCHIVE`   | `gzip`                | Cosa fare dei sorgenti dopo l'ingestione: `gzip` (copia verificata in `archive/<sha256>/`, originali conservati), `keep` (non toccarli), `delete` (compatibilità: conserva gli originali e archivia come `gzip`) |
 
 ---
 
@@ -256,7 +275,7 @@ EOF
 - **Slug PID**: il backend mappa i nomi lunghi dei PID (es. `[ECM] Crankshaft speed`) a slug brevi (`rpm`, `egt_a`, `soot`, ecc.) tramite `CURATED_SLUG` in `csv_parser.py`, in modo che combaciaino con quelli hardcoded nel frontend.
 - **Curatela PID**: dei ~180 PID registrati dal profilo MD1CS003, ognuno è marcato `useful` se ha uno slug curato **oppure** se porta un'unità fisica reale e varia nel viaggio. I ~110 PID-rumore (flag interni ECU, segnali grezzi `MP_*`, contatori, valori costanti) restano accessibili tramite il toggle "Tutti" nel PID Explorer ma sono nascosti di default.
 - **Spazio su disco**: il catalogo PID vive in una tabella globale `pid_catalog` (una riga per slug) invece di essere duplicato in ogni viaggio; le serie downsampled sono arrotondate a 2 decimali e le serie costanti non vengono salvate; le coordinate GPS sono arrotondate a 5 decimali (≈1 m). I blob JSON pesanti (track, statistiche e serie PID) sono compressi zlib in modo trasparente. Le migrazioni v6+v7 compattano i database esistenti e fanno `VACUUM` (nel corpus reale: ~20 MB → ~2 MB).
-- **Ciclo di vita dei sorgenti**: dopo l'ingestione ogni CSV/.myop viene registrato nel ledger `ingested_files` (sha256 del contenuto non compresso) e, con la policy di default, gzippato in `<watch_dir>/archive/` (~90 % più piccolo). La scansione all'avvio legge anche gli archivi `.gz`, quindi le migrazioni future possono sempre ri-analizzare i sorgenti. La vista **Admin → Spazio su disco** mostra dimensioni e risparmio.
+- **Ciclo di vita dei sorgenti**: dopo l'ingestione ogni CSV/.myop viene registrato nel ledger `ingested_files` (sha256 del contenuto non compresso) e, con la policy di default, copiato e verificato in `<watch_dir>/archive/<sha256>/`. Gli originali restano disponibili anche in caso di scritture tardive; file omonimi con contenuto diverso hanno archivi distinti. La scansione all'avvio legge anche gli archivi `.gz`, quindi le migrazioni future possono sempre ri-analizzare i sorgenti. La vista **Admin → Spazio su disco** mostra dimensioni e risparmio.
 - **Distanza OBD**: calcolata dal contatore di tratta `Distanza percorsa:` se presente, altrimenti dal delta dell'odometro `[ECM] Total mileage` (affidabile ≥2 km), e solo come ultima risorsa dall'integrale della velocità GPS (rumoroso). Questo era la causa principale delle correlazioni mancate.
 - **Correlazione OBD↔MyOpel** (3 passaggi): ① ogni tratta MyOpel viene assegnata alla sessione OBD la cui finestra temporale ne contiene l'inizio, usando **solo il timestamp grezzo**; ② le tratte rimaste orfane riprovano con il timestamp corretto di −1 h (bug DST "gruppo B" Stellantis); ③ le ultime orfane usano un punteggio pesato (tempo ±60 min + distanza ±30 % + durata) contro le sessioni OBD ancora libere — recupera le tratte gruppo B ai margini della finestra e le registrazioni partite ad adattatore già in marcia. In ogni passaggio vale un **budget di distanza**: né una singola tratta né la somma delle tratte può superare i km della sessione OBD oltre la tolleranza, così una guida estranea non viene più assorbita per caso. La somma dei km MyOpel viene salvata (`myop_distance_km`): se copre <60 % della sessione il consumo non viene derivato dal carburante Stellantis e la coppia compare tra le "correlazioni da verificare" nella vista Admin.
 

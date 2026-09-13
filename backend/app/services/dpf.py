@@ -1,89 +1,107 @@
-"""
-DPF state machine — briefing §8.
-States: idle | requested | active | completed | post_regen
+"""DPF events inferred from consecutive, contemporaneous ECU observations.
+
+The end state describes the last *observed* condition, never proof of an engine
+shutdown. Missing or stale signals produce an explicit unknown state.
 """
 from __future__ import annotations
 
-_REGEN_STATUS    = "[ECM] DPF regeneration status"
-_REGEN_ENABLE    = "[ECM] Regeneration enable"
-_EGT_AFTER       = "[ECM] Exhaust gas temperature after pre-catalytic converter"
-_NOX_CAT         = "[ECM] Temperature of the NOx catalytic converter"
-_EGT_DPF_INLET   = "[ECM] EGT at DPF inlet"
-_EGT_DPF_OUTLET  = "[ECM] EGT at DPF outlet"
-_SOOT_CL         = "[ECM] Closed loop soot load assessment of the diesel particulate filter"
-_DIST_REGEN      = "[ECM] Distance traveled since the last regeneration"
-
-# Minimum number of consecutive regen_status samples ≥ 1 required before
-# treating the ECU signal as a real regen request.  A single spike (e.g.
-# one poll cycle with value=1) is filtered out as noise.
+_REGEN_STATUS = "[ECM] DPF regeneration status"
+_REGEN_ENABLE = "[ECM] Regeneration enable"
+_EGT_AFTER = "[ECM] Exhaust gas temperature after pre-catalytic converter"
+_NOX_CAT = "[ECM] Temperature of the NOx catalytic converter"
+_EGT_DPF_INLET = "[ECM] EGT at DPF inlet"
+_EGT_DPF_OUTLET = "[ECM] EGT at DPF outlet"
+_SOOT_CL = "[ECM] Closed loop soot load assessment of the diesel particulate filter"
+_DIST_REGEN = "[ECM] Distance traveled since the last regeneration"
 _MIN_REGEN_SAMPLES = 3
+_MAX_SAMPLE_AGE_S = 30.0
+_MIN_REQUEST_DURATION_S = 10.0
 
 
-def _consecutive_below(recs: list, threshold: float, n: int) -> bool:
-    """Return True if there are at least n consecutive records with value < threshold."""
-    count = 0
-    for _, v in recs:
-        count = count + 1 if v < threshold else 0
-        if count >= n:
-            return True
-    return False
+def _last_at(series: list, timestamp: float) -> float | None:
+    """Read a past sample only within the freshness bound; never look ahead."""
+    for ts, value in reversed(series):
+        if ts <= timestamp:
+            return value if timestamp - ts <= _MAX_SAMPLE_AGE_S else None
+    return None
+
+
+def assess_state(pid_series: dict[str, list[tuple[float, float]]]) -> dict:
+    """Return observed DPF state, historical activity and quality warnings."""
+    series = {key: sorted(value) for key, value in pid_series.items() if value}
+    status = series.get(_REGEN_STATUS, [])
+    temperatures = ((_EGT_AFTER, 550), (_NOX_CAT, 550),
+                    (_EGT_DPF_INLET, 500), (_EGT_DPF_OUTLET, 500))
+    requested = active = False
+    first_active = None
+    run_start = previous = None
+    run_length = 0
+    last_run_active = False
+    for timestamp, value in status:
+        contiguous = previous is not None and timestamp - previous <= _MAX_SAMPLE_AGE_S
+        if value >= 1:
+            if not contiguous or run_length == 0:
+                run_start, run_length = timestamp, 1
+            else:
+                run_length += 1
+        else:
+            run_start, run_length = None, 0
+        valid = run_length >= _MIN_REGEN_SAMPLES and timestamp - run_start >= _MIN_REQUEST_DURATION_S
+        requested = requested or valid
+        thermal = any((v := _last_at(series.get(name, []), timestamp)) is not None and v > threshold
+                      for name, threshold in temperatures)
+        enable = _last_at(series.get(_REGEN_ENABLE, []), timestamp)
+        last_run_active = valid and thermal and (enable is None or enable >= 1)
+        if last_run_active:
+            active = True
+            if first_active is None:
+                first_active = timestamp
+        previous = timestamp
+
+    end = max((rows[-1][0] for rows in series.values()), default=None)
+    status_fresh = bool(status and end is not None and end - status[-1][0] <= _MAX_SAMPLE_AGE_S)
+    end_active = last_run_active if status_fresh else None
+    distance = series.get(_DIST_REGEN, [])
+    soot = series.get(_SOOT_CL, [])
+    completed = False
+    if active:
+        before = [v for ts, v in distance if ts <= first_active]
+        after = [(ts, v) for ts, v in distance if ts >= first_active]
+        if before and before[-1] > 20:
+            count = 0
+            prev = None
+            for ts, value in after:
+                if value < before[-1] * 0.1 and (prev is None or ts - prev <= _MAX_SAMPLE_AGE_S):
+                    count += 1
+                else:
+                    count = 1 if value < before[-1] * 0.1 else 0
+                if count >= _MIN_REGEN_SAMPLES:
+                    completed = True
+                prev = ts
+        if soot and soot[-1][0] >= first_active and soot[-1][1] <= 0.5:
+            completed = True
+    warnings = []
+    if not status_fresh:
+        warnings.append("Stato ECU DPF assente o non recente alla fine della registrazione.")
+    if completed:
+        state = "completed"
+    elif end_active:
+        state = "active"
+    elif active:
+        state = "unknown"
+        warnings.append("Rigenerazione osservata, esito finale non confermato dai contatori.")
+    elif requested and status_fresh and status[-1][1] >= 1:
+        state = "requested"
+    elif distance and distance[-1][1] < 20:
+        state = "post_regen"
+    elif status_fresh:
+        state = "idle"
+    else:
+        state = "unknown"
+    return {"state": state, "active": int(active), "endObservedActive": end_active, "warnings": warnings}
 
 
 def compute_state(pid_series: dict[str, list[tuple[float, float]]]) -> tuple[str, int]:
-    """
-    Returns (state_str, regen_active_int) from per-PID (ts, value) series.
-    regen_active is 0 or 1.
-    """
-    def vals(name: str) -> list[float]:
-        return [v for _, v in pid_series.get(name, [])]
-
-    regen_status_vals = vals(_REGEN_STATUS)
-    regen_enable_vals = vals(_REGEN_ENABLE)
-    egt_after_vals    = vals(_EGT_AFTER)
-    nox_cat_vals      = vals(_NOX_CAT)
-    egt_dpf_i_vals    = vals(_EGT_DPF_INLET)
-    egt_dpf_o_vals    = vals(_EGT_DPF_OUTLET)
-    soot_cl_vals      = vals(_SOOT_CL)
-    dist_regen_recs   = pid_series.get(_DIST_REGEN, [])
-
-    # Require at least _MIN_REGEN_SAMPLES above threshold to reject noise spikes.
-    regen_requested = sum(1 for v in regen_status_vals if v >= 1) >= _MIN_REGEN_SAMPLES
-    regen_enabled   = (not regen_enable_vals) or max(regen_enable_vals, default=0) >= 1
-    thermal_regen   = (
-        (bool(egt_after_vals)   and max(egt_after_vals)   > 550) or
-        (bool(nox_cat_vals)     and max(nox_cat_vals)     > 550) or
-        (bool(egt_dpf_i_vals)   and max(egt_dpf_i_vals)   > 500) or
-        (bool(egt_dpf_o_vals)   and max(egt_dpf_o_vals)   > 500)
-    )
-    regen_active = regen_requested and regen_enabled and thermal_regen
-
-    soot_end = soot_cl_vals[-1] if soot_cl_vals else None
-
-    dist_reset_in_trip = (
-        len(dist_regen_recs) >= _MIN_REGEN_SAMPLES + 1
-        and dist_regen_recs[0][1] > 20
-        and _consecutive_below(dist_regen_recs[1:], dist_regen_recs[0][1] * 0.1, _MIN_REGEN_SAMPLES)
-    )
-
-    cooldown_started = (
-        bool(dist_regen_recs)
-        and dist_regen_recs[0][1] < 1.0
-        and thermal_regen
-        and not regen_requested
-    )
-
-    dist_end = dist_regen_recs[-1][1] if dist_regen_recs else None
-
-    if regen_active and (dist_reset_in_trip or (soot_end is not None and soot_end <= 0.5)):
-        state = "completed"
-    elif regen_active:
-        state = "active"
-    elif regen_requested and not thermal_regen:
-        state = "requested"
-    elif ((dist_end is not None and dist_end < 20 and not regen_active)
-          or cooldown_started):
-        state = "post_regen"
-    else:
-        state = "idle"
-
-    return state, (1 if regen_active else 0)
+    """Compatibility wrapper returning (state, activity observed during session)."""
+    result = assess_state(pid_series)
+    return result["state"], result["active"]

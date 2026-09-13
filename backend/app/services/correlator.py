@@ -105,12 +105,13 @@ def _aggregate_myop_legs(legs: list[dict]) -> dict:
     total_cost = sum(l.get("costEur") or 0 for l in legs)
     total_dist = sum(l.get("distanceKm") or 0 for l in legs)
     eff_price  = (total_cost / total_fuel) if (total_cost and total_fuel) else last.get("priceFuel")
-    leg_ids    = [l.get("myopId") for l in legs if l.get("myopId") is not None]
+    leg_ids    = list(dict.fromkeys(i for l in legs for i in (l.get("myopLegIds") or ([l["myopId"]] if l.get("myopId") is not None else []))))
     alerts     = sorted({a for l in legs for a in (l.get("alerts") or [])})
     return {
         "myopId":            leg_ids[0] if leg_ids else last.get("myopId"),
         "myopLegIds":        leg_ids,
         "myopDistanceKm":    round(total_dist, 2) if total_dist else None,
+        "myopFuelUl":        sum(l.get("myopFuelUl") or 0 for l in legs) or None,
         "fuelLevel":         last.get("fuelLevel"),
         "fuelAutonomy":      last.get("fuelAutonomy"),
         "fuelConsumedL":     round(total_fuel, 3) if total_fuel else None,
@@ -157,6 +158,14 @@ def _score(a: dict, b: dict) -> float:
     t_b = _parse_dt(b.get("start"))
     if not t_a or not t_b:
         return 0.0
+    windows = a.get("observedWindows")
+    end_a = _parse_dt(a.get("end"))
+    if windows and end_a:
+        candidates = (t_b, t_b - _dst_offset(t_b))
+        if all(t_a <= candidate <= end_a and not any(
+                t_a + timedelta(seconds=lo-SESSION_PRE_S) <= candidate <= t_a + timedelta(seconds=hi+SESSION_POST_S)
+                for lo, hi in windows) for candidate in candidates):
+            return 0.0
 
     def _time_score(t1: datetime, t2: datetime) -> float:
         dt = abs((t1 - t2).total_seconds())
@@ -242,6 +251,35 @@ def _detect_obd_chains(obd_trips: list[dict]) -> list[list[str]]:
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
+def _dedupe_myop_candidates(trips: list[dict]) -> tuple[list[dict], set[str]]:
+    """Recognize reissued legs using both time boundaries and distance agreement.
+
+    Nearby but distinct drives are retained; only almost identical windows are
+    deduplicated. Original revisions remain available for inspection/rebuild.
+    """
+    ordered = sorted(trips, key=lambda t: (t.get("start") or "", str(t.get("myopId") or "")), reverse=True)
+    kept, duplicate_ids = [], set()
+    for trip in ordered:
+        start, end = _parse_dt(trip.get("start")), _parse_dt(trip.get("end"))
+        duplicate = False
+        if start and end and not trip.get("_legacyTarget"):
+            for prior in kept:
+                ps, pe = _parse_dt(prior.get("start")), _parse_dt(prior.get("end"))
+                if not ps or not pe or prior.get("_legacyTarget"):
+                    continue
+                if abs((start-ps).total_seconds()) > 60 or abs((end-pe).total_seconds()) > 60:
+                    continue
+                a, b = trip.get("distanceKm") or 0, prior.get("distanceKm") or 0
+                if a > 0 and b > 0 and abs(a-b) / max(a,b) <= DEDUPE_DISTANCE_TOL:
+                    duplicate = True
+                    break
+        if duplicate:
+            duplicate_ids.add(trip["id"])
+        else:
+            kept.append(trip)
+    return kept, duplicate_ids
+
+
 def auto_correlate_all() -> dict:
     """Reconcile all trips in the DB. Returns operation counts.
 
@@ -307,7 +345,11 @@ def auto_correlate_all() -> dict:
     for chain in chains:
         primary, *rest = chain
         log.info("Auto-merging OBD chain: %s ← %s", primary, rest)
-        db.merge_trips(primary, rest)
+        try:
+            db.merge_trips(primary, rest)
+        except ValueError as exc:
+            log.warning("Chain left unchanged: %s", exc)
+            continue
         counts["obd_chains_merged"] += 1
         counts["obd_trips_absorbed"] += len(rest)
 
@@ -317,6 +359,30 @@ def auto_correlate_all() -> dict:
         obd_trips  = [t for t in trips if "obd"    in t.get("sources", [])]
         myop_trips = [t for t in trips if "myopel" in t.get("sources", [])
                       and "obd" not in t.get("sources", [])]
+
+    # Rebuild enrichment from original MyOpel observations, including previously
+    # absorbed legs. Materialized deletes never remove their immutable revisions.
+    candidates = {t["id"]: t for t in myop_trips}
+    candidates.update({t["id"]: t for t in db.get_raw_trips("myopel")})
+    for session in obd_trips:
+        ids = session.get("myopLegIds") or ([session["myopId"]] if session.get("myopId") is not None else [])
+        missing = [i for i in ids if f"myop-{i}" not in candidates]
+        if missing:
+            # Preserve a legacy aggregate until its complete raw legs are replayed.
+            # Avoid adding the known subset again on top of that aggregate.
+            for i in ids:
+                candidates.pop(f"myop-{i}", None)
+            legacy = dict(session)
+            legacy.update(id=f"legacy-myop-{session['id']}", sources=["myopel"],
+                          distanceKm=session.get("myopDistanceKm"),
+                          fuelConsumedL=session.get("myopFuelConsumedL"),
+                          myopLegIds=ids, _legacyTarget=session["id"])
+            candidates[legacy["id"]] = legacy
+    myop_trips, duplicate_raw_ids = _dedupe_myop_candidates(list(candidates.values()))
+    for duplicate_id in duplicate_raw_ids:
+        if db.trip_exists(duplicate_id):
+            db.delete_trip(duplicate_id)
+            counts["myop_duplicates_removed"] += 1
 
     # 2. OBD↔MyOpel session grouping
     # Assign every standalone MyOpel leg to the OBD session whose engine-on
@@ -341,7 +407,11 @@ def auto_correlate_all() -> dict:
         for obd, os_, oe in parsed_sessions:
             if not os_ or not oe:
                 continue
-            if _leg_in_session(ls, os_, oe, allow_dst=allow_dst) is None:
+            effective = _leg_in_session(ls, os_, oe, allow_dst=allow_dst)
+            if effective is None:
+                continue
+            windows = obd.get("observedWindows")
+            if windows and not any(os_ + timedelta(seconds=a - SESSION_PRE_S) <= effective <= os_ + timedelta(seconds=b + SESSION_POST_S) for a, b in windows):
                 continue
             budget = _distance_budget_km(obd.get("distanceKm"))
             if budget is not None and leg_km > budget:
@@ -355,7 +425,7 @@ def auto_correlate_all() -> dict:
     assignments: dict[str, list[dict]] = {}
     unmatched: list[dict] = []
     for leg in myop_trips:
-        target = _find_session(leg, allow_dst=False)
+        target = next((t for t in obd_sessions if t["id"] == leg.get("_legacyTarget")), None) if leg.get("_legacyTarget") else _find_session(leg, allow_dst=False)
         if target is not None:
             assignments.setdefault(target["id"], []).append(leg)
         else:
@@ -376,7 +446,7 @@ def auto_correlate_all() -> dict:
     # ±60 min, so it can't absorb a foreign leg the way the old always-try-DST
     # logic did. One leg per session, sessions with no other match only.
     free_sessions = [t for t in obd_sessions
-                     if t["id"] not in assignments and t.get("myopId") is None]
+                     if t["id"] not in assignments]
     scored: list[tuple[float, dict, dict]] = []
     for leg in still_unmatched:
         for obd in free_sessions:
@@ -394,6 +464,8 @@ def auto_correlate_all() -> dict:
         assignments.setdefault(obd["id"], []).append(leg)
         log.info("Score-fallback correlation %s ← %s (score %.2f)", obd["id"], leg["id"], s)
 
+    attached_ids = set()
+    changed_sessions = set()
     session_km = {t["id"]: (t.get("distanceKm") or 0) for t in obd_sessions}
     for obd_id, legs in assignments.items():
         legs.sort(key=lambda l: l.get("start") or "")
@@ -410,45 +482,33 @@ def auto_correlate_all() -> dict:
                 log.info("Session %s: leg %s dropped (sum %.1f km > budget %.1f km)",
                          obd_id, dropped["id"], total + (dropped.get("distanceKm") or 0), budget)
         agg = _aggregate_myop_legs(legs)
+        attached_ids.update(agg.get("myopLegIds") or [])
+        changed_sessions.add(obd_id)
         log.info("Correlating OBD %s ← %d MyOpel leg(s): %s",
                  obd_id, len(legs), [l["id"] for l in legs])
-        db.enrich_with_myop(obd_id, agg)
+        existing = db.get_trip(obd_id) or {}
+        changed = any(existing.get(k) != agg.get(k) for k in
+                      ("myopId", "myopLegIds", "myopDistanceKm", "fuelLevel", "fuelAutonomy",
+                       "priceFuel", "daysToService", "kmToService", "alerts", "myopFuelUl"))
+        changed = changed or existing.get("myopFuelConsumedL") != agg.get("fuelConsumedL")
+        if changed:
+            db.enrich_with_myop(obd_id, agg)
+            counts["myop_correlated"] += 1
+        absorbed = 0
         for leg in legs:
-            db.delete_trip(leg["id"])
-        counts["myop_correlated"] += 1
-        counts["myop_legs_absorbed"] += len(legs)
+            if db.trip_exists(leg["id"]):
+                db.delete_trip(leg["id"])
+                absorbed += 1
+        counts["myop_legs_absorbed"] += absorbed
 
-    # 3. MyOpel-to-MyOpel dedupe (same trip resent with new ID)
-    trips = db.get_all_trips()
-    myop_only = sorted(
-        [t for t in trips if "myopel" in t.get("sources", [])
-         and "obd" not in t.get("sources", [])],
-        key=lambda t: t.get("start") or "",
-    )
-    keep: list[dict] = []
-    for trip in myop_only:
-        is_dup = False
-        for kept in keep:
-            t_k = _parse_dt(kept.get("start"))
-            t_t = _parse_dt(trip.get("start"))
-            if not t_k or not t_t:
-                continue
-            if abs((t_k - t_t).total_seconds()) > DEDUPE_TIME_S:
-                continue
-            d_k = kept.get("distanceKm") or 0
-            d_t = trip.get("distanceKm") or 0
-            if d_k > 0 and d_t > 0:
-                ratio = abs(d_k - d_t) / max(d_k, d_t)
-                if ratio > DEDUPE_DISTANCE_TOL:
-                    continue
-            is_dup = True
-            break
-        if is_dup:
-            log.info("Removing duplicate myop trip %s (matches %s)", trip["id"], keep[-1]["id"])
-            db.delete_trip(trip["id"])
-            counts["myop_duplicates_removed"] += 1
-        else:
-            keep.append(trip)
+    for session in obd_sessions:
+        ids = session.get("myopLegIds") or ([session["myopId"]] if session.get("myopId") is not None else [])
+        if ids and session["id"] not in changed_sessions and all(db.raw_trip_exists(f"myop-{i}") for i in ids):
+            db.clear_myop_enrichment(session["id"])
+            counts["myop_correlated"] += 1
+    for raw in db.get_raw_trips("myopel"):
+        if raw["id"] not in duplicate_raw_ids and raw.get("myopId") not in attached_ids and not db.trip_exists(raw["id"]):
+            db.save_trip(raw, record_raw=False)
 
     if any(counts.values()):
         log.info("auto_correlate_all summary: %s", counts)

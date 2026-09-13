@@ -5,6 +5,8 @@ zlib-compressed; readers accept both compressed blobs and legacy plain text.
 """
 from __future__ import annotations
 import json
+import hashlib
+import math
 import logging
 import re
 import sqlite3
@@ -60,6 +62,7 @@ _EXTRA_TRIP_COLUMNS: tuple[tuple[str, str], ...] = (
     ("speed_bands_json",    "TEXT"),      # §3 {band: km} distance split by speed band
     ("ratio_wg",            "REAL"),      # §3 median wheel-speed / GPS-speed (tyre monitor)
     ("fc_suspect",          "INTEGER"),   # §1 stale MyOpel fuelConsumption flag
+    ("metadata_json",       "TEXT"),     # versioned provenance, coverage and time axes
     ("myop_fuel_ul",        "INTEGER"),   # §1 raw MyOpel fuelConsumption, microlitres
 )
 
@@ -110,6 +113,14 @@ def _run_data_migrations() -> None:
         _migrate_v8_fix_empty_starts()
         with _conn() as con:
             con.execute("PRAGMA user_version = 8")
+
+
+    if version < 9:
+        # Additive migration: keep every original row, including compressed blobs.
+        # Rebuilding derived sessions from source files is an explicit offline job.
+        with _conn() as con:
+            con.execute("CREATE TABLE IF NOT EXISTS trips_before_v9 AS SELECT * FROM trips")
+            con.execute("PRAGMA user_version = 9")
 
 
 def _migrate_v1_fix_myop_dst() -> None:
@@ -472,6 +483,17 @@ def _vacuum() -> None:
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS raw_trip_revisions (
+    trip_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    source_kind TEXT NOT NULL,
+    parser_version INTEGER NOT NULL DEFAULT 1,
+    payload BLOB NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (trip_id, revision)
+);
+CREATE INDEX IF NOT EXISTS raw_trip_kind ON raw_trip_revisions(source_kind);
 CREATE TABLE IF NOT EXISTS trips (
     id                  TEXT PRIMARY KEY,
     source              TEXT,          -- "obd_csv" | "myop"
@@ -747,8 +769,13 @@ def update_insights(trip_id: str, insights: list) -> None:
         )
 
 
-def save_trip(trip: dict) -> None:
-    """Insert or replace a trip dict (as produced by the parsers)."""
+def save_trip(trip: dict, *, record_raw: bool = True) -> None:
+    """Store a materialized trip and preserve immutable parser revisions by default.
+
+    Derived merges pass record_raw=False so they cannot overwrite original legs.
+    """
+    if record_raw:
+        save_raw_trip(trip)
     _j = lambda v: json.dumps(v) if v is not None else None
     sources = trip.get("sources", [])
     is_obd  = "obd" in sources
@@ -809,7 +836,7 @@ def save_trip(trip: dict) -> None:
             trip.get("oilMaxC"),
             trip.get("odometerKm"),
             trip.get("airTempC"),
-            trip.get("fuelConsumedL"),
+            trip.get("obdFuelConsumedL", trip.get("fuelConsumedL")) if is_obd else trip.get("fuelConsumedL"),
             trip.get("consumptionL100km"),
             trip.get("dpfSootPct"),
             trip.get("dpfClosedSoot"),
@@ -844,6 +871,12 @@ def save_trip(trip: dict) -> None:
             trip.get("vin"),
         ))
 
+        con.execute("UPDATE trips SET metadata_json=?,merged_ids=?,myop_leg_ids=?,myop_distance_km=? WHERE id=?",
+                    (_pack_json({k: trip.get(k) for k in _METADATA_FIELDS if k in trip}),
+                     _j(trip.get("mergedIds")), _j(trip.get("myopLegIds")), trip.get("myopDistanceKm"), trip["id"]))
+        if trip.get("myopFuelConsumedL") is not None:
+            con.execute("UPDATE trips SET myop_fuel_consumed_l=? WHERE id=?", (trip["myopFuelConsumedL"], trip["id"]))
+
         # OBD-native + derived metrics (added after the base schema).
         con.execute("""
             UPDATE trips SET
@@ -869,6 +902,128 @@ def save_trip(trip: dict) -> None:
             trip.get("myopFuelUl"),
             trip.get("id"),
         ))
+
+
+_METADATA_FIELDS = (
+    "parserVersion", "distanceSource", "fuelRateCoveragePct", "fuelMassCoveragePct",
+    "fuelSource", "fuelCoveragePct", "qualityWarnings", "elapsedDurationMin",
+    "recordingGapSeconds", "engineOnDurationMin", "pidSeriesTimes",
+    "observedWindows", "dpfEndObservedActive", "dpfQualityWarnings",
+    "fuelDensityGL", "myopFuelConsumedL",
+)
+
+
+def save_raw_trip(trip: dict) -> bool:
+    """Append an immutable source revision if its meaningful payload changed."""
+    clean = {k: v for k, v in trip.items() if k not in ("insights", "filename")}
+    encoded = json.dumps(clean, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    with _conn() as con:
+        old = con.execute("SELECT revision, content_hash FROM raw_trip_revisions WHERE trip_id=? ORDER BY revision DESC LIMIT 1", (trip["id"],)).fetchone()
+        if old and old["content_hash"] == digest:
+            return False
+        con.execute("INSERT INTO raw_trip_revisions(trip_id,revision,content_hash,source_kind,parser_version,payload) VALUES(?,?,?,?,?,?)",
+                    (trip["id"], old["revision"] + 1 if old else 1, digest,
+                     "obd" if "obd" in trip.get("sources", []) else "myopel",
+                     trip.get("parserVersion", 1), _pack_json(trip)))
+    return True
+
+
+def raw_trip_revision_known(trip: dict) -> bool:
+    """Recognize any archived revision without promoting it over the chosen latest."""
+    clean = {k: v for k, v in trip.items() if k not in ("insights", "filename")}
+    digest = hashlib.sha256(json.dumps(clean, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+    with _conn() as con:
+        return con.execute("SELECT 1 FROM raw_trip_revisions WHERE trip_id=? AND content_hash=? LIMIT 1", (trip["id"], digest)).fetchone() is not None
+
+
+def raw_trip_exists(trip_id: str) -> bool:
+    """Whether a parser observation exists, including absorbed segments."""
+    with _conn() as con:
+        return con.execute("SELECT 1 FROM raw_trip_revisions WHERE trip_id=? LIMIT 1", (trip_id,)).fetchone() is not None
+
+
+def get_raw_trip(trip_id: str) -> dict | None:
+    """Return the latest immutable parser observation for an original trip ID."""
+    with _conn() as con:
+        row = con.execute("SELECT payload FROM raw_trip_revisions WHERE trip_id=? ORDER BY revision DESC LIMIT 1", (trip_id,)).fetchone()
+    return _unpack_json(row["payload"]) if row else None
+
+
+def get_raw_trips(kind: str | None = None) -> list[dict]:
+    """Latest source observations, optionally restricted to obd or myopel."""
+    with _conn() as con:
+        rows = con.execute("""SELECT r.payload FROM raw_trip_revisions r
+            JOIN (SELECT trip_id, MAX(revision) revision FROM raw_trip_revisions GROUP BY trip_id) latest
+            USING(trip_id,revision) WHERE (? IS NULL OR r.source_kind=?)""", (kind, kind)).fetchall()
+    return [_unpack_json(r["payload"]) for r in rows]
+
+
+def set_settings(mapping: dict) -> None:
+    """Atomically store a prevalidated batch of settings."""
+    with _conn() as con:
+        con.executemany("""INSERT INTO settings(key,value,updated_at) VALUES(?,?,datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+                        [(key, json.dumps(value, allow_nan=False)) for key, value in mapping.items()])
+
+
+def apply_source_observation(trip: dict) -> bool:
+    """Apply a new raw revision without dropping the other segments of a session.
+
+    Call after save_raw_trip. An incomplete legacy session stays materialized as
+    before and is repaired only by the explicit offline rebuild.
+    """
+    affected = next((t for t in get_all_trips() if trip["id"] in (t.get("mergedIds") or []) and len(t["mergedIds"]) > 1), None)
+    if affected is None:
+        save_trip(trip, record_raw=False)
+        return True
+    member_ids = affected["mergedIds"]
+    members = [get_raw_trip(tid) for tid in member_ids]
+    legs = affected.get("myopLegIds") or ([affected["myopId"]] if affected.get("myopId") is not None else [])
+    if any(member is None for member in members) or any(not raw_trip_exists(f"myop-{i}") for i in legs):
+        log.warning("Raw revision retained; legacy session %s requires complete source rebuild", affected["id"])
+        return False
+    for member in members:
+        save_trip(member, record_raw=False)
+    merge_trips(affected["id"], [tid for tid in member_ids if tid != affected["id"]])
+    return True
+
+
+def rebuild_materialized_from_raw() -> dict:
+    """Explicit offline rebuild after parsing *all* source copies into raw revisions.
+
+    This is never invoked by init/startup. Legacy rows without complete original
+    coverage remain in place; their overlapping source observations are withheld.
+    Call the correlator afterwards to rebuild sessions and MyOpel enrichment.
+    """
+    def canonical(tid):
+        """Normalize only the known duplicate-export suffix, preserving identity."""
+        return re.sub(r"__zip_[0-9a-fA-F]+$", "", tid)
+    raw = {t["id"]: t for t in get_raw_trips()}
+    existing = get_all_trips()
+    replace_ids, protected, held_raw = [], [], set()
+    for trip in existing:
+        ids = {canonical(tid) for tid in (trip.get("mergedIds") or [trip["id"]])}
+        # An OBD row can also contain legacy MyOpel enrichment: require those legs
+        # before replacing it so a partial source copy cannot lose that history.
+        legs = trip.get("myopLegIds") or ([trip["myopId"]] if trip.get("myopId") is not None else [])
+        needed = ids | {f"myop-{i}" for i in legs}
+        if needed <= raw.keys():
+            replace_ids.append(trip["id"])
+        else:
+            protected.append(trip["id"])
+            held_raw.update(needed & raw.keys())
+    with _conn() as con:
+        # Copy every pre-rebuild row, including latest settings/refuels elsewhere.
+        con.execute("CREATE TABLE IF NOT EXISTS trips_before_rebuild AS SELECT * FROM trips")
+        con.executemany("DELETE FROM trips WHERE id=?", [(tid,) for tid in replace_ids])
+    written = 0
+    for tid, observation in raw.items():
+        if tid not in held_raw:
+            save_trip(observation, record_raw=False)
+            written += 1
+    return {"replaced": len(replace_ids), "materializedRaw": written,
+            "preservedLegacy": protected, "withheldRawIds": sorted(held_raw)}
 
 
 def get_all_trips() -> list[dict]:
@@ -909,6 +1064,7 @@ def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
         con.execute("""
             UPDATE trips SET
                 myop_trip_id        = ?,
+                myop_fuel_ul        = ?,
                 myop_leg_ids        = ?,
                 myop_distance_km    = ?,
                 myop_fuel_level     = ?,
@@ -923,6 +1079,7 @@ def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
             WHERE id = ?
         """, (
             myop_trip.get("myopId"),
+            myop_trip.get("myopFuelUl"),
             json.dumps(leg_ids) if leg_ids else None,
             myop_trip.get("myopDistanceKm"),
             myop_trip.get("fuelLevel"),
@@ -938,119 +1095,147 @@ def enrich_with_myop(obd_trip_id: str, myop_trip: dict) -> None:
         ))
 
 
-def merge_trips(primary_id: str, secondary_ids: list[str]) -> dict:
-    """Merge secondary trips into primary. Returns updated primary trip dict."""
-    import json as _json
+def clear_myop_enrichment(trip_id: str) -> None:
+    """Clear a derived association only when original legs exist for regrouping."""
     with _conn() as con:
-        primary = con.execute("SELECT * FROM trips WHERE id=?", (primary_id,)).fetchone()
-        if not primary:
-            raise ValueError(f"Primary trip {primary_id} not found")
-        primary = dict(primary)
+        con.execute("""UPDATE trips SET myop_trip_id=NULL,myop_leg_ids=NULL,myop_distance_km=NULL,
+            myop_fuel_level=NULL,myop_fuel_autonomy=NULL,myop_fuel_consumed_l=NULL,
+            myop_price_fuel=NULL,myop_days_to_service=NULL,myop_km_to_service=NULL,
+            myop_maintenance_passed=NULL,myop_fuel_ul=NULL,alerts_json='[]' WHERE id=?""", (trip_id,))
 
-        secondaries = []
-        for sid in secondary_ids:
-            row = con.execute("SELECT * FROM trips WHERE id=?", (sid,)).fetchone()
-            if row:
-                secondaries.append(dict(row))
 
-        if not secondaries:
-            return _row_to_trip(primary)
+def trip_is_absorbed(trip_id: str) -> bool:
+    """Check legacy and current session references without resurrecting segments."""
+    with _conn() as con:
+        rows = con.execute("SELECT merged_ids,myop_leg_ids,myop_trip_id FROM trips WHERE merged_ids IS NOT NULL OR myop_trip_id IS NOT NULL").fetchall()
+    myop_id = trip_id.removeprefix("myop-")
+    for row in rows:
+        if trip_id in (_unpack_json(row["merged_ids"]) or []):
+            return True
+        ids = _unpack_json(row["myop_leg_ids"]) or [row["myop_trip_id"]]
+        if trip_id.startswith("myop-") and any(str(i) == myop_id for i in ids):
+            return True
+    return False
 
-        # Compute merged end time (latest)
-        all_ends = [primary.get("end_local", ""), *[s.get("end_local", "") for s in secondaries]]
-        merged_end = max(e for e in all_ends if e)
 
-        # Sum numeric fields
-        def _sum(*vals):
-            return sum(v for v in vals if v is not None) or None
+def merge_trips(primary_id: str, secondary_ids: list[str]) -> dict:
+    """Aggregate original segments by field semantics while retaining raw revisions.
 
-        # Duration = sum of all durations
-        merged_dur = _sum(primary.get("duration_min"), *[s.get("duration_min") for s in secondaries])
-
-        # Distance = sum
-        merged_dist = _sum(primary.get("distance_km"), *[s.get("distance_km") for s in secondaries])
-
-        # Fuel = sum
-        merged_fuel = _sum(primary.get("fuel_consumed_l"), *[s.get("fuel_consumed_l") for s in secondaries])
-
-        # Recalculate L/100km
-        merged_l100 = (merged_fuel / merged_dist * 100) if (merged_dist and merged_fuel and merged_dist > 0) else primary.get("consumption_l100km")
-
-        # Recalculate avg speed from merged totals; take MAX across all rows for max speed
-        merged_avg_speed = (
-            merged_dist / (merged_dur / 60.0)
-            if (merged_dist and merged_dur and merged_dur > 0)
-            else primary.get("avg_speed_kmh")
-        )
-        max_speeds = [primary.get("max_speed_kmh"), *[s.get("max_speed_kmh") for s in secondaries]]
-        merged_max_speed = max((v for v in max_speeds if v is not None), default=None)
-
-        # Sources: union (stored as source column — keep primary's)
-        # alerts: merge from alerts_json
-        def _alerts(row):
-            try:
-                return _json.loads(row.get("alerts_json") or "[]")
-            except Exception:
-                return []
-        all_alerts = list(set(a for r in [primary, *secondaries] for a in _alerts(r)))
-
-        # Merge myop_trip_id and vin (take first non-null)
-        merged_myop_id = primary.get("myop_trip_id")
-        merged_vin     = primary.get("vin")
-        for s in secondaries:
-            if not merged_myop_id and s.get("myop_trip_id"):
-                merged_myop_id = s.get("myop_trip_id")
-            if not merged_vin and s.get("vin"):
-                merged_vin = s.get("vin")
-
-        # GPS tracks: concatenate in chain order so the merged path is continuous
-        def _track(row):
-            try:
-                return _unpack_json(row.get("gps_track_json")) or []
-            except Exception:
-                return []
-        merged_track = _track(primary)
-        for s in secondaries:
-            merged_track.extend(_track(s))
-        merged_track_json = _pack_json(merged_track) if merged_track else None
-
-        con.execute("""
-            UPDATE trips SET
-                end_local           = ?,
-                duration_min        = ?,
-                distance_km         = ?,
-                avg_speed_kmh       = ?,
-                max_speed_kmh       = ?,
-                fuel_consumed_l     = ?,
-                consumption_l100km  = ?,
-                alerts_json         = ?,
-                gps_track_json      = ?,
-                myop_trip_id        = ?,
-                vin                 = ?,
-                merged_ids          = ?
-            WHERE id = ?
-        """, (
-            merged_end,
-            merged_dur,
-            merged_dist,
-            merged_avg_speed,
-            merged_max_speed,
-            merged_fuel,
-            merged_l100,
-            _json.dumps(all_alerts),
-            merged_track_json,
-            merged_myop_id,
-            merged_vin,
-            _json.dumps([primary_id, *secondary_ids]),
-            primary_id,
-        ))
-
-        # Delete secondary trips
-        for sid in secondary_ids:
-            con.execute("DELETE FROM trips WHERE id=?", (sid,))
-
-        row = con.execute("SELECT * FROM trips WHERE id=?", (primary_id,)).fetchone()
-        return _row_to_trip(dict(row))
+    A legacy merged row without all original observations is left intact and must
+    be rebuilt explicitly from archived source copies before extending its chain.
+    """
+    if primary_id in secondary_ids or len(set(secondary_ids)) != len(secondary_ids):
+        raise ValueError("Gli ID da unire devono essere distinti")
+    material = [get_trip(tid) for tid in [primary_id, *secondary_ids]]
+    if any(t is None for t in material):
+        raise ValueError("Viaggio da unire non trovato")
+    raw_ids = list(dict.fromkeys(tid for t in material for tid in (t.get("mergedIds") or [t["id"]])))
+    parts = []
+    for tid in raw_ids:
+        raw = get_raw_trip(tid)
+        if raw is None:
+            candidate = next((t for t in material if t["id"] == tid and not t.get("mergedIds")), None)
+            if candidate is None:
+                raise ValueError("Sessione legacy: ricostruire i segmenti dai sorgenti prima del merge")
+            raw = candidate
+            save_raw_trip(raw)
+        parts.append(raw)
+    parts.sort(key=lambda t: t.get("start") or "")
+    if any(not t.get("start") or not t.get("end") for t in parts):
+        raise ValueError("Date mancanti: impossibile unire in modo affidabile")
+    merged = dict(parts[0])
+    merged["id"] = primary_id
+    merged["mergedIds"] = raw_ids
+    merged["end"] = max(t["end"] for t in parts)
+    merged["durationMin"] = sum(t.get("durationMin") or 0 for t in parts)
+    merged["elapsedDurationMin"] = (datetime.fromisoformat(merged["end"]) - datetime.fromisoformat(merged["start"])).total_seconds() / 60
+    merged["recordingGapSeconds"] = max(0, (merged["elapsedDurationMin"] - merged["durationMin"]) * 60)
+    merged["track"] = [point for t in parts for point in (t.get("track") or [])]
+    merged["alerts"] = sorted({a for t in parts for a in (t.get("alerts") or [])})
+    merged["qualityWarnings"] = sorted({w for t in parts for w in (t.get("qualityWarnings") or [])})
+    # Additive quantities retain null when every segment lacks a measurement.
+    for key in ("distanceKm", "fuelMassG", "idleSeconds", "idleFuelG", "engineOnDurationMin"):
+        values = [t.get(key) for t in parts if t.get(key) is not None]
+        merged[key] = sum(values) if values else None
+    last_keys = ("odometerKm", "dpfSootPct", "dpfClosedSoot", "dpfSinceRegenKm", "dpfAvgRegenKm",
+                 "dpfReplaceKm", "dpfRegenCapability", "dpfRegenCapabilityST", "adblueVolL",
+                 "adblueRangeKm", "oilDilutionPct", "ssState", "fuelLevelObd", "oilKmToService",
+                 "fuelLevel", "fuelAutonomy", "kmToService", "daysToService", "dpfEndObservedActive")
+    for key in last_keys:
+        merged[key] = next((t[key] for t in reversed(parts) if t.get(key) is not None), None)
+    for key in ("maxSpeedKmh", "maxRpm", "coolantMaxC", "oilMaxC", "exhaustBeforeCatC", "exhaustAfterCatC", "noxCatTempMaxC"):
+        merged[key] = max((t[key] for t in parts if t.get(key) is not None), default=None)
+    for key in ("avgRpm", "acCurrentMa", "acActivePct", "ratioWg", "fuelRateCoveragePct", "fuelMassCoveragePct"):
+        weights = [(t.get(key), t.get("durationMin") or 0) for t in parts]
+        is_coverage = key.endswith("CoveragePct")
+        total = sum(w for v, w in weights if is_coverage or v is not None)
+        merged[key] = sum((v or 0) * w for v, w in weights) / total if total and any(v is not None for v, _ in weights) else None
+    duration = merged.get("durationMin") or 0
+    km = merged.get("distanceKm") or 0
+    merged["avgSpeedKmh"] = km / duration * 60 if duration else None
+    merged["gPerKm"] = merged["fuelMassG"] / km if merged.get("fuelMassG") is not None and km and (merged.get("fuelMassCoveragePct") or 0) >= 90 else None
+    if merged.get("fuelMassG") is not None and (merged.get("fuelMassCoveragePct") or 0) < 90:
+        merged["qualityWarnings"].append("Consumo in massa parziale: confronto g/km non disponibile.")
+    engine_s = (merged.get("engineOnDurationMin") or 0) * 60
+    merged["idleSharePct"] = (merged.get("idleSeconds") or 0) / engine_s * 100 if engine_s else None
+    rates = [t.get("obdFuelConsumedL", t.get("fuelConsumedL")) for t in parts]
+    merged["obdFuelConsumedL"] = sum(v for v in rates if v is not None) if any(v is not None for v in rates) else None
+    merged["fuelConsumedL"] = merged["obdFuelConsumedL"]
+    merged["consumptionL100km"] = merged["fuelConsumedL"] / km * 100 if merged["fuelConsumedL"] and km else None
+    merged["fuelValidationGL"] = merged["fuelMassG"] / merged["fuelConsumedL"] if merged.get("fuelMassG") and merged["fuelConsumedL"] else None
+    bands = {}
+    for t in parts:
+        for band, value in (t.get("speedBandsKm") or {}).items():
+            bands[band] = bands.get(band, 0) + value
+    merged["speedBandsKm"] = bands or None
+    states = [t.get("dpfRegenState") for t in parts]
+    merged["dpfRegenState"] = states[-1]
+    if states[-1] not in ("active", "requested") and "completed" in states:
+        merged["dpfRegenState"] = "completed"
+    merged["dpfRegenActive"] = 1 if any(t.get("dpfRegenActive") for t in parts) else 0
+    base = datetime.fromisoformat(merged["start"])
+    merged["pidValues"], merged["pidSeriesFull"], merged["pidSeriesTimes"] = {}, {}, {}
+    merged["observedWindows"] = []
+    slugs = {slug for t in parts for slug in (t.get("pidValues") or {})}
+    for t in parts:
+        shift = (datetime.fromisoformat(t["start"]) - base).total_seconds()
+        windows = t.get("observedWindows") or [[0, (t.get("durationMin") or 0) * 60]]
+        merged["observedWindows"].extend([[a + shift, b + shift] for a, b in windows])
+        for slug, values in (t.get("pidSeriesFull") or {}).items():
+            times = (t.get("pidSeriesTimes") or {}).get(slug)
+            if not times or len(times) != len(values):
+                continue  # no invented time axis for legacy values
+            merged["pidSeriesFull"].setdefault(slug, []).extend(values)
+            merged["pidSeriesTimes"].setdefault(slug, []).extend([v + shift for v in times])
+    for slug in slugs:
+        values = [(t, (t.get("pidValues") or {})[slug]) for t in parts if slug in (t.get("pidValues") or {})]
+        first_t, first = values[0]
+        last_t, last = values[-1]
+        stat = dict(first)
+        stat["first"], stat["last"] = first.get("first"), last.get("last")
+        for key, fn in (("min", min), ("max", max)):
+            stat[key] = fn((v[key] for _, v in values if v.get(key) is not None), default=None)
+        samples = sum(v.get("samples") or 0 for _, v in values)
+        stat["samples"] = samples
+        stat["mean"] = sum((v.get("mean") or 0) * (v.get("samples") or 0) for _, v in values) / samples if samples else None
+        modes = {v.get("mode") for _, v in values}
+        stat["mode"] = modes.pop() if len(modes) == 1 else None
+        stat["first_seen_s"] = (datetime.fromisoformat(first_t["start"]) - base).total_seconds() + (first.get("first_seen_s") or 0)
+        stat["last_seen_s"] = (datetime.fromisoformat(last_t["start"]) - base).total_seconds() + (last.get("last_seen_s") or 0)
+        stat["age_from_trip_end_s"] = merged["elapsedDurationMin"] * 60 - stat["last_seen_s"]
+        stat["is_stale"] = stat["age_from_trip_end_s"] > 60
+        stat["coverage_pct"] = sum((v.get("coverage_pct") or 0) * (t.get("durationMin") or 0) for t, v in values) / duration if duration else 0
+        stat["sample_rate_hz"] = samples / (duration * 60) if duration else None
+        merged["pidValues"][slug] = stat
+    merged["pidCatalog"] = list({p["slug"]: p for t in parts for p in (t.get("pidCatalog") or [])}.values())
+    # Source MyOpel legs are reattached by the correlator after this merge.
+    known_legs = list(dict.fromkeys(i for t in material for i in (t.get("myopLegIds") or ([t["myopId"]] if t.get("myopId") is not None else []))))
+    merged["myopLegIds"] = known_legs or None
+    merged["myopId"] = known_legs[0] if known_legs else None
+    save_trip(merged, record_raw=False)
+    with _conn() as con:
+        con.executemany("DELETE FROM trips WHERE id=?", [(sid,) for sid in secondary_ids])
+    return get_trip(primary_id)
 
 
 def _row_to_trip(row: dict) -> dict:
@@ -1064,20 +1249,20 @@ def _row_to_trip(row: dict) -> dict:
     if not sources:
         sources = ["myopel" if row.get("source") == "myop" else "obd"]
 
-    # Consumption: prefer the OBD-derived value; otherwise MyOpel fuel over the
-    # *MyOpel* distance — never over the OBD distance, because Stellantis may
-    # have recorded only part of the session (partial coverage produced absurd
-    # figures like 1.4 L/100 km before). The fallback is used only when the
-    # MyOpel legs cover most of the OBD session, so a 2-km leg absorbed into a
-    # 90-km session can't masquerade as the whole trip's consumption.
-    # Standalone myop rows have their own consumption_l100km from the parser.
-    _l100 = row.get("consumption_l100km")
-    if not _l100 and row.get("myop_fuel_consumed_l"):
-        _myop_km = row.get("myop_distance_km")
-        _obd_km  = row.get("distance_km")
-        if _myop_km and _myop_km > 0 and (not _obd_km or _myop_km >= 0.6 * _obd_km):
-            _l100 = row["myop_fuel_consumed_l"] / _myop_km * 100
-    _kml = round(100.0 / _l100, 2) if _l100 and _l100 > 0 else None
+    metadata = _j("metadata_json") or {}
+    if "obd" in sources and metadata.get("parserVersion", 0) < 2:
+        metadata.setdefault("qualityWarnings", []).append("Dati legacy: copertura non verificata; ricostruzione dai sorgenti necessaria.")
+    from .services.fuel import select_consumption
+    selected = select_consumption({
+        **metadata,
+        "sources": sources, "distanceKm": row.get("distance_km"),
+        "obdFuelConsumedL": row.get("fuel_consumed_l") if "obd" in sources else None,
+        "myopFuelConsumedL": row.get("myop_fuel_consumed_l"),
+        "myopDistanceKm": row.get("myop_distance_km") if "obd" in sources else row.get("distance_km"),
+        "fuelMassG": row.get("fuel_mass_g"),
+    })
+    _l100 = selected["consumptionL100km"]
+    _kml = 100.0 / _l100 if _l100 and _l100 > 0 else None
 
     return {
         "id":                    row["id"],
@@ -1099,7 +1284,9 @@ def _row_to_trip(row: dict) -> dict:
         "oilMaxC":               row.get("oil_temp_max_c"),
         "odometerKm":            row.get("odometer_km"),
         "airTempC":              row.get("air_temp_c"),
-        "fuelConsumedL":         row.get("fuel_consumed_l") or row.get("myop_fuel_consumed_l"),
+        "fuelConsumedL":         selected["fuelConsumedL"],
+        "obdFuelConsumedL":      row.get("fuel_consumed_l") if "obd" in sources else None,
+        "myopFuelConsumedL":     row.get("myop_fuel_consumed_l"),
         "consumptionL100km":     round(_l100, 2) if _l100 else None,
         "consumptionKmL":        _kml,
         "dpfSootPct":            row.get("dpf_soot_pct"),
@@ -1140,6 +1327,7 @@ def _row_to_trip(row: dict) -> dict:
         "ratioWg":               row.get("ratio_wg"),
         "fcSuspect":             (bool(row["fc_suspect"]) if row.get("fc_suspect") is not None else None),
         "myopFuelUl":            row.get("myop_fuel_ul"),
+        "costDistanceKm":        row.get("myop_distance_km") if "obd" in sources else row.get("distance_km"),
         "costEur":               (row["myop_fuel_consumed_l"] * row["myop_price_fuel"]
                                    if row.get("myop_fuel_consumed_l") and row.get("myop_price_fuel")
                                    else None),
@@ -1150,4 +1338,6 @@ def _row_to_trip(row: dict) -> dict:
         "insights":              _j("insights_json") or [],
         "mergedIds":             _j("merged_ids"),
         "vin":                   row.get("vin"),
+        **metadata,
+        **selected,
     }

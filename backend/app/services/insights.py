@@ -69,16 +69,11 @@ def _median(vals: list[float]) -> float | None:
 
 
 def _km_l(trip: dict) -> float | None:
-    """km/L for a trip, from the stored value or distance/fuel."""
-    if trip.get("consumptionKmL"):
+    """Use only consumption selected with known provenance and coverage."""
+    from .fuel import select_consumption
+    if trip.get("fuelSource") and trip.get("consumptionKmL"):
         return trip["consumptionKmL"]
-    l100 = trip.get("consumptionL100km")
-    if l100 and l100 > 0:
-        return round(100.0 / l100, 2)
-    d, f = trip.get("distanceKm"), trip.get("fuelConsumedL")
-    if d and f and f > 0:
-        return round(d / f, 2)
-    return None
+    return select_consumption(trip)["consumptionKmL"]
 
 
 def _fmt_date(s: str | None) -> str:
@@ -183,8 +178,8 @@ def per_trip(trip: dict, ctx: dict | None = None) -> list[dict]:
     state = trip.get("dpfRegenState") or "idle"
     egt = trip.get("exhaustAfterCatC")
     if state == "active":
-        out.append(_ins("dpf", "warning", "Rigenerazione interrotta allo spegnimento",
-            f"La rigenerazione era ancora in corso alla fine del viaggio"
+        out.append(_ins("dpf", "warning", "Rigenerazione attiva all’ultima osservazione",
+            f"I sensori indicavano una rigenerazione all’ultima osservazione disponibile"
             + (f" (EGT {egt:.0f}°C)" if egt else "")
             + ". Interromperla immette gasolio nell'olio: se possibile prosegui "
               "la marcia finché non termina (5–15 min a velocità costante)."))
@@ -425,7 +420,7 @@ def cross_trip(trips: list[dict]) -> list[dict]:
         else:
             out.append(_ins("engine", "info", "Regolazione rail stabile",
                 f"Pressione carburante misurata allineata alla richiesta "
-                f"(deriva {drift:+.1f}% sulle ultime uscite). Pompa e regolatore in salute.",
+                f"(deriva {drift:+.1f}% sulle ultime uscite). Non è un test diagnostico di pompa e regolatore.",
                 series, "%"))
 
     # ── 7. Turbo peak boost vs baseline ───────────────────────────────────────
@@ -469,10 +464,10 @@ def cross_trip(trips: list[dict]) -> list[dict]:
                 "supporti motore o iniettori. Vale un controllo se senti vibrazioni.",
                 idle_modes, "rpm"))
         else:
-            out.append(_ins("engine", "info", f"Minimo stabile · ~{med_idle:.0f} rpm",
+            out.append(_ins("engine", "info", f"Minimo osservato stabile · ~{med_idle:.0f} rpm",
                 f"Regime di minimo regolare su {len(idle_modes)} viaggi"
                 + (f" (1 calo isolato sotto i 600 rpm)" if len(dips) == 1 else "") +
-                ". Nessun sintomo da volano bimassa o EGR al momento.", idle_modes, "rpm"))
+                ". Questi dati da soli non escludono guasti meccanici.", idle_modes, "rpm"))
 
     # ── 9. Thermostat / warm-up check ─────────────────────────────────────────
     warm_candidates = [t for t in obd[-12:]
@@ -568,7 +563,7 @@ def cross_trip(trips: list[dict]) -> list[dict]:
                 "filtro aria, freno che rimane appoggiato, carburante diverso.", vals, "km/L"))
         elif raw_drift <= -0.10:
             body = (f"Ultimi {n_recent} viaggi al {abs(raw_drift)*100:.0f}% sotto la tua media "
-                    f"({med:.1f} km/L), ma il percorso spiega la differenza")
+                    f"({med:.1f} km/L); condizioni di percorso e campionamento possono incidere")
             if norm_drift is not None:
                 body += f": a parità di condizioni il motore è in linea ({norm_drift*100:+.0f}%)"
             body += "."
@@ -577,7 +572,7 @@ def cross_trip(trips: list[dict]) -> list[dict]:
                          "— più traffico o tragitti più urbani.")
             if temp_up >= 3:
                 body += f" Fa anche più caldo (+{temp_up:.0f}°C): il clima incide in città."
-            out.append(_ins("fuel", "info", "Consumi su, ma è il percorso", body, vals, "km/L"))
+            out.append(_ins("fuel", "info", "Consumi in aumento: confronto da approfondire", body, vals, "km/L"))
         else:
             best = max(recs, key=lambda r: r["kml"])
             body = (f"Media {med:.1f} km/L su {len(vals)} viaggi · "
@@ -591,10 +586,10 @@ def cross_trip(trips: list[dict]) -> list[dict]:
             f"Media {statistics.median(vals):.1f} km/L su {len(vals)} viaggi.", vals, "km/L"))
 
     # ── 12. Fuel cost ─────────────────────────────────────────────────────────
-    costed = [t for t in chrono if t.get("costEur") and t.get("distanceKm")]
+    costed = [t for t in chrono if t.get("costEur") and t.get("costDistanceKm")]
     if len(costed) >= 4:
         total_cost = sum(t["costEur"] for t in costed)
-        total_km = sum(t["distanceKm"] for t in costed)
+        total_km = sum(t["costDistanceKm"] for t in costed)
         per100 = total_cost / total_km * 100 if total_km else 0
         last_dt = _parse_dt(costed[-1].get("start"))
         recent = [t for t in costed

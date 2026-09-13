@@ -37,206 +37,150 @@ const Icon = ({ name, size = 16, className = "" }) => {
   );
 };
 
-/* Filter obvious outliers using 3×IQR rule; null values are kept as gaps */
-const filterOutliers = (data) => {
-  if (!data || data.length < 6) return data;
-  const clean = data.filter(v => v != null && isFinite(v));
-  if (clean.length < 4) return data;
-  const sorted = [...clean].sort((a, b) => a - b);
-  const q1 = sorted[Math.floor(sorted.length * 0.25)];
-  const q3 = sorted[Math.floor(sorted.length * 0.75)];
-  const iqr = q3 - q1;
-  if (iqr === 0) return data;
-  const lo = q1 - 3 * iqr;
-  const hi = q3 + 3 * iqr;
-  return data.map(v => (v != null && isFinite(v) && v >= lo && v <= hi) ? v : null);
+/** Build separate SVG segments so absent samples remain visible gaps. */
+const chartPaths = (points, baseline) => {
+  const segments = [];
+  points.forEach(p => {
+    if (!p) { if (segments.length && segments[segments.length - 1].length) segments.push([]); return; }
+    if (!segments.length) segments.push([]);
+    segments[segments.length - 1].push(p);
+  });
+  const lines = segments.filter(s => s.length).map(s => ({
+    line: s.map((p, i) => `${i ? "L" : "M"}${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(" "),
+    first: s[0], last: s[s.length - 1],
+  }));
+  return { line: lines.map(s => s.line).join(" "),
+    fill: lines.map(s => `${s.line} L${s.last.x},${baseline} L${s.first.x},${baseline} Z`).join(" ") };
 };
 
-/* ============== Sparkline (tiny SVG line chart) ============== */
-const Sparkline = ({ data, height = 50, color = "var(--accent)", showFill = true, showMinMax = true, animate = true }) => {
-  if (!data || data.length < 2) return null;
-  const filtered = filterOutliers(data) || data;
-  const cleanVals = filtered.filter(v => v != null && isFinite(v));
-  if (cleanVals.length < 2) return null;
-  const min = Math.min(...cleanVals);
-  const max = Math.max(...cleanVals);
-  const range = max - min || 1;
-  const w = 100;
-  const pts = filtered.map((v, i) => v != null ? { x: (i / (filtered.length - 1)) * w, y: 100 - ((v - min) / range) * 100 } : null);
-  const path = pts.reduce((acc, pt, i) => {
-    if (pt == null) return acc + ` M${pts.find((p, j) => j > i && p != null)?.x ?? 0},${pts.find((p, j) => j > i && p != null)?.y ?? 0}`;
-    const prev = i === 0 || pts[i-1] == null;
-    return acc + ` ${prev ? 'M' : 'L'}${pt.x.toFixed(2)},${pt.y.toFixed(2)}`;
-  }, "").trim();
-  // Fill path: connect only non-null segments to baseline
-  const firstNonNull = pts.find(p => p != null);
-  const lastNonNull = [...pts].reverse().find(p => p != null);
-  const fillPath = firstNonNull && lastNonNull
-    ? path + ` L${lastNonNull.x.toFixed(2)},100 L${firstNonNull.x.toFixed(2)},100 Z`
-    : path;
-  // Live pulse marker on the last non-null point
-  const lastX = lastNonNull ? lastNonNull.x : w;
-  const lastY = lastNonNull ? lastNonNull.y : 100;
+/** Compact historical series: preserve all finite readings, without statistical clipping. */
+const Sparkline = ({ data, times, height = 50, color = "var(--accent)", showFill = true, animate = true }) => {
+  const gradId = React.useId().replace(/:/g, "");
+  const values = OBD.chartValues(data);
+  const clean = values.filter(v => v != null);
+  if (clean.length < 2) return <span className="chart-empty">{clean.length ? "Un solo campione" : "Serie non disponibile"}</span>;
+  const min = Math.min(...clean), max = Math.max(...clean), range = max - min || 1;
+  const axis = OBD.chartPositions(values, times).times;
+  const from = axis[0], span = axis[axis.length - 1] - from || 1;
+  const points = values.map((v, i) => v == null ? null : { x: (axis[i] - from) / span * 100, y: 95 - (v - min) / range * 90 });
+  const paths = chartPaths(points, 100);
   return (
-    <svg viewBox="0 0 100 100" preserveAspectRatio="none" style={{ height, width: "100%", display: "block", overflow: "visible" }}>
-      <defs>
-        <linearGradient id={`sgrad-${color.replace(/[^\w]/g, "")}`} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="0.3" />
-          <stop offset="100%" stopColor={color} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      {showFill && <path d={fillPath} fill={`url(#sgrad-${color.replace(/[^\w]/g, "")})`} className={animate ? "spark-fill-in" : ""} />}
-      <path d={path} fill="none" stroke={color} strokeWidth="1.4" vectorEffect="non-scaling-stroke"
+    <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img"
+         aria-label={`Andamento storico, minimo ${OBD.measurement(min)}, massimo ${OBD.measurement(max)}`}
+         style={{ height, width: "100%", display: "block" }}>
+      <defs><linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stopColor={color} stopOpacity="0.3" /><stop offset="100%" stopColor={color} stopOpacity="0" />
+      </linearGradient></defs>
+      {showFill && <path d={paths.fill} fill={`url(#${gradId})`} />}
+      <path d={paths.line} fill="none" stroke={color} strokeWidth="1.4" vectorEffect="non-scaling-stroke"
             className={animate ? "spark-draw" : ""} />
-      {animate && (
-        <circle cx={lastX} cy={lastY} r="1.6" fill={color}>
-          <animate attributeName="r" values="1.6;3;1.6" dur="2.4s" repeatCount="indefinite" />
-          <animate attributeName="opacity" values="1;0.4;1" dur="2.4s" repeatCount="indefinite" />
-        </circle>
-      )}
     </svg>
   );
 };
 
-/* ============== Bigger chart (axis-less line) ============== */
-const LineChart = ({ data, height = 200, color = "var(--accent)", yLabel, accent = "accent", animate = true }) => {
-  if (!data || data.length < 2) return null;
+/** Inspect an observed series with elapsed time, pointer/touch and keyboard controls. */
+const LineChart = ({ data, times, labels, height = 200, color = "var(--accent)", yLabel = "", animate = true }) => {
   const svgRef = useRef(null);
   const [hover, setHover] = useState(null);
-
-  const filteredData = filterOutliers(data) || data;
-  const cleanVals = filteredData.filter(v => v != null && isFinite(v));
-  if (cleanVals.length < 2) return null;
-  const min = Math.min(...cleanVals);
-  const max = Math.max(...cleanVals);
-  const range = (max - min) || 1;
-  const w = 600;
-  const h = height;
-  const padX = 16, padY = 12;
-  const innerW = w - padX * 2;
-  const innerH = h - padY * 2;
-
-  const pts = filteredData.map((v, i) =>
-    v != null ? { x: padX + (i / (filteredData.length - 1)) * innerW, y: padY + innerH - ((v - min) / range) * innerH } : null
-  );
-  const path = pts.reduce((acc, pt, i) => {
-    if (pt == null) return acc + ` M${pts.find((p, j) => j > i && p != null)?.x ?? padX},${pts.find((p, j) => j > i && p != null)?.y ?? (padY + innerH)}`;
-    const prev = i === 0 || pts[i-1] == null;
-    return acc + ` ${prev ? 'M' : 'L'}${pt.x.toFixed(2)},${pt.y.toFixed(2)}`;
-  }, "").trim();
-
-  const firstNonNull = pts.find(p => p != null);
-  const lastNonNull = [...pts].reverse().find(p => p != null);
-  const fillPath = firstNonNull && lastNonNull
-    ? path + ` L${lastNonNull.x.toFixed(2)},${h - padY} L${firstNonNull.x.toFixed(2)},${h - padY} Z`
-    : path;
-
-  const gridY = [0, 0.25, 0.5, 0.75, 1].map(t => padY + t * innerH);
-  const gradId = `lc-${color.replace(/[^\w]/g, "")}`;
-
-  const handleMouseMove = (e) => {
-    const svg = svgRef.current;
-    if (!svg) return;
-    const rect = svg.getBoundingClientRect();
-    const mouseX = ((e.clientX - rect.left) / rect.width) * w;
-    const step = innerW / Math.max(filteredData.length - 1, 1);
-    const idx = Math.max(0, Math.min(filteredData.length - 1, Math.round((mouseX - padX) / step)));
-    const val = filteredData[idx];
-    if (val == null) { setHover(null); return; }
-    const cx = padX + (idx / (filteredData.length - 1)) * innerW;
-    const cy = padY + innerH - ((val - min) / range) * innerH;
-    setHover({ idx, val, cx, cy });
+  const gradId = React.useId().replace(/:/g, "");
+  const values = OBD.chartValues(data);
+  const clean = values.filter(v => v != null);
+  const axis = OBD.chartPositions(values, times);
+  useEffect(() => setHover(null), [data, times]);
+  if (clean.length < 2) return <div className="chart-empty">{clean.length ? "Un solo campione disponibile" : "Serie non disponibile"}</div>;
+  const min = Math.min(...clean), max = Math.max(...clean), range = max - min || 1;
+  const w = 600, padX = 20, padTop = 18, padBottom = 26, innerW = w - padX * 2, innerH = height - padTop - padBottom;
+  const from = axis.times[0], span = axis.times[axis.times.length - 1] - from || 1;
+  const points = values.map((v, i) => v == null ? null : {
+    x: padX + (axis.times[i] - from) / span * innerW,
+    y: padTop + innerH - (v - min) / range * innerH,
+  });
+  const paths = chartPaths(points, padTop + innerH);
+  const axisLabel = i => labels?.[i] || (axis.timed ? `${OBD.measurement(axis.times[i] / 60, 1)} min` : `campione ${i + 1}`);
+  const pointAt = e => {
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const x = (e.clientX - rect.left) / rect.width * w;
+    let nearest = null, distance = Infinity;
+    points.forEach((p, i) => { if (p && Math.abs(p.x - x) < distance) { nearest = i; distance = Math.abs(p.x - x); } });
+    setHover(nearest);
   };
-
+  const keyboard = e => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    const indices = values.map((v, i) => v == null ? null : i).filter(i => i != null);
+    const at = Math.max(0, indices.indexOf(hover));
+    const next = e.key === "Home" ? 0 : e.key === "End" ? indices.length - 1 : Math.max(0, Math.min(indices.length - 1, at + (e.key === "ArrowRight" ? 1 : -1)));
+    setHover(indices[next]);
+  };
+  const selected = hover != null ? points[hover] : null;
   return (
-    <svg ref={svgRef} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none"
-         style={{ width: "100%", height, display: "block" }}
-         onMouseMove={handleMouseMove} onMouseLeave={() => setHover(null)}>
-      <defs>
-        <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="0.25" />
-          <stop offset="100%" stopColor={color} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      {gridY.map((y, i) => (
-        <line key={i} x1={padX} x2={w - padX} y1={y} y2={y}
-              stroke="var(--line-soft)" strokeWidth="1" strokeDasharray={i === 0 || i === gridY.length - 1 ? "" : "2,3"} />
-      ))}
-      <path d={fillPath} fill={`url(#${gradId})`} className={animate ? "lc-fill-in" : ""} />
-      <path d={path} fill="none" stroke={color} strokeWidth="1.6" className={animate ? "lc-draw" : ""} />
-      {/* y labels */}
-      <text x={padX + 4} y={padY + 4} fill="var(--fg-3)" fontSize="10" fontFamily="var(--font-mono)">{max.toFixed(1)}</text>
-      <text x={padX + 4} y={h - padY - 2} fill="var(--fg-3)" fontSize="10" fontFamily="var(--font-mono)">{min.toFixed(1)}</text>
-      {yLabel && <text x={w - padX} y={padY + 4} fill="var(--fg-3)" fontSize="10" fontFamily="var(--font-mono)" textAnchor="end">{yLabel}</text>}
-      {hover && (
-        <g>
-          <circle cx={hover.cx} cy={hover.cy} r={3} fill={color} />
-          <rect x={hover.cx + 6} y={hover.cy - 16} width={52} height={18} rx={4} fill="var(--bg-3)" opacity={0.95} />
-          <text x={hover.cx + 10} y={hover.cy - 4} fill="var(--fg-0)" fontSize="10" fontFamily="var(--font-mono)">
-            {hover.val.toFixed(2)}
-          </text>
-        </g>
-      )}
-    </svg>
+    <div className="line-chart">
+      <svg ref={svgRef} viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none"
+           role="img" tabIndex={0} aria-label={`Grafico ${yLabel}. Frecce per esplorare i campioni; tocca per leggere un valore.`}
+           onKeyDown={keyboard} onFocus={() => setHover(values.findIndex(v => v != null))}
+           onPointerDown={pointAt} onPointerMove={pointAt}
+           style={{ width: "100%", height, display: "block", touchAction: "pan-y" }}>
+        <defs><linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.25" /><stop offset="100%" stopColor={color} stopOpacity="0" />
+        </linearGradient></defs>
+        {[0, 0.25, 0.5, 0.75, 1].map(t => <line key={t} x1={padX} x2={w-padX} y1={padTop+t*innerH} y2={padTop+t*innerH} stroke="var(--line-soft)" />)}
+        <path d={paths.fill} fill={`url(#${gradId})`} />
+        <path d={paths.line} fill="none" stroke={color} strokeWidth="1.6" className={animate ? "lc-draw" : ""} />
+        <text x={padX} y={12} fill="var(--fg-2)" fontSize="11">{OBD.measurement(max)} {yLabel}</text>
+        <text x={padX} y={height-padBottom-3} fill="var(--fg-2)" fontSize="11">{OBD.measurement(min)}</text>
+        <text x={padX} y={height-5} fill="var(--fg-2)" fontSize="10">{axisLabel(0)}</text>
+        <text x={w-padX} y={height-5} fill="var(--fg-2)" fontSize="10" textAnchor="end">{axisLabel(values.length-1)}</text>
+        {selected && <circle cx={selected.x} cy={selected.y} r={4} fill={color} />}
+      </svg>
+      <div className="chart-readout" aria-live="polite">{selected
+        ? `${axisLabel(hover)} · ${OBD.measurement(values[hover], 2)} ${yLabel}`
+        : `${values.length} campioni visualizzati · tocca o usa le frecce per esplorare`}</div>
+    </div>
   );
 };
 
-/* ============== Bar chart (SVG, hover tooltip) ============== */
+/** Inspect daily distances using pointer/touch or a keyboard. */
 const BarChart = ({ data, height = 120, color = "var(--accent)", yLabel = "" }) => {
-  // data: [{ label, value }]
-  if (!data || data.length === 0) return null;
   const [hover, setHover] = useState(null);
+  const svgRef = useRef(null);
+  if (!data?.length) return <div className="chart-empty">Nessun dato nel periodo</div>;
   const w = 600, padX = 10, padTop = 16, padBot = 18;
-  const innerW = w - padX * 2;
-  const innerH = height - padTop - padBot;
-  const max = Math.max(...data.map(d => d.value), 1);
-  const step = innerW / data.length;
-  const barW = Math.max(2, step - 2);   // 2px surface gap between bars
-  return (
-    <svg viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none"
-         style={{ width: "100%", height, display: "block" }}
-         onMouseLeave={() => setHover(null)}>
-      <line x1={padX} x2={w - padX} y1={padTop + innerH} y2={padTop + innerH}
-            stroke="var(--line-soft)" strokeWidth="1" />
-      <text x={padX + 2} y={padTop - 5} fill="var(--fg-3)" fontSize="10"
-            fontFamily="var(--font-mono)">{max.toFixed(0)} {yLabel}</text>
+  const innerW = w - padX * 2, innerH = height - padTop - padBot;
+  const max = Math.max(...data.map(d => d.value), 1), step = innerW / data.length;
+  const inspect = e => {
+    const rect = svgRef.current.getBoundingClientRect();
+    setHover(Math.max(0, Math.min(data.length - 1, Math.floor(((e.clientX-rect.left)/rect.width*w-padX)/step))));
+  };
+  return <div>
+    <svg ref={svgRef} viewBox={`0 0 ${w} ${height}`} preserveAspectRatio="none" tabIndex={0} role="img"
+         aria-label="Distanze giornaliere. Frecce o tocco per leggere i valori."
+         style={{ width: "100%", height, display: "block", touchAction: "pan-y" }}
+         onPointerDown={inspect} onPointerMove={inspect} onFocus={() => setHover(0)}
+         onKeyDown={e => { if (["ArrowLeft", "ArrowRight"].includes(e.key)) { e.preventDefault(); setHover(Math.max(0, Math.min(data.length-1, (hover ?? 0) + (e.key === "ArrowRight" ? 1 : -1)))); } }}>
+      <text x={padX} y={12} fill="var(--fg-2)" fontSize="10">{OBD.measurement(max, 0)} {yLabel}</text>
       {data.map((d, i) => {
-        const h = Math.max(d.value > 0 ? 2 : 0, (d.value / max) * innerH);
-        const x = padX + i * step + (step - barW) / 2;
-        const y = padTop + innerH - h;
-        const isHover = hover === i;
-        return (
-          <g key={i} onMouseEnter={() => setHover(i)}>
-            {/* invisible full-height hit target, wider than the mark */}
-            <rect x={padX + i * step} y={padTop} width={step} height={innerH} fill="transparent" />
-            <rect x={x} y={y} width={barW} height={h} rx="3"
-                  fill={color} opacity={isHover ? 1 : 0.75} />
-          </g>
-        );
+        const h = Math.max(d.value > 0 ? 2 : 0, d.value / max * innerH);
+        return <rect key={i} x={padX+i*step+1} y={padTop+innerH-h} width={Math.max(2,step-2)} height={h} rx={2} fill={color} opacity={hover===i?1:0.75} />;
       })}
-      {hover != null && data[hover] && (
-        <g pointerEvents="none">
-          <rect x={Math.min(padX + hover * step, w - 150)} y={padTop} width={140} height={20} rx={5}
-                fill="var(--bg-3)" opacity="0.96" />
-          <text x={Math.min(padX + hover * step, w - 150) + 8} y={padTop + 14}
-                fill="var(--fg-0)" fontSize="11" fontFamily="var(--font-mono)">
-            {data[hover].label} · {data[hover].value.toFixed(1)} {yLabel}
-          </text>
-        </g>
-      )}
+      <text x={padX} y={height-3} fill="var(--fg-2)" fontSize="10">{data[0].label}</text>
+      <text x={w-padX} y={height-3} fill="var(--fg-2)" fontSize="10" textAnchor="end">{data[data.length-1].label}</text>
     </svg>
-  );
+    <div className="chart-readout" aria-live="polite">{hover != null && data[hover] ? `${data[hover].label} · ${OBD.measurement(data[hover].value)} ${yLabel}` : "Tocca o usa le frecce per esplorare"}</div>
+  </div>;
 };
 
 /* ============== Radial gauge ============== */
 /* thresholds: color shifts to warn/crit as the value fills — right for "high
    is bad" quantities (soot, temperature). Pass false for fuel/charge levels. */
 const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accent)", duration = 900, decimals = 0, thresholds = true }) => {
-  // Animate from 0 to value on mount
+  const known = typeof value === "number" && Number.isFinite(value);
+  // Animate known observations only. Missing measurements remain unavailable.
   const [shown, setShown] = useState(0);
   useEffect(() => {
+    if (!known) { setShown(0); return; }
     let raf, start;
-    const animDur = document.documentElement.dataset.anim === "off" ? 0 : duration;
+    const animDur = (document.documentElement.dataset.anim === "off" || window.matchMedia("(prefers-reduced-motion: reduce)").matches) ? 0 : duration;
     if (animDur === 0) { setShown(value); return; }
     const ease = (t) => 1 - Math.pow(1 - t, 3); // ease-out cubic
     const step = (ts) => {
@@ -247,7 +191,7 @@ const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accen
     };
     raf = requestAnimationFrame(step);
     return () => raf && cancelAnimationFrame(raf);
-  }, [value, duration]);
+  }, [value, duration, known]);
 
   const pct = Math.max(0, Math.min(1, shown / max));
   const r = 50, c = 60;
@@ -272,7 +216,7 @@ const RadialGauge = ({ value, max = 100, label = "%", strokeColor = "var(--accen
                 strokeDasharray={`${dash} ${circ - dash}`} />
       </svg>
       <div className="gauge-value">
-        <div className="v">{shown.toFixed(decimals)}</div>
+        <div className="v">{known ? shown.toFixed(decimals) : "—"}</div>
         <div className="l">{label}</div>
       </div>
     </div>
@@ -285,7 +229,7 @@ const AnimatedNumber = ({ value, decimals = 0, duration = 700, prefix = "", suff
   const prev = useRef(0);
   useEffect(() => {
     let raf, start;
-    const animDur = document.documentElement.dataset.anim === "off" ? 0 : duration;
+    const animDur = (document.documentElement.dataset.anim === "off" || window.matchMedia("(prefers-reduced-motion: reduce)").matches) ? 0 : duration;
     if (animDur === 0) { setShown(value); prev.current = value; return; }
     const from = prev.current;
     const ease = (t) => 1 - Math.pow(1 - t, 3);
@@ -367,7 +311,7 @@ const TripMap = ({ trip, allTrips = null, height = 340 }) => {
       if (all.length) {
         mapRef.current.fitBounds(all, { padding: [20, 20] });
       }
-    } else if (trip && trip.track) {
+    } else if (trip && Array.isArray(trip.track) && trip.track.length >= 2) {
       const line = window.L.polyline(trip.track, {
         color: "oklch(0.86 0.16 200)",
         weight: 4,
@@ -395,7 +339,7 @@ const TripMap = ({ trip, allTrips = null, height = 340 }) => {
       if (mapRef.current) mapRef.current.invalidateSize();
     });
     if (ref.current) obs.observe(ref.current);
-    return () => obs.disconnect();
+    return () => { obs.disconnect(); mapRef.current?.remove(); mapRef.current = null; };
   }, []);
 
   return <div ref={ref} style={{ height, width: "100%" }} />;
@@ -404,9 +348,10 @@ const TripMap = ({ trip, allTrips = null, height = 340 }) => {
 /* ============== DPF state pill ============== */
 const DpfPill = ({ state }) => {
   const labels = {
-    idle: "DPF idle",
+    idle: "Nessuna regen osservata",
+    unknown: "Stato DPF non determinabile",
     requested: "Regen richiesta",
-    active: "Regen attiva",
+    active: "Regen osservata",
     completed: "Regen completata",
     post_regen: "Post-regen",
   };
@@ -450,7 +395,7 @@ const TripCard = ({ trip, active, onClick }) => {
   const dateStr = d.toLocaleDateString("it-IT", { day: "2-digit", month: "short", year: "2-digit" });
   const timeStr = d.toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" });
   return (
-    <div className={`trip-card ${active ? "active" : ""}`} onClick={onClick}>
+    <button type="button" className={`trip-card ${active ? "active" : ""}`} onClick={onClick} aria-pressed={!!active}>
       <div className="trip-card-head">
         <span className="trip-date">{dateStr}</span>
         <span className="trip-time">{timeStr}</span>
@@ -465,11 +410,11 @@ const TripCard = ({ trip, active, onClick }) => {
           <span className="val">{trip.distanceKm?.toFixed(1) ?? "—"}<span className="unit"> km</span></span>
         </div>
         <div className="trip-stat">
-          <span className="lbl">Durata</span>
+          <span className="lbl">Tempo osservato</span>
           <span className="val">{trip.durationMin?.toFixed(0) ?? "—"}<span className="unit"> min</span></span>
         </div>
         <div className="trip-stat">
-          <span className="lbl">Media</span>
+          <span className="lbl">Vel. osservata</span>
           <span className="val">{trip.avgSpeedKmh?.toFixed(0) ?? "—"}<span className="unit"> km/h</span></span>
         </div>
         <div className="trip-stat">
@@ -486,7 +431,7 @@ const TripCard = ({ trip, active, onClick }) => {
           </div>
         )}
       </div>
-    </div>
+    </button>
   );
 };
 
