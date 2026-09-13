@@ -5,6 +5,15 @@ Tutte le modifiche rilevanti al progetto sono annotate qui.
 Formato basato su [Keep a Changelog](https://keepachangelog.com/it/1.1.0/);
 il versionamento segue [SemVer](https://semver.org/lang/it/).
 
+## [0.10.1] — 2026-09-13
+
+### Corretto
+- Crash della mappa su tracciati GPS lunghi: sostituita, per le polilinee della
+  dashboard, la semplificazione ricorsiva di Leaflet con un algoritmo iterativo.
+  Stessa tolleranza, ordine e punti risultanti; coordinate originali conservate.
+- La correzione copre singolo viaggio, mappa complessiva e ridisegni durante lo zoom.
+  Regressione contro Leaflet 1.9.4 e riproduzione dello stack overflow con stack ridotto.
+
 ## [0.10.0] — 2026-09-13
 
 ### Aggiunto

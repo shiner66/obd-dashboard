@@ -8,6 +8,15 @@ Aggrega ed elabora i log esportati da:
 
 Costruito per essere **self-hosted via Docker su Unraid**, in **un singolo container**.
 
+### v0.10.1 — correzione mappa su mobile
+
+I tracciati lunghi sono semplificati per il disegno con una versione iterativa
+compatibile con Leaflet 1.9.4. Evita l'esaurimento dello stack JavaScript durante
+l'apertura della mappa o lo zoom, mantenendo la stessa tolleranza e i punti
+risultanti. Le coordinate originali nel database e nell'export non cambiano.
+Il modulo `map-core.js` sostituisce soltanto il passaggio di semplificazione
+delle nostre polilinee; verificarlo quando si aggiorna la versione di Leaflet.
+
 ### v0.10 — insight verificabili e registro eventi
 
 Gli insight separano osservazioni, ipotesi, prove contrarie, limiti e azioni.

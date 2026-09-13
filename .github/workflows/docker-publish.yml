@@ -39,7 +39,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: npm install --no-save --package-lock=false @babel/standalone@7.29.0
+      - run: npm install --no-save --package-lock=false @babel/standalone@7.29.0 leaflet@1.9.4
       - run: node scripts/check-frontend.cjs
       - run: node --test tests/*.test.cjs
 

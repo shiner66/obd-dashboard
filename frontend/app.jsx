@@ -248,7 +248,7 @@ const Sidebar = ({ active, setActive }) => {
         <div className="brand-mark"></div>
         <div>
           <div className="brand-name">OBD Cockpit</div>
-          <div className="brand-sub"><span className="live-dot"></span>v0.10 · dati registrati</div>
+          <div className="brand-sub"><span className="live-dot"></span>v0.10.1 · dati registrati</div>
         </div>
       </div>
 

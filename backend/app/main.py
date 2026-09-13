@@ -37,7 +37,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(messa
 OBD_FILES_DIR   = Path(os.getenv("OBD_FILES_DIR",   "/data/obd"))
 MYOP_FILES_DIR  = Path(os.getenv("MYOP_FILES_DIR",  "/data/myop"))
 DB_PATH         = Path(os.getenv("DB_PATH",         "/data/db/trips.db"))
-APP_VERSION    = os.getenv("APP_VERSION", "0.10.0")
+APP_VERSION    = os.getenv("APP_VERSION", "0.10.1")
 APP_REVISION   = os.getenv("APP_REVISION", "unknown")
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 VEHICLE_NAME    = os.getenv("VEHICLE_NAME",    "Opel Corsa F Elegance")

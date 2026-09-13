@@ -337,7 +337,7 @@ const TripMap = ({ trip, allTrips = null, height = 340 }) => {
       allTrips.forEach(t => {
         if (!t.track) return;
         const isActive = trip && t.id === trip.id;
-        const line = window.L.polyline(t.track, {
+        const line = OBDMap.polyline(window.L, t.track, {
           color: isActive ? "oklch(0.86 0.16 200)" : "oklch(0.5 0.04 240)",
           weight: isActive ? 4 : 2,
           opacity: isActive ? 1 : 0.5,
@@ -349,7 +349,7 @@ const TripMap = ({ trip, allTrips = null, height = 340 }) => {
         mapRef.current.fitBounds(all, { padding: [20, 20] });
       }
     } else if (trip && Array.isArray(trip.track) && trip.track.length >= 2) {
-      const line = window.L.polyline(trip.track, {
+      const line = OBDMap.polyline(window.L, trip.track, {
         color: "oklch(0.86 0.16 200)",
         weight: 4,
         opacity: 1,

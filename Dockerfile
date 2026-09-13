@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 ARG APP_REVISION=unknown
-ENV APP_VERSION=0.10.0 APP_REVISION=${APP_REVISION}
+ENV APP_VERSION=0.10.1 APP_REVISION=${APP_REVISION}
 
 # ── Single-container image: uvicorn (backend) + nginx (frontend) ─────────────
 
@@ -24,6 +24,7 @@ COPY frontend/components.jsx    /usr/share/nginx/html/components.jsx
 COPY frontend/insight-events.jsx /usr/share/nginx/html/insight-events.jsx
 COPY frontend/tweaks-panel.jsx  /usr/share/nginx/html/tweaks-panel.jsx
 COPY frontend/dashboard-core.js /usr/share/nginx/html/dashboard-core.js
+COPY frontend/map-core.js /usr/share/nginx/html/map-core.js
 COPY frontend/exploration-core.js /usr/share/nginx/html/exploration-core.js
 COPY frontend/exploration.jsx /usr/share/nginx/html/exploration.jsx
 COPY frontend/exploration.css /usr/share/nginx/html/exploration.css

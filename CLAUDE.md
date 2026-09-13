@@ -44,7 +44,7 @@ in una venv Python 3.12. Prima di committare:
 
 - `PYTHONPATH=backend python -m pytest -q`.
 - `node --test tests/*.test.cjs`.
-- `npm install --no-save --package-lock=false @babel/standalone@7.29.0`,
+- `npm install --no-save --package-lock=false @babel/standalone@7.29.0 leaflet@1.9.4`,
   quindi `node scripts/check-frontend.cjs`.
 
 Completare inoltre queste verifiche mirate quando la modifica lo richiede:
